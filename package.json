@@ -1,0 +1,49 @@
+{
+  "name": "chat-lite",
+  "version": "0.1.0",
+  "description": "Lightweight mobile chat app with React/Vite frontend and native Node.js HTTP TypeScript backend.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:server": "tsx watch src/server/index.ts",
+    "build": "vite build && esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external && node scripts/copy-schema.mjs",
+    "start": "node dist-server/index.js",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.1.48",
+    "@langchain/mcp-adapters": "^1.1.3",
+    "@langchain/openai": "^1.4.7",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "argon2": "^0.41.1",
+    "better-sqlite3": "^11.7.0",
+    "busboy": "^1.6.0",
+    "dompurify": "^3.4.9",
+    "dotenv": "^16.4.7",
+    "gsap": "^3.15.0",
+    "langchain": "^1.4.4",
+    "markdown-it": "^14.2.0",
+    "markdown-it-task-lists": "^2.1.1",
+    "nanoid": "^5.0.9",
+    "nodemailer": "^6.9.16",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/busboy": "^1.5.4",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.10.2",
+    "@types/nodemailer": "^6.4.17",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "esbuild": "^0.24.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.6"
+  }
+}
