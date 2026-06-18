@@ -51,7 +51,13 @@ function imageApiEndpoint() {
 
 function imageEditApiEndpoint() {
   const explicit = process.env.IMAGE_EDIT_API_URL;
-  if (explicit) return explicit.replace(/\/+$/, '');
+  if (explicit) {
+    const trimmed = explicit.replace(/\/+$/, '');
+    if (/\/images\/edits$/i.test(trimmed)) return trimmed;
+    if (/\/images\/generations$/i.test(trimmed)) return trimmed.replace(/\/images\/generations$/i, '/images/edits');
+    if (/\/v1\/image_generation$/i.test(trimmed)) return trimmed;
+    return `${trimmed}/images/edits`;
+  }
   const base = process.env.IMAGE_API_URL || process.env.MODEL_BASE_URL || process.env.OPENAI_BASE_URL || '';
   if (!base) return '';
   const trimmed = base.replace(/\/+$/, '');
@@ -66,6 +72,14 @@ function textImageModel() {
 
 function editImageModel() {
   return process.env.IMAGE_EDIT_MODEL || process.env.IMAGE_MODEL || '';
+}
+
+function textImageResponseFormat() {
+  return process.env.TEXT_IMAGE_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || 'b64_json';
+}
+
+function editImageResponseFormat() {
+  return process.env.IMAGE_EDIT_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || 'b64_json';
 }
 
 function mimeFromUrl(url: string) {
@@ -100,10 +114,10 @@ async function callImageApi(prompt: string) {
   const baseBody = { model, prompt, n: 1, size };
   let data: any;
   try {
-    data = await postImageGeneration(endpoint, apiKey, { ...baseBody, response_format: 'b64_json' });
+    data = await postImageGeneration(endpoint, apiKey, { ...baseBody, response_format: textImageResponseFormat() });
   } catch (error) {
     const msg = error instanceof Error ? error.message : '';
-    if (!/response_format|unsupported|invalid/i.test(msg)) throw error;
+    if (!/response_format|unsupported|invalid|upstream did not return image output/i.test(msg)) throw error;
     data = await postImageGeneration(endpoint, apiKey, baseBody);
   }
 
@@ -137,15 +151,31 @@ async function callImageEditApi(prompt: string, source: SourceImage) {
   form.append('prompt', prompt);
   form.append('n', '1');
   form.append('size', process.env.IMAGE_SIZE || '1024x1024');
+  form.append('response_format', editImageResponseFormat());
   form.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
 
-  const res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
+  let res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
     method: 'POST',
     headers: { authorization: `Bearer ${apiKey}` },
     body: form
   });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  let text = await res.text();
+  let data = text ? JSON.parse(text) : {};
+  if (!res.ok && /response_format|unsupported|invalid|upstream did not return image output/i.test(data?.error?.message || data?.message || '')) {
+    const fallbackForm = new FormData();
+    fallbackForm.append('model', model);
+    fallbackForm.append('prompt', prompt);
+    fallbackForm.append('n', '1');
+    fallbackForm.append('size', process.env.IMAGE_SIZE || '1024x1024');
+    fallbackForm.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
+    res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}` },
+      body: fallbackForm
+    });
+    text = await res.text();
+    data = text ? JSON.parse(text) : {};
+  }
   if (!res.ok) throw new Error(data?.error?.message || data?.message || `图生图失败 HTTP ${res.status}`);
 
   const first = data?.data?.[0] || data?.images?.[0] || data?.[0];
@@ -190,7 +220,7 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
   const body: Record<string, unknown> = {
     model,
     prompt,
-    response_format: process.env.IMAGE_RESPONSE_FORMAT || 'url',
+    response_format: editImageResponseFormat(),
     n: 1,
     subject_reference: [{
       type: process.env.IMAGE_EDIT_REFERENCE_TYPE || 'character',

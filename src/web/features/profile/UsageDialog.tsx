@@ -47,6 +47,7 @@ export default function UsageDialog({ kind }: { kind: UsageKind }) {
     const ctx = gsap.context(() => {
       gsap.fromTo('.usage-dialog__total', { autoAlpha: 0, y: -4 }, { autoAlpha: 1, y: 0, duration: 0.18, ease: 'power2.out' });
       gsap.fromTo('.usage-dialog__bar-fill', { scaleY: 0 }, { scaleY: 1, duration: 0.42, ease: 'power2.out', stagger: 0.045, delay: 0.04 });
+      gsap.fromTo('.usage-dialog__bar-value', { autoAlpha: 0, y: 4 }, { autoAlpha: 1, y: 0, duration: 0.2, ease: 'power2.out', stagger: 0.035, delay: 0.14 });
       gsap.fromTo('.usage-dialog__axis-label', { autoAlpha: 0, y: 5 }, { autoAlpha: 1, y: 0, duration: 0.2, ease: 'power2.out', stagger: 0.035, delay: 0.12 });
     }, rootRef);
     return () => ctx.revert();
@@ -60,6 +61,7 @@ export default function UsageDialog({ kind }: { kind: UsageKind }) {
       <div className="usage-dialog__total">{copy[kind].total}：{formatNumber(total)}</div>
       <div className="usage-dialog__chart" aria-label={copy[kind].chart} style={{ gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))` }}>
         {days.map(day => <div className="usage-dialog__column" key={day.date} title={`${day.label} ${formatNumber(day.value)}`}>
+          <span className="usage-dialog__bar-value">{formatNumber(day.value)}</span>
           <div className="usage-dialog__bar-track" aria-label={`${day.label} ${formatNumber(day.value)}`}>
             <div className="usage-dialog__bar-fill" style={{ height: `${Math.max(8, (day.value / maxValue) * 100)}%` }} />
           </div>

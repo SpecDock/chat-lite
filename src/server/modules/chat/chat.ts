@@ -1,11 +1,13 @@
 import { unlink } from 'node:fs/promises';
 import { jsonError, type Router } from '../../core/http.js';
 import { auth, newId, requireAuth, safeTitle } from '../../core/security.js';
-import { streamAgentChat } from './agent.js';
 import type { AgentUsage } from './agent.js';
 import { emitToUser } from '../../core/events.js';
 import { scheduleConversationTitle } from '../conversation-titles/title.js';
 import { defaultChatModelName, estimateTokenUsage, recordTokenUsage } from '../usage/usage.service.js';
+import { agentInputForMessage, looksLikeUnfinishedPlan, parseChatRequest, shouldForceSearchFallback, userMessageContent } from './chat.service.js';
+import { routeTask } from './task-router.js';
+import { runWorkflow } from './workflows/index.js';
 import {
   completeAssistantMessage,
   conversationExists,
@@ -65,12 +67,11 @@ export function registerConversationRoutes(router: Router) {
 export function registerChatRoutes(router: Router) {
   router.post('/api/chat', requireAuth, async (ctx) => {
     const body = await ctx.json().catch(() => ({}));
-    const content = String(body.content || body.message || '').trim();
-    let conversationId = String(body.conversationId || '').trim();
-    const attachmentIds: string[] = Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String).filter(Boolean).slice(0, 4) : [];
+    const parsed = parseChatRequest(body);
+    let conversationId = parsed.conversationId;
+    const { content, attachmentIds, userInput } = parsed;
     if (!content && attachmentIds.length === 0) return jsonError(ctx, 400, '消息不能为空');
     const userId = auth(ctx).userId;
-    const userInput = content || '请描述这张图片';
     let createdConversation = false;
     if (!conversationId) {
       conversationId = newId('conv');
@@ -88,7 +89,7 @@ export function registerChatRoutes(router: Router) {
       updateConversationTitle(conversationId, userId, safeTitle(userInput));
     }
     const userMessageId = newId('msg');
-    const storedUserContent = attachmentIds.length ? `${userInput}\n\n${attachmentIds.map(id => `![image](/api/files/${id})`).join('\n')}` : userInput;
+    const storedUserContent = userMessageContent(userInput, attachmentIds);
     insertUserMessage(userMessageId, userId, conversationId, storedUserContent);
     emitToUser(userId, 'messages_changed', { conversationId, reason: 'user_message' });
     linkAttachmentsToMessage(attachmentIds, userId, conversationId, userMessageId);
@@ -115,9 +116,16 @@ export function registerChatRoutes(router: Router) {
     let thinkStarted = false;
     let thinkClosed = false;
     send('meta', { conversationId, userMessageId, messageId: assistantId });
-    const agentInput = attachmentIds.length
-      ? `${userInput}\n\n本轮图片附件 ID：${attachmentIds.join(', ')}。如果是识别/分析图片，请调用 understand_image；如果是基于原图生成或修改图片，请调用 image_to_image。`
-      : userInput;
+    const appendThink = (text: string) => {
+      if (!thinkStarted || thinkClosed) {
+        thinkStarted = true;
+        thinkClosed = false;
+        storedAssistantContent += '<think>\n';
+      }
+      storedAssistantContent += `${text}\n`;
+      send('think', { text });
+    };
+    const agentInput = agentInputForMessage(userInput, attachmentIds);
     const recordAssistantUsage = (output: string) => {
       recordTokenUsage({
         userId,
@@ -128,25 +136,49 @@ export function registerChatRoutes(router: Router) {
       });
     };
     try {
-      for await (const chunk of streamAgentChat({ userId, conversationId, input: agentInput, history, attachmentIds, signal: abortController.signal })) {
-        if (abortController.signal.aborted) break;
-        if (chunk.type === 'usage') {
-          capturedUsage = chunk.usage;
-        } else if (chunk.type === 'think') {
-          if (!thinkStarted) {
-            thinkStarted = true;
-            storedAssistantContent += '<think>\n';
+      appendThink('正在分析请求。');
+      const route = await routeTask(userInput, attachmentIds, history, abortController.signal);
+      let webSearchTriggered = route.intent === 'web_search';
+      appendThink(`任务类型：${route.intent}`);
+      const runAgent = async (input: string) => {
+        for await (const chunk of runWorkflow(route, { userId, conversationId, input, history, attachmentIds, sourceAttachmentId: route.sourceAttachmentId, signal: abortController.signal })) {
+          if (abortController.signal.aborted) break;
+          if (chunk.type === 'usage') {
+            capturedUsage = chunk.usage;
+          } else if (chunk.type === 'think') {
+            if (/web_search|搜索网页|搜索完成/.test(chunk.text)) webSearchTriggered = true;
+            appendThink(chunk.text);
+          } else {
+            if (thinkStarted && !thinkClosed) {
+              thinkClosed = true;
+              storedAssistantContent += '</think>\n\n';
+            }
+            full += chunk.text;
+            storedAssistantContent += chunk.text;
+            send('delta', { text: chunk.text });
           }
-          storedAssistantContent += `${chunk.text}\n`;
-          send('think', { text: chunk.text });
-        } else {
-          if (thinkStarted && !thinkClosed) {
-            thinkClosed = true;
-            storedAssistantContent += '</think>\n\n';
+        }
+      };
+      await runAgent(agentInput);
+      if (!full.trim() && !/!\[[^\]]*\]\(\/api\/files\/att_[^)]+\)/.test(storedAssistantContent)) {
+        throw new Error('主模型未返回正文');
+      }
+      if (!webSearchTriggered && looksLikeUnfinishedPlan(full) && shouldForceSearchFallback(userInput, full)) {
+        appendThink('检测到需要联网搜索，正在自动补充搜索结果。');
+        const searchRoute = { intent: 'web_search' as const, needVision: false, needImageEdit: false, needSearch: true, confidence: 1 };
+        for await (const chunk of runWorkflow(searchRoute, { userId, conversationId, input: userInput, history, attachmentIds, signal: abortController.signal })) {
+          if (abortController.signal.aborted) break;
+          if (chunk.type === 'usage') capturedUsage = chunk.usage;
+          else if (chunk.type === 'think') appendThink(chunk.text);
+          else {
+            if (thinkStarted && !thinkClosed) {
+              thinkClosed = true;
+              storedAssistantContent += '</think>\n\n';
+            }
+            full += chunk.text;
+            storedAssistantContent += chunk.text;
+            send('delta', { text: chunk.text });
           }
-          full += chunk.text;
-          storedAssistantContent += chunk.text;
-          send('delta', { text: chunk.text });
         }
       }
       if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
@@ -170,11 +202,19 @@ export function registerChatRoutes(router: Router) {
         send('cancelled', { ok: true });
         return;
       }
-      const msg = e instanceof Error ? e.message : '模型调用失败';
+      const msg = userFacingModelError(e);
       failAssistantMessage(assistantId, userId, msg);
       recordAssistantUsage(msg);
       emitToUser(userId, 'messages_changed', { conversationId, reason: 'assistant_error' });
       send('error', { error: msg });
     } finally { if (!ctx.res.writableEnded && !ctx.res.destroyed) ctx.res.end(); }
   });
+}
+
+function userFacingModelError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/额度不足|insufficient|quota|balance|403|401|authentication|invalid.*token/i.test(message)) {
+    return '当前主模型额度不足或认证失败，请更换可用的模型 API Key 后再试。';
+  }
+  return `当前主模型调用失败，请稍后重试。${message ? `\n\n错误信息：${message}` : ''}`;
 }

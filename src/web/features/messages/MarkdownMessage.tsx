@@ -2,6 +2,8 @@ import { Component, type ReactNode, useMemo } from 'react';
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
 import taskLists from 'markdown-it-task-lists';
+import markdownItKatex from 'markdown-it-katex';
+import 'katex/dist/katex.min.css';
 
 const md = new MarkdownIt({
   html: false,
@@ -11,6 +13,7 @@ const md = new MarkdownIt({
 });
 
 md.use(taskLists, { enabled: false, label: true, labelAfter: true });
+md.use(markdownItKatex);
 
 class MarkdownRenderBoundary extends Component<{ fallback: string; children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -36,7 +39,7 @@ class MarkdownRenderBoundary extends Component<{ fallback: string; children: Rea
 function renderMarkdown(content: string) {
   const html = md.render(content);
   return DOMPurify.sanitize(html, {
-    USE_PROFILES: { html: true },
+    USE_PROFILES: { html: true, mathMl: true },
     ADD_ATTR: ['target', 'rel', 'class', 'disabled', 'checked'],
   });
 }

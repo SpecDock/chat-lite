@@ -169,7 +169,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const attachments = pending;
     setPending([]);
 
-    const userText = text.trim() || (attachments.length ? '请描述这张图片' : '');
+    const userText = text.trim();
     activeSentTextRef.current = userText;
     const userContent = attachments.length ? `${userText}\n\n${attachments.map(a => `![${a.original_name}](${a.public_path})`).join('\n')}` : userText;
     const tempUser: MessageDTO = { id: crypto.randomUUID(), conversation_id: current || '', role: 'user', content: userContent, status: 'completed', created_at: new Date().toISOString() };
@@ -194,8 +194,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           }));
         }
         if (event === 'think') {
+          const reopenThink = thinkStarted && thinkClosed;
           thinkStarted = true;
-          setMessages(m => m.map(x => x.id === assistantMessageId ? { ...x, content: `${x.content || '<think>\n'}${data.text}\n` } : x));
+          if (reopenThink) thinkClosed = false;
+          setMessages(m => m.map(x => {
+            if (x.id !== assistantMessageId) return x;
+            const prefix = !x.content || reopenThink ? '<think>\n' : '';
+            return { ...x, content: `${x.content}${prefix}${data.text}\n` };
+          }));
         }
         if (event === 'delta') {
           const prefix = thinkStarted && !thinkClosed ? '</think>\n\n' : '';
@@ -212,7 +218,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           setErr(data.error);
           setMessages(m => m.map(x => {
             if (x.id !== assistantMessageId) return x;
-            const content = thinkStarted && !thinkClosed ? `${x.content}</think>` : x.content;
+            const content = `${thinkStarted && !thinkClosed ? `${x.content}</think>\n\n` : x.content}${data.error || '请求失败'}`;
             return { ...x, content, status: 'error' };
           }));
         }

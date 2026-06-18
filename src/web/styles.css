@@ -45,7 +45,10 @@ body {
   color: var(--body);
 }
 
-::selection { background: rgba(204, 120, 92, 0.22); }
+::selection {
+  background: rgba(88, 113, 138, 0.26);
+  color: var(--ink);
+}
 
 button, input, textarea {
   font: inherit;
@@ -415,9 +418,23 @@ input:focus, textarea:focus {
   min-width: 0;
   height: 100%;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
   align-items: end;
+}
+
+.usage-dialog__bar-value {
+  display: block;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.15;
+  text-align: center;
+  letter-spacing: -0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .usage-dialog__bar-track {
@@ -455,6 +472,7 @@ input:focus, textarea:focus {
 @media (max-width: 520px) {
   .usage-dialog__body { padding: 16px 14px 18px; }
   .usage-dialog__chart { gap: 6px; padding-inline: 2px; }
+  .usage-dialog__bar-value { font-size: 10px; }
   .usage-dialog__axis-label { font-size: 11px; }
 }
 
