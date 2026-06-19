@@ -6,6 +6,7 @@ import { emitToUser } from '../../core/events.js';
 import { scheduleConversationTitle } from '../conversation-titles/title.js';
 import { defaultChatModelName, estimateTokenUsage, recordTokenUsage } from '../usage/usage.service.js';
 import { agentInputForMessage, looksLikeUnfinishedPlan, parseChatRequest, shouldForceSearchFallback, userMessageContent } from './chat.service.js';
+import { ensureRagInitialized, indexChatMessage } from '../rag/rag.js';
 import { routeTask } from './task-router.js';
 import { runWorkflow } from './workflows/index.js';
 import {
@@ -91,6 +92,8 @@ export function registerChatRoutes(router: Router) {
     const userMessageId = newId('msg');
     const storedUserContent = userMessageContent(userInput, attachmentIds);
     insertUserMessage(userMessageId, userId, conversationId, storedUserContent);
+    ensureRagInitialized();
+    indexChatMessage({ userId, conversationId, messageId: userMessageId, role: 'user', content: storedUserContent });
     emitToUser(userId, 'messages_changed', { conversationId, reason: 'user_message' });
     linkAttachmentsToMessage(attachmentIds, userId, conversationId, userMessageId);
     const assistantId = newId('msg');
@@ -183,8 +186,10 @@ export function registerChatRoutes(router: Router) {
       }
       if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
       completed = true;
-      completeAssistantMessage(assistantId, userId, storedAssistantContent || full);
-      recordAssistantUsage(storedAssistantContent || full);
+      const completedContent = storedAssistantContent || full;
+      completeAssistantMessage(assistantId, userId, completedContent);
+      indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: completedContent });
+      recordAssistantUsage(completedContent);
       touchConversation(conversationId, userId);
       emitToUser(userId, 'messages_changed', { conversationId, reason: 'assistant_completed' });
       emitToUser(userId, 'conversations_changed', { conversationId, reason: 'updated' });
@@ -193,8 +198,10 @@ export function registerChatRoutes(router: Router) {
     } catch (e) {
       if (abortController.signal.aborted || (e instanceof Error && e.name === 'AbortError')) {
         if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
-        interruptAssistantMessage(assistantId, userId, storedAssistantContent || full || '已取消');
-        recordAssistantUsage(storedAssistantContent || full || '已取消');
+        const interruptedContent = storedAssistantContent || full || '已取消';
+        interruptAssistantMessage(assistantId, userId, interruptedContent);
+        indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: interruptedContent });
+        recordAssistantUsage(interruptedContent);
         touchConversation(conversationId, userId);
         emitToUser(userId, 'messages_changed', { conversationId, reason: 'assistant_interrupted' });
         emitToUser(userId, 'conversations_changed', { conversationId, reason: 'updated' });
@@ -204,6 +211,7 @@ export function registerChatRoutes(router: Router) {
       }
       const msg = userFacingModelError(e);
       failAssistantMessage(assistantId, userId, msg);
+      indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: msg });
       recordAssistantUsage(msg);
       emitToUser(userId, 'messages_changed', { conversationId, reason: 'assistant_error' });
       send('error', { error: msg });

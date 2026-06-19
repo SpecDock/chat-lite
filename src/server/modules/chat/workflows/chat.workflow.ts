@@ -1,6 +1,8 @@
 import type { WorkflowEvent, WorkflowInput } from './types.js';
 import { streamFinalAnswer } from './streaming.js';
 import { answerHistoryLimit } from '../history-limits.js';
+import { ensureRagInitialized, getRagContext } from '../../rag/rag.js';
+import { ragConfig, ragReadActive } from '../../rag/rag.config.js';
 
 function historyText(history: WorkflowInput['history']) {
   return history
@@ -9,10 +11,19 @@ function historyText(history: WorkflowInput['history']) {
     .join('\n');
 }
 
-export function runChatWorkflow(input: WorkflowInput): AsyncGenerator<WorkflowEvent> {
-  return streamFinalAnswer({
+export async function* runChatWorkflow(input: WorkflowInput): AsyncGenerator<WorkflowEvent> {
+  ensureRagInitialized();
+  const cfg = ragConfig();
+  const total = input.history.length;
+  let ragBlock = '';
+  if (ragReadActive() && cfg.topK > 0) {
+    const context = await getRagContext(input.userId, input.input, total, cfg.topK, input.conversationId);
+    if (context) ragBlock = context;
+  }
+  const userPrompt = `${ragBlock ? `${ragBlock}\n\n` : ''}最近对话：\n${historyText(input.history) || '(无)'}\n\n当前用户：${input.input}`;
+  yield* streamFinalAnswer({
     system: '你是 Chat Lite 的普通对话助手。使用中文优先回答，保持简洁、准确。不要声称会调用工具；如果问题需要实时信息、图片、生成图片等外部能力，说明需要使用对应功能。',
-    user: `最近对话：\n${historyText(input.history) || '(无)'}\n\n当前用户：${input.input}`,
+    user: userPrompt,
     signal: input.signal
   });
 }

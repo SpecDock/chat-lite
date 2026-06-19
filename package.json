@@ -7,10 +7,11 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "dev:server": "tsx watch src/server/index.ts",
-    "build": "vite build && esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external && node scripts/copy-schema.mjs",
+    "build": "vite build && esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external && esbuild src/server/modules/rag/backfill.ts --bundle --platform=node --format=esm --outfile=dist-server/backfill-rag.js --packages=external && node scripts/copy-schema.mjs",
     "start": "node dist-server/index.js",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "rag:backfill": "node dist-server/backfill-rag.js"
   },
   "dependencies": {
     "@langchain/core": "^1.1.48",
@@ -33,6 +34,7 @@
     "nodemailer": "^6.9.16",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "sqlite-vec": "^0.1.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {
