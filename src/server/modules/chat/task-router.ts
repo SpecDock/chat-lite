@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ChatOpenAI } from '@langchain/openai';
 import type { MessageDTO } from '../../../shared/types.js';
 import { chooseSourceAttachmentId, imageCandidates } from './image-selection.service.js';
+import { routerHistoryLimit } from './history-limits.js';
 
 export type TaskIntent = 'chat' | 'vision_qa' | 'image_edit' | 'text_to_image' | 'web_search' | 'mixed';
 
@@ -68,7 +69,7 @@ function wantsExternalKnowledge(input: string) {
 function historyContext(history: Pick<MessageDTO, 'role' | 'content'>[] = []) {
   return history
     .filter(m => m.role === 'user' || m.role === 'assistant')
-    .slice(-24)
+    .slice(-routerHistoryLimit())
     .map(m => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').slice(0, 500)}`)
     .join('\n');
 }

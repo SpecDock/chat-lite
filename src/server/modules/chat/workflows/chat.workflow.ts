@@ -1,9 +1,10 @@
 import type { WorkflowEvent, WorkflowInput } from './types.js';
 import { streamFinalAnswer } from './streaming.js';
+import { answerHistoryLimit } from '../history-limits.js';
 
 function historyText(history: WorkflowInput['history']) {
   return history
-    .slice(-80)
+    .slice(-answerHistoryLimit())
     .map(m => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').slice(0, 800)}`)
     .join('\n');
 }

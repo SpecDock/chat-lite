@@ -5,12 +5,13 @@ import type { MessageDTO } from '../../../../shared/types.js';
 import { row } from '../../../core/db.js';
 import { callMiniMaxTool } from '../../images/mcp.js';
 import { createChatModel, textFromModelMessage } from '../model.js';
+import { answerHistoryLimit } from '../history-limits.js';
 import type { ToolBudget } from './tool-budget.js';
 
 function historyContextForVision(history: Pick<MessageDTO, 'role' | 'content'>[] = []) {
   return history
     .filter(m => m.role === 'user' || m.role === 'assistant')
-    .slice(-80)
+    .slice(-answerHistoryLimit())
     .map(m => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').slice(0, 700)}`)
     .join('\n');
 }

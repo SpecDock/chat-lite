@@ -6,6 +6,7 @@ import { createImageToImageTool } from './tools/image-edit.tool.js';
 import { createUnderstandImageTool } from './tools/image-understand.tool.js';
 import { createWebSearchTool } from './tools/web-search.tool.js';
 import { createToolBudget, intEnv } from './tools/tool-budget.js';
+import { answerHistoryLimit } from './history-limits.js';
 
 type AgentInput = {
   userId: string;
@@ -68,7 +69,7 @@ function systemPrompt(attachmentIds: string[]) {
 function toAgentMessages(history: Pick<MessageDTO, 'role' | 'content'>[], input: string) {
   const messages = history
     .filter(m => m.role === 'user' || m.role === 'assistant')
-    .slice(-80)
+    .slice(-answerHistoryLimit())
     .map(m => ({ role: m.role, content: m.content }));
   messages.push({ role: 'user', content: input });
   return messages;
