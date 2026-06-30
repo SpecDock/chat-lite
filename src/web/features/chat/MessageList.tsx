@@ -2,6 +2,14 @@ import { useEffect, useLayoutEffect, useRef } from 'react';
 import { gsap } from 'gsap';
 import type { MessageDTO } from '../../../shared/types';
 import MarkdownMessage from '../messages/MarkdownMessage';
+import MessageActions from './MessageActions';
+
+function visibleContent(m: MessageDTO): string {
+  if (m.role === 'assistant') {
+    return String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  }
+  return String(m.content || '');
+}
 
 function safeGetScroll(key: string) {
   try {
@@ -113,5 +121,27 @@ export default function MessageList({ messages, conversationId, storageKey, scro
     return () => ctx.revert();
   }, [messages]);
 
-  return <div className="messages" ref={rootRef}>{messages.map(m => <div className={`msg ${m.role}`} data-message-id={m.id} key={m.id}><div className="bubble"><MarkdownMessage content={m.content || (m.status === 'streaming' ? '...' : '')} /></div></div>)}<div ref={endRef} /></div>;
+  return (
+    <div className="messages" ref={rootRef}>
+      {messages.map(m => {
+        const copyText = visibleContent(m);
+        const showActions =
+          m.role !== 'system' &&
+          m.role !== 'tool' &&
+          m.status !== 'streaming' &&
+          copyText.length > 0;
+        return (
+          <div className={`msg ${m.role}`} data-message-id={m.id} key={m.id}>
+            <div className="msg-row">
+              <div className="bubble">
+                <MarkdownMessage content={m.content || (m.status === 'streaming' ? '...' : '')} />
+              </div>
+              {showActions && <MessageActions text={copyText} />}
+            </div>
+          </div>
+        );
+      })}
+      <div ref={endRef} />
+    </div>
+  );
 }

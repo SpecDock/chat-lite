@@ -144,7 +144,7 @@ export function registerChatRoutes(router: Router) {
       let webSearchTriggered = route.intent === 'web_search';
       appendThink(`任务类型：${route.intent}`);
       const runAgent = async (input: string) => {
-        for await (const chunk of runWorkflow(route, { userId, conversationId, input, history, attachmentIds, sourceAttachmentId: route.sourceAttachmentId, signal: abortController.signal })) {
+        for await (const chunk of runWorkflow(route, { userId, conversationId, input, history, attachmentIds, sourceAttachmentId: route.sourceAttachmentId, prompts: route.prompts, signal: abortController.signal })) {
           if (abortController.signal.aborted) break;
           if (chunk.type === 'usage') {
             capturedUsage = chunk.usage;

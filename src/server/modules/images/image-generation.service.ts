@@ -11,6 +11,7 @@ type GenerateImageInput = {
   prompt: string;
   conversationId?: string;
   sourceAttachmentId?: string;
+  signal?: AbortSignal;
 };
 
 type SourceImage = { attachmentId: string; buffer: Buffer; mimeType: string; filename: string };
@@ -35,51 +36,64 @@ function normalizeAttachmentId(value: string) {
 }
 
 function textImageApiKey() {
-  return process.env.TEXT_IMAGE_API_KEY || process.env.IMAGE_API_KEY || process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || '';
+  return process.env.TEXT_IMAGE_API_KEY || '';
 }
 
 function editImageApiKey() {
-  return process.env.IMAGE_EDIT_API_KEY || process.env.IMAGE_API_KEY || process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || '';
+  return process.env.IMAGE_EDIT_API_KEY || '';
 }
 
 function imageApiEndpoint() {
-  const base = process.env.TEXT_IMAGE_API_URL || process.env.IMAGE_API_URL || process.env.MODEL_BASE_URL || process.env.OPENAI_BASE_URL || '';
+  const base = process.env.TEXT_IMAGE_API_URL || '';
   if (!base) return '';
   const trimmed = base.replace(/\/+$/, '');
   return /\/images\/generations$/.test(trimmed) ? trimmed : `${trimmed}/images/generations`;
 }
 
 function imageEditApiEndpoint() {
-  const explicit = process.env.IMAGE_EDIT_API_URL;
-  if (explicit) {
-    const trimmed = explicit.replace(/\/+$/, '');
-    if (/\/images\/edits$/i.test(trimmed)) return trimmed;
-    if (/\/images\/generations$/i.test(trimmed)) return trimmed.replace(/\/images\/generations$/i, '/images/edits');
-    if (/\/v1\/image_generation$/i.test(trimmed)) return trimmed;
-    return `${trimmed}/images/edits`;
-  }
-  const base = process.env.IMAGE_API_URL || process.env.MODEL_BASE_URL || process.env.OPENAI_BASE_URL || '';
+  const base = process.env.IMAGE_EDIT_API_URL || '';
   if (!base) return '';
   const trimmed = base.replace(/\/+$/, '');
-  if (/\/images\/edits$/.test(trimmed)) return trimmed;
-  if (/\/images\/generations$/.test(trimmed)) return trimmed.replace(/\/images\/generations$/, '/images/edits');
+  if (/\/images\/edits$/i.test(trimmed)) return trimmed;
+  if (/\/images\/generations$/i.test(trimmed)) return trimmed.replace(/\/images\/generations$/i, '/images/edits');
+  if (/\/v1\/image_generation$/i.test(trimmed)) return trimmed;
   return `${trimmed}/images/edits`;
 }
 
 function textImageModel() {
-  return process.env.TEXT_IMAGE_MODEL || process.env.IMAGE_MODEL || '';
+  return process.env.TEXT_IMAGE_MODEL || '';
 }
 
 function editImageModel() {
-  return process.env.IMAGE_EDIT_MODEL || process.env.IMAGE_MODEL || '';
+  return process.env.IMAGE_EDIT_MODEL || '';
 }
 
 function textImageResponseFormat() {
-  return process.env.TEXT_IMAGE_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || 'b64_json';
+  return process.env.TEXT_IMAGE_RESPONSE_FORMAT || 'b64_json';
 }
 
 function editImageResponseFormat() {
-  return process.env.IMAGE_EDIT_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || 'b64_json';
+  return process.env.IMAGE_EDIT_RESPONSE_FORMAT || 'b64_json';
+}
+
+function imageSize() {
+  const v = process.env.TEXT_IMAGE_SIZE;
+  if (!v || v === 'auto') return undefined;
+  return v;
+}
+
+function imageEditSize() {
+  const v = process.env.IMAGE_EDIT_SIZE;
+  if (!v || v === 'auto') return undefined;
+  return v;
+}
+
+function textImageQuality() {
+  return process.env.TEXT_IMAGE_QUALITY || undefined;
+}
+
+function imageEditQuality() {
+  return process.env.IMAGE_EDIT_QUALITY || undefined;
 }
 
 function mimeFromUrl(url: string) {
@@ -89,14 +103,15 @@ function mimeFromUrl(url: string) {
   return 'image/png';
 }
 
-async function postImageGeneration(endpoint: string, apiKey: string, body: Record<string, unknown>) {
+async function postImageGeneration(endpoint: string, apiKey: string, body: Record<string, unknown>, signal?: AbortSignal) {
   const res = await fetch(assertHttpUrl(endpoint, 'IMAGE_API_URL'), {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${apiKey}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
@@ -104,21 +119,24 @@ async function postImageGeneration(endpoint: string, apiKey: string, body: Recor
   return data;
 }
 
-async function callImageApi(prompt: string) {
+async function callImageApi(prompt: string, signal?: AbortSignal) {
   const endpoint = imageApiEndpoint();
   const apiKey = textImageApiKey();
   const model = textImageModel();
   if (!endpoint || !apiKey || !model) throw new Error('文生图 API 未配置：请设置 TEXT_IMAGE_API_URL、TEXT_IMAGE_API_KEY、TEXT_IMAGE_MODEL');
 
-  const size = process.env.IMAGE_SIZE || '1024x1024';
-  const baseBody = { model, prompt, n: 1, size };
+  const size = imageSize();
+  const quality = textImageQuality();
+  const baseBody: Record<string, unknown> = { model, prompt, n: 1 };
+  if (size) baseBody.size = size;
+  if (quality) baseBody.quality = quality;
   let data: any;
   try {
-    data = await postImageGeneration(endpoint, apiKey, { ...baseBody, response_format: textImageResponseFormat() });
+    data = await postImageGeneration(endpoint, apiKey, { ...baseBody, response_format: textImageResponseFormat() }, signal);
   } catch (error) {
     const msg = error instanceof Error ? error.message : '';
     if (!/response_format|unsupported|invalid|upstream did not return image output/i.test(msg)) throw error;
-    data = await postImageGeneration(endpoint, apiKey, baseBody);
+    data = await postImageGeneration(endpoint, apiKey, baseBody, signal);
   }
 
   const first = data?.data?.[0] || data?.images?.[0] || data?.[0];
@@ -136,28 +154,32 @@ async function callImageApi(prompt: string) {
   throw new Error('图片生成 API 未返回 url 或 b64_json');
 }
 
-async function callImageEditApi(prompt: string, source: SourceImage) {
+async function callImageEditApi(prompt: string, source: SourceImage, signal?: AbortSignal) {
   const endpoint = imageEditApiEndpoint();
   const apiKey = editImageApiKey();
   const model = editImageModel();
   if (!endpoint || !apiKey || !model) throw new Error('图生图 API 未配置：请设置 IMAGE_EDIT_API_URL、IMAGE_EDIT_API_KEY、IMAGE_EDIT_MODEL');
 
   if (isMiniMaxImageGenerationEndpoint(endpoint)) {
-    return callMiniMaxImageToImage(endpoint, apiKey, model, prompt, source);
+    return callMiniMaxImageToImage(endpoint, apiKey, model, prompt, source, signal);
   }
 
   const form = new FormData();
   form.append('model', model);
   form.append('prompt', prompt);
   form.append('n', '1');
-  form.append('size', process.env.IMAGE_SIZE || '1024x1024');
+  const editSize = imageEditSize();
+  if (editSize) form.append('size', editSize);
   form.append('response_format', editImageResponseFormat());
+  const editQuality = imageEditQuality();
+  if (editQuality) form.append('quality', editQuality);
   form.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
 
   let res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
     method: 'POST',
     headers: { authorization: `Bearer ${apiKey}` },
-    body: form
+    body: form,
+    signal
   });
   let text = await res.text();
   let data = text ? JSON.parse(text) : {};
@@ -166,12 +188,14 @@ async function callImageEditApi(prompt: string, source: SourceImage) {
     fallbackForm.append('model', model);
     fallbackForm.append('prompt', prompt);
     fallbackForm.append('n', '1');
-    fallbackForm.append('size', process.env.IMAGE_SIZE || '1024x1024');
+    if (editSize) fallbackForm.append('size', editSize);
+    if (editQuality) fallbackForm.append('quality', editQuality);
     fallbackForm.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
     res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
       method: 'POST',
       headers: { authorization: `Bearer ${apiKey}` },
-      body: fallbackForm
+      body: fallbackForm,
+      signal
     });
     text = await res.text();
     data = text ? JSON.parse(text) : {};
@@ -204,19 +228,19 @@ function miniMaxSourceImage(source: SourceImage, mode: MiniMaxSourceMode) {
   return createSignedImageSourceUrl(source.attachmentId);
 }
 
-async function callMiniMaxImageToImage(endpoint: string, apiKey: string, model: string, prompt: string, source: SourceImage) {
+async function callMiniMaxImageToImage(endpoint: string, apiKey: string, model: string, prompt: string, source: SourceImage, signal?: AbortSignal) {
   const preferredMode: MiniMaxSourceMode = process.env.IMAGE_EDIT_SOURCE_MODE === 'signed-url' ? 'signed-url' : 'base64';
   const fallbackMode: MiniMaxSourceMode = preferredMode === 'base64' ? 'signed-url' : 'base64';
 
   try {
-    return await callMiniMaxImageToImageWithSourceMode(endpoint, apiKey, model, prompt, source, preferredMode);
+    return await callMiniMaxImageToImageWithSourceMode(endpoint, apiKey, model, prompt, source, preferredMode, signal);
   } catch (error) {
     console.warn(`[image_to_image] MiniMax ${preferredMode} source failed, retrying ${fallbackMode}:`, error instanceof Error ? error.message : error);
-    return callMiniMaxImageToImageWithSourceMode(endpoint, apiKey, model, prompt, source, fallbackMode);
+    return callMiniMaxImageToImageWithSourceMode(endpoint, apiKey, model, prompt, source, fallbackMode, signal);
   }
 }
 
-async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: string, model: string, prompt: string, source: SourceImage, sourceMode: MiniMaxSourceMode) {
+async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: string, model: string, prompt: string, source: SourceImage, sourceMode: MiniMaxSourceMode, signal?: AbortSignal) {
   const body: Record<string, unknown> = {
     model,
     prompt,
@@ -227,7 +251,7 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
       image_file: miniMaxSourceImage(source, sourceMode)
     }]
   };
-  if (process.env.IMAGE_ASPECT_RATIO) body.aspect_ratio = process.env.IMAGE_ASPECT_RATIO;
+  if (process.env.IMAGE_EDIT_ASPECT_RATIO) body.aspect_ratio = process.env.IMAGE_EDIT_ASPECT_RATIO;
 
   const res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
     method: 'POST',
@@ -235,7 +259,8 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
       authorization: `Bearer ${apiKey}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
@@ -268,7 +293,67 @@ async function loadSourceImage(userId: string, attachmentId: string): Promise<So
   };
 }
 
-export async function generateImageForUser({ userId, prompt, conversationId, sourceAttachmentId }: GenerateImageInput) {
+function textImageMaxBatch() {
+  const value = Number(process.env.TEXT_IMAGE_MAX_BATCH);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 6;
+}
+
+function textImageMaxParallel() {
+  const value = Number(process.env.TEXT_IMAGE_MAX_PARALLEL);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 4;
+}
+
+export type GenerateImageBatchResult =
+  | { prompt: string; ok: true; markdown: string }
+  | { prompt: string; ok: false; error: string };
+
+/**
+ * Batch text-to-image generation. Each item reuses generateImageForUser so the
+ * existing image_generations row + image_usage record + attachment lifecycle
+ * stay identical to the single-image path.
+ */
+export async function generateImageBatchForUser(input: {
+  userId: string;
+  conversationId: string | null;
+  prompts: string[];
+  signal?: AbortSignal;
+}): Promise<GenerateImageBatchResult[]> {
+  const maxBatch = textImageMaxBatch();
+  const parallel = textImageMaxParallel();
+  const cleaned = (input.prompts || [])
+    .map(p => String(p == null ? '' : p).trim())
+    .filter(p => p.length > 0)
+    .slice(0, maxBatch);
+  const results: GenerateImageBatchResult[] = [];
+  for (let i = 0; i < cleaned.length; i += parallel) {
+    const chunk = cleaned.slice(i, i + parallel);
+    if (input.signal?.aborted) {
+      const reason = input.signal.reason instanceof Error ? input.signal.reason.message : '请求已取消';
+      chunk.forEach(prompt => results.push({ prompt, ok: false, error: reason }));
+      continue;
+    }
+    const settled = await Promise.allSettled(chunk.map(prompt =>
+      generateImageForUser({
+        userId: input.userId,
+        prompt,
+        conversationId: input.conversationId || undefined,
+        signal: input.signal
+      })
+    ));
+    settled.forEach((s, idx) => {
+      const prompt = chunk[idx];
+      if (s.status === 'fulfilled') {
+        results.push({ prompt, ok: true, markdown: s.value.markdown });
+      } else {
+        const message = s.reason instanceof Error ? s.reason.message : String(s.reason || '生成失败');
+        results.push({ prompt, ok: false, error: message });
+      }
+    });
+  }
+  return results;
+}
+
+export async function generateImageForUser({ userId, prompt, conversationId, sourceAttachmentId, signal }: GenerateImageInput) {
   if (conversationId && !userConversationExists(conversationId, userId)) {
     throw Object.assign(new Error('会话不存在'), { status: 404 });
   }
@@ -279,8 +364,8 @@ export async function generateImageForUser({ userId, prompt, conversationId, sou
 
   try {
     const image = sourceAttachmentId
-      ? await callImageEditApi(prompt, await loadSourceImage(userId, sourceAttachmentId))
-      : await callImageApi(prompt);
+      ? await callImageEditApi(prompt, await loadSourceImage(userId, sourceAttachmentId), signal)
+      : await callImageApi(prompt, signal);
     const attachment = await saveImageBuffer(userId, image, conversationId);
     repo.completeImageGeneration(generationId, userId, attachment.id);
     recordImageUsage(userId, generationId, model || null);

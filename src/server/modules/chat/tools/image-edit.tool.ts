@@ -4,12 +4,13 @@ import { generateImageForUser } from '../../images/imageGeneration.js';
 import { normalizeAttachmentId } from './image-understand.tool.js';
 import type { ToolBudget } from './tool-budget.js';
 
-export async function executeImageEditForUser(input: { userId: string; conversationId: string; prompt: string; sourceAttachmentId: string }) {
+export async function executeImageEditForUser(input: { userId: string; conversationId: string; prompt: string; sourceAttachmentId: string; signal?: AbortSignal }) {
   return await generateImageForUser({
     userId: input.userId,
     conversationId: input.conversationId,
     prompt: input.prompt,
-    sourceAttachmentId: input.sourceAttachmentId
+    sourceAttachmentId: input.sourceAttachmentId,
+    signal: input.signal
   });
 }
 

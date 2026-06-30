@@ -7,6 +7,7 @@ export type WorkflowInput = {
   history: Pick<MessageDTO, 'role' | 'content'>[];
   attachmentIds: string[];
   sourceAttachmentId?: string;
+  prompts?: string[];
   signal?: AbortSignal;
 };
 

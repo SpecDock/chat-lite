@@ -25,7 +25,7 @@ export type RagConfig = {
   readEnabled: boolean;
   shadowEnabled: boolean;
   topK: number;
-  currentConversationBoost: number;
+  maxDistance: number;
   contentMaxChars: number;
   chunkEnabled: boolean;
   chunkMaxChars: number;
@@ -57,7 +57,7 @@ export function ragConfig(): RagConfig {
     readEnabled: boolEnv('RAG_READ_ENABLED', false),
     shadowEnabled: boolEnv('RAG_SHADOW_ENABLED', false),
     topK: intEnv('RAG_TOP_K', 3),
-    currentConversationBoost: floatEnv('RAG_CURRENT_CONVERSATION_BOOST', 0.15),
+    maxDistance: floatEnv('RAG_MAX_DISTANCE', 0.4),
     contentMaxChars: intEnv('RAG_CONTENT_MAX_CHARS', 1200),
     chunkEnabled: boolEnv('RAG_CHUNK_ENABLED', true),
     chunkMaxChars: intEnv('RAG_CHUNK_MAX_CHARS', 1200),

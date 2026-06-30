@@ -646,6 +646,79 @@ input:focus, textarea:focus {
   font-size: 14px;
 }
 
+.msg-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  max-width: min(760px, 92%);
+}
+.msg.user .msg-row { align-items: flex-end; }
+.msg.assistant .msg-row,
+.msg.system .msg-row,
+.msg.tool .msg-row { align-items: flex-start; }
+.msg .bubble { max-width: 100%; }
+
+.copy-btn {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid var(--hairline-soft);
+  border-radius: 999px;
+  background: rgba(250, 249, 245, 0.86);
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  font-family: inherit;
+}
+.copy-btn:hover:not(:disabled):not(.is-copied) {
+  background: var(--surface-card);
+  color: var(--ink);
+  border-color: var(--hairline);
+}
+.copy-btn:active:not(:disabled):not(.is-copied) {
+  background: var(--surface-cream-strong);
+}
+.copy-btn:focus-visible {
+  outline: 2px solid var(--primary-active);
+  outline-offset: 2px;
+}
+.copy-btn.is-copied {
+  color: #2f7d3f;
+  border-color: rgba(47, 125, 63, 0.4);
+  background: rgba(225, 245, 230, 0.92);
+}
+.copy-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+}
+.copy-btn-label {
+  line-height: 1;
+}
+
+@media (max-width: 540px) {
+  .msg-row { max-width: 100%; }
+  .copy-btn {
+    height: 32px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+  .copy-btn-icon { width: 14px; height: 14px; }
+  .copy-btn-label { display: none; }
+  .copy-btn { width: auto; min-width: 36px; }
+}
+
 .markdown {
   font-size: 15px;
   line-height: 1.64;

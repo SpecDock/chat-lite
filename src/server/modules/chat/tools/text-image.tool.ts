@@ -3,11 +3,12 @@ import { z } from 'zod';
 import { generateImageForUser } from '../../images/imageGeneration.js';
 import type { ToolBudget } from './tool-budget.js';
 
-export async function executeTextImageForUser(input: { userId: string; conversationId: string; prompt: string }) {
+export async function executeTextImageForUser(input: { userId: string; conversationId: string; prompt: string; signal?: AbortSignal }) {
   return await generateImageForUser({
     userId: input.userId,
     conversationId: input.conversationId,
-    prompt: input.prompt
+    prompt: input.prompt,
+    signal: input.signal
   });
 }
 

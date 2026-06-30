@@ -32,24 +32,27 @@ export function normalizeImageAttachmentId(value: string) {
   return normalizeAttachmentId(value);
 }
 
-async function understandImageWithPrimaryModel(att: { file_path: string; mime_type: string }, prompt: string) {
+async function understandImageWithPrimaryModel(att: { file_path: string; mime_type: string }, prompt: string, signal?: AbortSignal) {
   const buffer = await readFile(att.file_path);
   const dataUrl = `data:${att.mime_type};base64,${buffer.toString('base64')}`;
-  const message = await createChatModel().invoke([
-    {
-      role: 'user',
-      content: [
-        { type: 'text', text: prompt || '请描述这张图片' },
-        { type: 'image_url', image_url: { url: dataUrl } }
-      ]
-    }
-  ]);
+  const message = await createChatModel().invoke(
+    [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt || '请描述这张图片' },
+          { type: 'image_url', image_url: { url: dataUrl } }
+        ]
+      }
+    ],
+    { signal }
+  );
   const text = textFromModelMessage(message).trim();
   if (!text) throw new Error('主模型未返回图片理解结果');
   return text;
 }
 
-export async function understandImageForUser(input: { userId: string; attachmentId: string; prompt?: string }) {
+export async function understandImageForUser(input: { userId: string; attachmentId: string; prompt?: string; signal?: AbortSignal }) {
   const normalizedAttachmentId = normalizeAttachmentId(input.attachmentId);
   const att = row<{ file_path: string; mime_type: string }>(
     'SELECT file_path,mime_type FROM attachments WHERE id=? AND user_id=?', normalizedAttachmentId, input.userId
@@ -57,7 +60,7 @@ export async function understandImageForUser(input: { userId: string; attachment
   if (!att) throw new Error(`找不到当前用户的图片附件：${normalizedAttachmentId || input.attachmentId}`);
   const prompt = input.prompt || '请详细识别这张图片的内容。';
   try {
-    return await understandImageWithPrimaryModel(att, prompt);
+    return await understandImageWithPrimaryModel(att, prompt, input.signal);
   } catch (primaryError) {
     console.warn('[understand_image] primary vision failed, falling back to MCP:', primaryError instanceof Error ? primaryError.message : primaryError);
   }

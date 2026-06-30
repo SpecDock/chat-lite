@@ -129,16 +129,20 @@ export function scheduleIndexMessage(input: RagIndexInput) {
   })();
 }
 
-function rankCandidate(candidate: RagCandidate, currentConversationId: string | undefined, boost: number): RankedCandidate {
+function rankCandidate(candidate: RagCandidate): RankedCandidate {
+  // Retrieval is now conversation-scoped, so the per-conversation boost is
+  // meaningless: every candidate already belongs to the target conversation.
   const baseScore = 1 / (1 + candidate.distance);
-  const conversationBoost = currentConversationId && candidate.item.conversation_id === currentConversationId ? boost : 0;
-  return { ...candidate, score: baseScore + conversationBoost };
+  return { ...candidate, score: baseScore };
 }
 
-export async function retrieveForUser(userId: string, query: string, historyCount: number, topK = ragConfig().topK, currentConversationId?: string): Promise<RagHit[]> {
+// userId is retained for log attribution and shadow-mode tracing only; it is
+// no longer used as an isolation boundary. conversationId is now the sole
+// retrieval scope.
+export async function retrieveForUser(userId: string, query: string, historyCount: number, topK = ragConfig().topK, conversationId?: string): Promise<RagHit[]> {
   if (!ragReadActive()) return [];
   const cfg = ragConfig();
-  if (!userId || !query || !query.trim()) return [];
+  if (!conversationId || !query || !query.trim()) return [];
   const answerLimit = historyCount > 0 ? historyCount : answerHistoryLimit();
   const effectiveTopK = Math.max(0, Math.min(topK, cfg.topK));
   if (effectiveTopK <= 0) return [];
@@ -150,14 +154,23 @@ export async function retrieveForUser(userId: string, query: string, historyCoun
   }
   let candidates: RagCandidate[] = [];
   if (embedding) {
-    candidates = vectorCandidatesForQuery(embedding, overFetch);
+    // Push the conversation filter into the SQL lookup so we never return
+    // chunks from other conversations.
+    candidates = vectorCandidatesForQuery(embedding, overFetch, { conversationId });
   } else {
     console.warn('[rag] vector search unavailable, skipping retrieval');
     return [];
   }
+  // Distance threshold: drop low-similarity chunks before they consume TopK
+  // budget or count as hits. 0 disables the filter.
+  const maxDistance = cfg.maxDistance > 0 ? cfg.maxDistance : Number.POSITIVE_INFINITY;
+  const beforeFilter = candidates.length;
+  candidates = candidates.filter(c => c.distance <= maxDistance);
+  if (beforeFilter !== candidates.length && cfg.shadowEnabled) {
+    console.info(`[rag] filtered by maxDistance=${cfg.maxDistance}: dropped=${beforeFilter - candidates.length} kept=${candidates.length}`);
+  }
   const ranked = candidates
-    .filter(c => c.item.user_id === userId)
-    .map(c => rankCandidate(c, currentConversationId, cfg.currentConversationBoost))
+    .map(c => rankCandidate(c))
     .sort((a, b) => b.score - a.score);
   recordChunkHits(ranked.map(c => c.rowid));
   const filtered = ranked.slice(0, effectiveTopK);
@@ -172,7 +185,7 @@ export async function retrieveForUser(userId: string, query: string, historyCoun
   }));
   if (cfg.shadowEnabled && !cfg.readEnabled) {
     const preview = hits.map((hit, idx) => `${idx + 1}:${hit.role}:${hit.score.toFixed(2)}:${hit.text.slice(0, 120)}`).join(' | ');
-    console.info(`[rag] shadow retrieve user=${userId} topK=${effectiveTopK} hits=${hits.length} answerLimit=${answerLimit}${preview ? ` ${preview}` : ''}`);
+    console.info(`[rag] shadow retrieve user=${userId} conversation=${conversationId} topK=${effectiveTopK} hits=${hits.length} answerLimit=${answerLimit}${preview ? ` ${preview}` : ''}`);
   }
   return hits;
 }
@@ -242,7 +255,10 @@ export async function runBackfill(options: { userIds?: string[]; limit?: number;
   const delayMs = options.delayMs ?? cfg.backfill.delayMs;
   const { db } = await import('../../core/db.js');
   const params: unknown[] = [];
-  let where = "WHERE role IN ('user','assistant') AND status IN ('completed','interrupted','error')";
+  // Skip messages whose parent conversation no longer exists (e.g. deleted
+  // while the backfill was queued). Keeps historical indexing consistent with
+  // the new conversation-scoped isolation model.
+  let where = "WHERE role IN ('user','assistant') AND status IN ('completed','interrupted','error') AND EXISTS (SELECT 1 FROM conversations WHERE conversations.id = messages.conversation_id)";
   if (options.userIds?.length) {
     const placeholders = options.userIds.map(() => '?').join(',');
     where += ` AND user_id IN (${placeholders})`;

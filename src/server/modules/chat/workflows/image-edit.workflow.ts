@@ -3,6 +3,7 @@ import { executeImageEditForUser } from '../tools/image-edit.tool.js';
 import { understandImageForUser } from '../tools/image-understand.tool.js';
 import type { WorkflowEvent, WorkflowInput } from './types.js';
 import { streamFinalAnswer, streamLiteralText } from './streaming.js';
+import { refineImageEditPrompt } from './prompt-refine.js';
 
 function wantsDescription(input: string) {
   return /先.*(说|描述|识别|分析)|这是什么|图片.*什么|先看/.test(input);
@@ -17,10 +18,12 @@ export async function* runImageEditWorkflow(input: WorkflowInput): AsyncGenerato
   let description = '';
   if (wantsDescription(input.input)) {
     yield { type: 'think', text: '正在识别原图内容。' };
-    description = await understandImageForUser({ userId: input.userId, attachmentId, prompt: input.input });
+    description = await understandImageForUser({ userId: input.userId, attachmentId, prompt: input.input, signal: input.signal });
   }
+  yield { type: 'think', text: '正在优化编辑 prompt。' };
+  const refinedPrompt = await refineImageEditPrompt({ userRequest: input.input, history: input.history, sourceDescription: description, signal: input.signal });
   yield { type: 'think', text: '正在生成图片。' };
-  const result = await executeImageEditForUser({ userId: input.userId, conversationId: input.conversationId, prompt: input.input, sourceAttachmentId: attachmentId });
+  const result = await executeImageEditForUser({ userId: input.userId, conversationId: input.conversationId, prompt: refinedPrompt, sourceAttachmentId: attachmentId, signal: input.signal });
   if (!result.markdown.includes('/api/files/att_')) throw new Error('图生图未返回有效图片附件');
   if (!description) {
     yield* streamLiteralText(`已完成图生图编辑：\n\n${result.markdown}`);

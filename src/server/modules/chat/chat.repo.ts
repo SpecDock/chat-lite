@@ -1,4 +1,5 @@
 import { all, db, now, row } from '../../core/db.js';
+import { deleteConversationChunks } from '../rag/rag.repo.js';
 import type { MessageDTO } from '../../../shared/types.js';
 
 export type ConversationRow = {
@@ -52,6 +53,17 @@ export function deleteConversationData(conversationId: string, userId: string) {
     db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?').run(conversationId, userId);
   });
   removeConversation();
+  // RAG chunks live in a separate database (rag.db), so we can't fold the
+  // cleanup into the SQL transaction above. Run it immediately after the
+  // transaction commits; failures are logged but do not roll back the
+  // conversation deletion itself. deleteConversationChunks also wipes the
+  // matching vec_rag_items rowids in the same call.
+  try {
+    const removed = deleteConversationChunks(conversationId);
+    if (removed > 0) console.info(`[rag] deleted ${removed} chunks for conversation=${conversationId}`);
+  } catch (error) {
+    console.warn('[rag] chunk cleanup failed for conversation', conversationId, error instanceof Error ? error.message : error);
+  }
   return attachments;
 }
 
