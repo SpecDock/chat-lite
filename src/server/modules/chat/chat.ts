@@ -8,7 +8,8 @@ import { defaultChatModelName, estimateTokenUsage, recordTokenUsage } from '../u
 import { agentInputForMessage, looksLikeUnfinishedPlan, parseChatRequest, shouldForceSearchFallback, userMessageContent } from './chat.service.js';
 import { ensureRagInitialized, indexChatMessage } from '../rag/rag.js';
 import { routeTask } from './task-router.js';
-import { runWorkflow } from './workflows/index.js';
+import { buildPlanFromRoute } from './engine/plan-builder.js';
+import { executePlan } from './engine/plan-executor.js';
 import {
   completeAssistantMessage,
   conversationExists,
@@ -143,8 +144,10 @@ export function registerChatRoutes(router: Router) {
       const route = await routeTask(userInput, attachmentIds, history, abortController.signal);
       let webSearchTriggered = route.intent === 'web_search';
       appendThink(`任务类型：${route.intent}`);
-      const runAgent = async (input: string) => {
-        for await (const chunk of runWorkflow(route, { userId, conversationId, input, history, attachmentIds, sourceAttachmentId: route.sourceAttachmentId, prompts: route.prompts, signal: abortController.signal })) {
+      const runAgent = async (input: string, activeRoute = route) => {
+        const workflowInput = { userId, conversationId, input, history, attachmentIds, sourceAttachmentId: activeRoute.sourceAttachmentId, prompts: activeRoute.prompts, signal: abortController.signal };
+        const plan = buildPlanFromRoute(activeRoute, workflowInput);
+        for await (const chunk of executePlan(plan, activeRoute, workflowInput)) {
           if (abortController.signal.aborted) break;
           if (chunk.type === 'usage') {
             capturedUsage = chunk.usage;
@@ -169,7 +172,9 @@ export function registerChatRoutes(router: Router) {
       if (!webSearchTriggered && looksLikeUnfinishedPlan(full) && shouldForceSearchFallback(userInput, full)) {
         appendThink('检测到需要联网搜索，正在自动补充搜索结果。');
         const searchRoute = { intent: 'web_search' as const, needVision: false, needImageEdit: false, needSearch: true, confidence: 1 };
-        for await (const chunk of runWorkflow(searchRoute, { userId, conversationId, input: userInput, history, attachmentIds, signal: abortController.signal })) {
+        const workflowInput = { userId, conversationId, input: userInput, history, attachmentIds, signal: abortController.signal };
+        const plan = buildPlanFromRoute(searchRoute, workflowInput);
+        for await (const chunk of executePlan(plan, searchRoute, workflowInput)) {
           if (abortController.signal.aborted) break;
           if (chunk.type === 'usage') capturedUsage = chunk.usage;
           else if (chunk.type === 'think') appendThink(chunk.text);

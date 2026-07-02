@@ -66,6 +66,14 @@ try {
   console.log('smoke ok');
 } finally {
   server.kill('SIGTERM');
-  await new Promise(resolve => server.once('exit', resolve));
+  if (server.exitCode === null && server.signalCode === null) {
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, 3000);
+      server.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
   await rm(dataDir, { recursive: true, force: true });
 }
