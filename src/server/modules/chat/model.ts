@@ -19,6 +19,7 @@ export function createChatModel() {
     model: modelName(),
     apiKey,
     temperature: Number(process.env.MODEL_TEMPERATURE || 0.3),
+    maxRetries: 0,
     configuration: { baseURL: modelBaseUrl() }
   });
 }

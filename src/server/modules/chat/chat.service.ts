@@ -1,38 +1,114 @@
-export function defaultUserInput(content: string, attachmentCount: number) {
-  return content || '';
+/**
+ * Helpers for parsing the `/api/chat` request body and assembling the user
+ * message that gets persisted + indexed for RAG. All routing / plan-building
+ * helpers were removed when the main path moved to AgentLoop; only the
+ * request/serialization helpers are kept here.
+ */
+
+import { answerHistoryLimit } from './history-limits.js';
+import { selectModelVisibleHistory } from './message-visibility.js';
+import { copyFile, mkdir, unlink } from 'node:fs/promises';
+import { extname, join } from 'node:path';
+import { uploadDir } from '../../core/db.js';
+import { newId } from '../../core/security.js';
+import {
+  deleteUnlinkedAttachments,
+  insertClonedAttachment,
+  listChatHistoryPage,
+  type CloneAttachmentRow
+} from './chat.repo.js';
+
+export type ClonedAttachment = Pick<CloneAttachmentRow, 'id' | 'file_path'>;
+
+export function loadModelHistory(conversationId: string, userId: string, excludedMessageIds: string[] = []) {
+  const limit = answerHistoryLimit();
+  const pageSize = 50;
+  const newest = [];
+  const excluded = new Set(excludedMessageIds);
+  let offset = 0;
+  while (newest.length < limit) {
+    const page = listChatHistoryPage(conversationId, userId, pageSize, offset);
+    for (const message of page) {
+      if (excluded.has(message.id)) continue;
+      if (selectModelVisibleHistory([message], 1).length) newest.push(message);
+      if (newest.length >= limit) break;
+    }
+    offset += page.length;
+    if (page.length < pageSize) break;
+  }
+  return newest.slice(0, limit).reverse();
 }
 
 export function userMessageContent(input: string, attachmentIds: string[]) {
   if (!attachmentIds.length) return input;
-  return `${input}\n\n${attachmentIds.map(id => `![image](/api/files/${id})`).join('\n')}`;
+  const imageMarkdown = attachmentIds.map(id => `![image](/api/files/${id})`).join('\n');
+  return input ? `${input}\n\n${imageMarkdown}` : imageMarkdown;
 }
 
-export function agentInputForMessage(input: string, attachmentIds: string[]) {
-  if (!attachmentIds.length) return input;
-  return `${input}\n\n本轮图片附件 ID：${attachmentIds.join(', ')}。如果用户需要识别/分析图片，请调用 understand_image；如果用户需要基于原图生成或修改图片，请调用 image_to_image。`;
+export function attachmentIdsFromContent(content: string) {
+  const ids = new Set<string>();
+  const pattern = /!\[[^\]]*\]\(\/api\/files\/([^\s)]+)(?:\s+["'][^"']*["'])?\)/g;
+  for (const match of content.matchAll(pattern)) {
+    try {
+      ids.add(decodeURIComponent(match[1]));
+    } catch {
+      ids.add(match[1]);
+    }
+  }
+  return [...ids];
 }
 
-export function requiresGeneratedImage(input: string, attachmentIds: string[]) {
-  if (!attachmentIds.length) return false;
-  return /(添加|加上|放上|贴纸|爱心|修改|编辑|改图|改成|换|去掉|删除|擦除|重绘|生成|动漫化|风格|背景|头像|海报|插画|图生图|参考原图|根据.*图)/.test(input)
-    && !/(不要生成|不用生成|不要改|只识别|只分析|只描述)/.test(input);
+export function stripUserImageContent(content: string) {
+  return content
+    .replace(/!\[[^\]]*\]\(\/api\/files\/[^\s)]+(?:\s+["'][^"']*["'])?\)/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
-export function hasGeneratedImageLink(output: string) {
-  return /!\[[^\]]*\]\(\/api\/files\/att_[^)]+\)/.test(output);
+export async function cloneUserAttachments(attachments: CloneAttachmentRow[], userId: string, conversationId: string) {
+  if (!attachments.length) return [];
+  const userDirectory = join(uploadDir, userId);
+  await mkdir(userDirectory, { recursive: true });
+  const clones: ClonedAttachment[] = [];
+  try {
+    for (const source of attachments) {
+      const id = newId('att');
+      const suffix = extname(source.file_path) || extname(source.original_name || '') || '.img';
+      const filePath = join(userDirectory, `${id}${suffix}`);
+      await copyFile(source.file_path, filePath);
+      try {
+        insertClonedAttachment({
+          id,
+          userId,
+          conversationId,
+          originalName: source.original_name,
+          filePath,
+          publicPath: `/api/files/${id}`,
+          mimeType: source.mime_type,
+          size: source.size
+        });
+      } catch (error) {
+        await unlink(filePath).catch(() => undefined);
+        throw error;
+      }
+      clones.push({ id, file_path: filePath });
+    }
+    return clones;
+  } catch (error) {
+    deleteUnlinkedAttachments(clones.map(clone => clone.id), userId);
+    await Promise.allSettled(clones.map(clone => unlink(clone.file_path)));
+    throw error;
+  }
 }
 
-export function looksLikeUnfinishedPlan(output: string) {
-  const text = output.trim();
-  return /(我先|我会|然后|接下来|准备|将会|再帮你|再按|稍后|正在|我去|我帮你).*?(看图|确认|识别|调用|生成|编辑|处理|加|添加|搜索|搜|查|联网|找)/.test(text)
-    && !hasGeneratedImageLink(text)
-    && !/(无法|不能|失败|暂不可用|配置|报错)/.test(text);
+export async function discardClonedAttachments(attachments: ClonedAttachment[], userId: string) {
+  deleteUnlinkedAttachments(attachments.map(attachment => attachment.id), userId);
+  await Promise.allSettled(attachments.map(attachment => unlink(attachment.file_path)));
 }
 
-export function shouldForceSearchFallback(input: string, output: string) {
-  if (/(翻译|润色|改写|写代码|代码|函数|组件|SQL|正则|作文|邮件|文案)/i.test(input)) return false;
-  return /(搜索|联网|最新|今天|新闻|网页|网址|价格|政策|实时|搜一下|查一下|帮我搜|帮我查|找一下|了解一下|百度|谷歌|最近怎么样|search|look up|find out|google it)/i.test(input)
-    || /(我去搜索|我先查|我帮你查|我帮你搜|我来搜索|我来查|需要搜索|需要联网)/.test(output);
+export async function removeAttachmentFiles(attachments: Array<{ file_path: string }>) {
+  await Promise.allSettled(attachments.map(attachment => unlink(attachment.file_path)));
 }
 
 export function parseChatRequest(body: unknown) {
@@ -40,5 +116,7 @@ export function parseChatRequest(body: unknown) {
   const content = String(source.content || source.message || '').trim();
   const conversationId = String(source.conversationId || '').trim();
   const attachmentIds = Array.isArray(source.attachmentIds) ? source.attachmentIds.map(String).filter(Boolean).slice(0, 4) : [];
-  return { content, conversationId, attachmentIds, userInput: defaultUserInput(content, attachmentIds.length) };
+  const editUserMessageId = String(source.editUserMessageId || '').trim();
+  const userInput = content || '';
+  return { content, conversationId, attachmentIds, editUserMessageId, userInput };
 }

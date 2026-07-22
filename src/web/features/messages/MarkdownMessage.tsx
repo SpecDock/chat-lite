@@ -2,8 +2,6 @@ import { Component, type ReactNode, useMemo } from 'react';
 import MarkdownIt from 'markdown-it';
 import DOMPurify from 'dompurify';
 import taskLists from 'markdown-it-task-lists';
-import markdownItKatex from 'markdown-it-katex';
-import 'katex/dist/katex.min.css';
 
 const md = new MarkdownIt({
   html: false,
@@ -13,7 +11,6 @@ const md = new MarkdownIt({
 });
 
 md.use(taskLists, { enabled: false, label: true, labelAfter: true });
-md.use(markdownItKatex);
 
 class MarkdownRenderBoundary extends Component<{ fallback: string; children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -39,7 +36,7 @@ class MarkdownRenderBoundary extends Component<{ fallback: string; children: Rea
 function renderMarkdown(content: string) {
   const html = md.render(content);
   return DOMPurify.sanitize(html, {
-    USE_PROFILES: { html: true, mathMl: true },
+    USE_PROFILES: { html: true },
     ADD_ATTR: ['target', 'rel', 'class', 'disabled', 'checked'],
   });
 }
@@ -64,9 +61,7 @@ function splitThinkBlocks(content: string) {
       answer.push(content.slice(cursor));
       break;
     }
-
     if (start > cursor) answer.push(content.slice(cursor, start));
-
     const bodyStart = start + openTag.length;
     const end = content.indexOf(closeTag, bodyStart);
     if (end === -1) {
@@ -74,7 +69,6 @@ function splitThinkBlocks(content: string) {
       cursor = content.length;
       break;
     }
-
     thinking.push(content.slice(bodyStart, end));
     cursor = end + closeTag.length;
   }

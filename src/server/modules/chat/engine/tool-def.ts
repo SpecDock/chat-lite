@@ -1,58 +1,87 @@
 import type { z } from 'zod';
 import type { MessageDTO } from '../../../../shared/types.js';
-import type { TaskRoute } from '../task-router.js';
-import type { WorkflowEvent, WorkflowInput } from '../workflows/types.js';
-import type { ArtifactStore } from './artifact-store.js';
+import { answerHistoryLimit } from '../history-limits.js';
+import { selectModelVisibleHistory, stripThinkBlocks } from '../message-visibility.js';
 
-export type ToolName =
-  | 'web_search'
-  | 'vision_understand'
-  | 'llm_respond'
-  | 'prompt_refine_text'
-  | 'prompt_refine_text_batch'
-  | 'prompt_refine_edit'
-  | 'text_to_image'
-  | 'image_edit'
-  | 'literal_response'
-  | 'agent_fallback';
+export type ToolName = 'web_search' | 'text_to_image' | 'image_edit' | 'view_image';
 
-export type ToolContext = WorkflowInput & {
-  route: TaskRoute;
-  artifacts: ArtifactStore;
+export type ImageCandidate = {
+  attachmentId: string;
+  label: string;
+  createdAt: string;
+  sourceText: string;
 };
 
-export type ToolResult =
+export type AgentContext = {
+  userId: string;
+  conversationId: string;
+  requestId?: string;
+  userInput: string;
+  history: Pick<MessageDTO, 'role' | 'content' | 'status'>[];
+  attachmentIds: string[];
+  imageCandidates?: { current: ImageCandidate[]; historical: ImageCandidate[]; generated: ImageCandidate[] };
+  viewedImageIds?: Set<string>;
+  signal?: AbortSignal;
+};
+
+/**
+ * Per-run mutable flags threaded through tool calls so individual tools
+ * (and the executor that calls them) can share state without each tool
+ * having to re-derive it. Mirrors what OpenCode threads via the closure
+ * inside `run-state.ts`.
+ */
+export type AgentRunFlags = {
+  imageAlreadyProduced: boolean;
+};
+
+export type AgentUsage = {
+  model?: string | null;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+};
+
+/**
+ * Streamed events produced by the agent loop. `think` and `delta` are
+ * forwarded to the SSE stream as `think` / `delta` events. `usage` is
+ * forwarded as `usage` events for billing. The chat.ts layer emits terminal
+ * events (`done` / `cancelled` / `error`).
+ */
+export type AgentEvent =
   | { type: 'think'; text: string }
   | { type: 'delta'; text: string }
-  | { type: 'usage'; usage: Extract<WorkflowEvent, { type: 'usage' }>['usage'] }
-  | { type: 'result'; status: 'success'; output?: unknown; artifacts?: Record<string, unknown>; think?: string }
-  | { type: 'result'; status: 'error'; error: string; recoverable?: boolean; think?: string };
+  | { type: 'usage'; usage: AgentUsage };
 
-export type ToolExecuteResult = ToolResult | AsyncGenerator<ToolResult>;
+/**
+ * A tool returns either:
+ * - a plain string (treated as the tool message content and a think hint of
+ *   "工具调用完成：<name>")
+ * - an AgentEvent (e.g. delta / usage)
+ * - an async generator of AgentEvents
+ */
+export type ToolExecuteResult = AgentEvent | string | AsyncGenerator<AgentEvent | string> | {
+  type: 'view_image';
+  text: string;
+  dataUrl: string;
+  attachmentId: string;
+} | {
+  type: 'tool_error';
+  text: string;
+};
 
 export type ToolDef<TSchema extends z.ZodTypeAny = z.ZodTypeAny> = {
   name: ToolName;
   description: string;
   schema: TSchema;
-  execute(args: z.infer<TSchema>, ctx: ToolContext): Promise<ToolExecuteResult> | ToolExecuteResult;
+  execute(args: z.infer<TSchema>, ctx: AgentContext): Promise<ToolExecuteResult> | ToolExecuteResult;
 };
-
-export function toolError(error: unknown, recoverable = false): ToolResult {
-  return {
-    type: 'result',
-    status: 'error',
-    error: error instanceof Error ? error.message : String(error || '未知错误'),
-    recoverable
-  };
-}
 
 export function assertNotAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw Object.assign(new Error('请求已取消'), { name: 'AbortError' });
 }
 
-export function historyText(history: Pick<MessageDTO, 'role' | 'content'>[], limit: number, slice = 800) {
-  return history
-    .slice(-limit)
-    .map(m => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').slice(0, slice)}`)
+export function historyText(history: Pick<MessageDTO, 'role' | 'content' | 'status'>[], limit: number = answerHistoryLimit(), slice = 800) {
+  return selectModelVisibleHistory(history, limit)
+    .map(m => `${m.role === 'user' ? '用户' : '助手'}：${m.role === 'assistant' ? stripThinkBlocks(m.content).slice(0, slice) : String(m.content || '').slice(0, slice)}`)
     .join('\n');
 }

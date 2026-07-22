@@ -8,13 +8,17 @@ import {
   hasMessageEmbedded,
   hasMessageIndexed,
   insertChunk,
+  listDistinctIndexedMessageIds,
   recordChunkHits,
   recordChunksInjected,
+  embeddingsForCandidates,
+  keywordCandidatesForQuery,
   type RagCandidate,
   vectorCandidatesForQuery
 } from './rag.repo.js';
 import { listMessages } from '../chat/chat.repo.js';
 import { answerHistoryLimit } from '../chat/history-limits.js';
+import { isModelVisibleMessage } from '../chat/message-visibility.js';
 
 export type RagIndexInput = {
   userId: string;
@@ -22,6 +26,7 @@ export type RagIndexInput = {
   messageId: string;
   role: 'user' | 'assistant';
   content: string;
+  status?: 'streaming' | 'completed' | 'interrupted' | 'error';
   createdAt?: string;
 };
 
@@ -74,8 +79,10 @@ async function indexOne(input: RagIndexInput) {
   if (!ragWriteEnabled()) return;
   if (!input.messageId || !input.userId || !input.conversationId) return;
   if (input.role !== 'user' && input.role !== 'assistant') return;
-  // Replace existing chunks for this message (idempotent re-indexing).
-  deleteMessageChunks(input.userId, input.messageId);
+  if (!isModelVisibleMessage({ ...input, status: input.status || 'completed' })) {
+    deleteMessageChunks(input.userId, input.messageId);
+    return;
+  }
   const cfg = ragConfig();
   const cleaned = cleanForIndexing(input.content, cfg.contentMaxChars);
   if (!cleaned || cleaned.length < 8) {
@@ -90,16 +97,36 @@ async function indexOne(input: RagIndexInput) {
   const useEmbeddings = embeddingConfigured() && ragDb().vectorAvailable;
   const createdAt = input.createdAt || new Date().toISOString();
   let embeddedCount = 0;
+  const prepared: Array<{ chunk: RagChunk; embedding: Float32Array | null }> = [];
+  let embeddingFailed = false;
   for (let i = 0; i < chunks.length; i += 1) {
     const chunk = chunks[i];
     let embedding: Float32Array | null = null;
     if (useEmbeddings) {
-      const result = await embedText(chunk.text);
-      if (result) {
-        embedding = result.vector;
-        embeddedCount += 1;
+      try {
+        const result = await embedText(chunk.text);
+        if (result) {
+          embedding = result.vector;
+          embeddedCount += 1;
+        } else {
+          embeddingFailed = true;
+        }
+      } catch (error) {
+        embeddingFailed = true;
+        console.warn('[rag] embedding threw while indexing:', error instanceof Error ? error.message : error);
       }
     }
+    prepared.push({ chunk, embedding });
+  }
+  // Do not discard a known-good index until all remote embedding work succeeded.
+  if (useEmbeddings && embeddingFailed && hasMessageIndexed(input.userId, input.messageId)) {
+    console.warn(`[rag] embedding incomplete; preserving existing index for ${input.messageId}`);
+    return;
+  }
+  if (useEmbeddings && embeddingFailed) console.warn(`[rag] embedding incomplete; storing keyword-only chunks for new message ${input.messageId}`);
+  deleteMessageChunks(input.userId, input.messageId);
+  for (let i = 0; i < prepared.length; i += 1) {
+    const { chunk, embedding } = prepared[i];
     insertChunk({
       id: chunkId(input.messageId, i),
       userId: input.userId,
@@ -111,7 +138,8 @@ async function indexOne(input: RagIndexInput) {
       chunkType: chunk.type || 'text',
       importance: typeof chunk.importance === 'number' ? chunk.importance : 0.5,
       createdAt,
-      embedding
+      embedding,
+      dimensions: cfg.embedding.dimensions
     });
   }
   console.info(`[rag] indexed ${input.messageId} chunks=${chunks.length} embedded=${embeddedCount} role=${input.role}`);
@@ -129,37 +157,64 @@ export function scheduleIndexMessage(input: RagIndexInput) {
   })();
 }
 
-function rankCandidate(candidate: RagCandidate): RankedCandidate {
-  // Retrieval is now conversation-scoped, so the per-conversation boost is
-  // meaningless: every candidate already belongs to the target conversation.
-  const baseScore = 1 / (1 + candidate.distance);
-  return { ...candidate, score: baseScore };
+function cosine(a: Float32Array, b: Float32Array) {
+  let dot = 0; let aa = 0; let bb = 0;
+  for (let i = 0; i < a.length; i += 1) { dot += a[i] * b[i]; aa += a[i] * a[i]; bb += b[i] * b[i]; }
+  return aa && bb ? dot / Math.sqrt(aa * bb) : 0;
+}
+
+export function jaccard(a: string, b: string) {
+  const tokens = (text: string) => {
+    const normalized = text.toLowerCase().replace(/\s+/gu, ' ').trim();
+    const values = new Set<string>();
+    for (const word of normalized.match(/[a-z0-9][a-z0-9._-]*/giu) || []) values.add(`w:${word}`);
+    const compact = normalized.replace(/\s+/gu, '');
+    for (let i = 0; i + 2 < compact.length; i += 1) values.add(`t:${compact.slice(i, i + 3)}`);
+    return values;
+  };
+  const left = tokens(a);
+  const right = tokens(b);
+  let shared = 0; for (const value of left) if (right.has(value)) shared += 1;
+  return shared / (left.size + right.size - shared || 1);
+}
+
+function preferred(a: RankedCandidate, b: RankedCandidate) {
+  if (a.item.created_at !== b.item.created_at) return a.item.created_at > b.item.created_at ? a : b;
+  if (a.item.importance !== b.item.importance) return a.item.importance > b.item.importance ? a : b;
+  return a.item.role === 'user' ? a : b;
 }
 
 // userId is retained for log attribution and shadow-mode tracing only; it is
 // no longer used as an isolation boundary. conversationId is now the sole
 // retrieval scope.
-export async function retrieveForUser(userId: string, query: string, historyCount: number, topK = ragConfig().topK, conversationId?: string): Promise<RagHit[]> {
+export async function retrieveForUser(userId: string, query: string, historyCount: number, topK = ragConfig().topK, conversationId?: string, signal?: AbortSignal): Promise<RagHit[]> {
+  if (signal?.aborted) throw Object.assign(new Error('请求已取消'), { name: 'AbortError' });
   if (!ragReadActive()) return [];
   const cfg = ragConfig();
   if (!conversationId || !query || !query.trim()) return [];
   const answerLimit = historyCount > 0 ? historyCount : answerHistoryLimit();
   const effectiveTopK = Math.max(0, Math.min(topK, cfg.topK));
   if (effectiveTopK <= 0) return [];
-  const overFetch = Math.max(effectiveTopK * 5, 8);
+  const overFetch = 15;
   let embedding: Float32Array | null = null;
   if (ragDb().vectorAvailable && embeddingConfigured()) {
-    const result = await embedText(query);
-    if (result) embedding = result.vector;
+    try {
+      const result = await embedText(query, signal);
+      if (result) embedding = result.vector;
+    } catch (error) {
+      if (signal?.aborted) throw Object.assign(new Error('请求已取消'), { name: 'AbortError' });
+      console.warn('[rag] query embedding failed, continuing keyword-only', {
+        name: error instanceof Error ? error.name : undefined,
+        code: error && typeof error === 'object' && 'code' in error ? String(error.code) : undefined
+      });
+    }
   }
+  if (signal?.aborted) throw Object.assign(new Error('请求已取消'), { name: 'AbortError' });
   let candidates: RagCandidate[] = [];
   if (embedding) {
-    // Push the conversation filter into the SQL lookup so we never return
-    // chunks from other conversations.
+    // vec0 candidates are globally ordered; repository overfetches until the
+    // conversation-scoped candidate target is met.
     candidates = vectorCandidatesForQuery(embedding, overFetch, { conversationId });
-  } else {
-    console.warn('[rag] vector search unavailable, skipping retrieval');
-    return [];
   }
   // Distance threshold: drop low-similarity chunks before they consume TopK
   // budget or count as hits. 0 disables the filter.
@@ -169,11 +224,36 @@ export async function retrieveForUser(userId: string, query: string, historyCoun
   if (beforeFilter !== candidates.length && cfg.shadowEnabled) {
     console.info(`[rag] filtered by maxDistance=${cfg.maxDistance}: dropped=${beforeFilter - candidates.length} kept=${candidates.length}`);
   }
-  const ranked = candidates
-    .map(c => rankCandidate(c))
-    .sort((a, b) => b.score - a.score);
-  recordChunkHits(ranked.map(c => c.rowid));
-  const filtered = ranked.slice(0, effectiveTopK);
+  const keyword = keywordCandidatesForQuery(query, overFetch, conversationId);
+  const union = new Map<number, { candidate: RagCandidate; vectorRank?: number; keywordRank?: number }>();
+  candidates.forEach((candidate, index) => union.set(candidate.rowid, { candidate, vectorRank: index + 1 }));
+  keyword.forEach((candidate, index) => {
+    const current = union.get(candidate.rowid);
+    if (current) current.keywordRank = index + 1;
+    else union.set(candidate.rowid, { candidate: { rowid: candidate.rowid, distance: 0, item: candidate.item }, keywordRank: index + 1 });
+  });
+  const maximum = 1 / 61;
+  const ranked: RankedCandidate[] = [...union.values()].map(({ candidate, vectorRank, keywordRank }) => ({
+    ...candidate,
+    score: ((vectorRank ? 0.7 / (60 + vectorRank) : 0) + (keywordRank ? 0.3 / (60 + keywordRank) : 0)) / maximum
+  })).sort((a, b) => b.score - a.score);
+  const embeddings = embeddingsForCandidates(ranked.map(candidate => candidate.rowid));
+  const parent = ranked.map((_, index) => index);
+  const find = (index: number): number => parent[index] === index ? index : (parent[index] = find(parent[index]));
+  for (let i = 0; i < ranked.length; i += 1) for (let j = 0; j < i; j += 1) {
+    const a = embeddings.get(ranked[i].rowid); const b = embeddings.get(ranked[j].rowid);
+    if (a && b && a.length === b.length && cosine(a, b) >= 0.95 && jaccard(ranked[i].item.chunk_text, ranked[j].item.chunk_text) >= 0.85) parent[find(i)] = find(j);
+  }
+  const groups = new Map<number, RankedCandidate[]>();
+  ranked.forEach((candidate, index) => { const group = find(index); groups.set(group, [...(groups.get(group) || []), candidate]); });
+  const deduped = [...groups.values()].map(group => {
+    const representative = group.reduce(preferred);
+    representative.score = Math.max(...group.map(candidate => candidate.score));
+    return representative;
+  });
+  deduped.sort((a, b) => b.score - a.score);
+  const filtered = deduped.slice(0, effectiveTopK);
+  recordChunkHits(filtered.map(c => c.rowid));
   if (cfg.readEnabled) recordChunksInjected(filtered.map(c => c.rowid));
   const hits: RagHit[] = filtered.map(c => ({
     messageId: c.item.message_id,
@@ -183,9 +263,9 @@ export async function retrieveForUser(userId: string, query: string, historyCoun
     importance: c.item.importance,
     score: c.score
   }));
-  if (cfg.shadowEnabled && !cfg.readEnabled) {
+  if (cfg.shadowEnabled) {
     const preview = hits.map((hit, idx) => `${idx + 1}:${hit.role}:${hit.score.toFixed(2)}:${hit.text.slice(0, 120)}`).join(' | ');
-    console.info(`[rag] shadow retrieve user=${userId} conversation=${conversationId} topK=${effectiveTopK} hits=${hits.length} answerLimit=${answerLimit}${preview ? ` ${preview}` : ''}`);
+    console.info(`[rag] shadow retrieve user=${userId} conversation=${conversationId} vector=${candidates.length} keyword=${keyword.length} union=${union.size} dedup=${deduped.length} final=${hits.length} topK=${effectiveTopK} answerLimit=${answerLimit}${preview ? ` ${preview}` : ''}`);
   }
   return hits;
 }
@@ -215,14 +295,43 @@ export type BackfillCandidate = {
   conversation_id: string;
   role: 'user' | 'assistant';
   content: string;
+  status: 'streaming' | 'completed' | 'interrupted' | 'error';
   created_at: string;
 };
+
+export async function purgeNonVisibleRagChunks() {
+  const { db } = await import('../../core/db.js');
+  const rows = db.prepare("SELECT id,user_id,role,content,status FROM messages WHERE role='assistant'").all() as Array<Pick<BackfillCandidate, 'id' | 'user_id' | 'role' | 'content' | 'status'>>;
+  let removed = 0;
+  for (const candidate of rows) {
+    if (!isModelVisibleMessage(candidate)) removed += deleteMessageChunks(candidate.user_id, candidate.id);
+  }
+  return removed;
+}
+
+export async function purgeOrphanedRagChunks() {
+  const { db } = await import('../../core/db.js');
+  const indexedMessages = listDistinctIndexedMessageIds();
+  const messageExists = db.prepare('SELECT 1 FROM messages WHERE id=? AND user_id=? LIMIT 1');
+  let removed = 0;
+  for (const candidate of indexedMessages) {
+    if (!messageExists.get(candidate.message_id, candidate.user_id)) {
+      removed += deleteMessageChunks(candidate.user_id, candidate.message_id);
+    }
+  }
+  return removed;
+}
 
 async function backfillBatch(candidates: BackfillCandidate[], summary: BackfillSummary, delayMs: number) {
   const cfg = ragConfig();
   const shouldRequireEmbeddings = embeddingConfigured() && ragDb().vectorAvailable;
   for (const candidate of candidates) {
     summary.scanned += 1;
+    if (!isModelVisibleMessage(candidate)) {
+      deleteMessageChunks(candidate.user_id, candidate.id);
+      summary.skipped += 1;
+      continue;
+    }
     const alreadyDone = shouldRequireEmbeddings
       ? hasMessageEmbedded(candidate.user_id, candidate.id, cfg.embedding.dimensions)
       : hasMessageIndexed(candidate.user_id, candidate.id);
@@ -237,6 +346,7 @@ async function backfillBatch(candidates: BackfillCandidate[], summary: BackfillS
         messageId: candidate.id,
         role: candidate.role,
         content: candidate.content,
+        status: candidate.status,
         createdAt: candidate.created_at
       });
       summary.indexed += 1;
@@ -254,17 +364,18 @@ export async function runBackfill(options: { userIds?: string[]; limit?: number;
   const batchSize = options.batchSize ?? cfg.backfill.batchSize;
   const delayMs = options.delayMs ?? cfg.backfill.delayMs;
   const { db } = await import('../../core/db.js');
+  await purgeNonVisibleRagChunks();
   const params: unknown[] = [];
   // Skip messages whose parent conversation no longer exists (e.g. deleted
   // while the backfill was queued). Keeps historical indexing consistent with
   // the new conversation-scoped isolation model.
-  let where = "WHERE role IN ('user','assistant') AND status IN ('completed','interrupted','error') AND EXISTS (SELECT 1 FROM conversations WHERE conversations.id = messages.conversation_id)";
+  let where = "WHERE role IN ('user','assistant') AND status IN ('completed','interrupted') AND EXISTS (SELECT 1 FROM conversations WHERE conversations.id = messages.conversation_id)";
   if (options.userIds?.length) {
     const placeholders = options.userIds.map(() => '?').join(',');
     where += ` AND user_id IN (${placeholders})`;
     params.push(...options.userIds);
   }
-  const sql = `SELECT id, user_id, conversation_id, role, content, created_at FROM messages ${where} ORDER BY created_at ASC`;
+  const sql = `SELECT id, user_id, conversation_id, role, content, status, created_at FROM messages ${where} ORDER BY created_at ASC`;
   const rows = db.prepare(sql).all(...params) as BackfillCandidate[];
   const slice = options.limit && options.limit > 0 ? rows.slice(0, options.limit) : rows;
   for (let i = 0; i < slice.length; i += batchSize) {

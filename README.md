@@ -29,7 +29,7 @@ Node.js 原生 HTTP API + 小型 TypeScript Router
 
 | 维度 | 选型 |
 | --- | --- |
-| 前端 | React + Vite + TypeScript + markdown-it + DOMPurify + KaTeX + GSAP |
+| 前端 | React + Vite + TypeScript + markdown-it + DOMPurify + GSAP |
 | 后端 | Node.js (≥ 22) + 原生 `node:http` + TypeScript + esbuild |
 | 数据库 | SQLite + better-sqlite3 |
 | 向量库 | sqlite-vec（独立 rag.db，与 app.db 分离） |
@@ -60,7 +60,7 @@ chat-lite/
 │  │  └─ index.ts              # 入口
 │  └─ web/                     # 前端 React
 │     ├─ features/chat/        # MessageList / MessageActions / MessageInput
-│     ├─ features/messages/    # MarkdownMessage (markdown-it + KaTeX)
+│     ├─ features/messages/    # MarkdownMessage (markdown-it)
 │     ├─ features/auth/        # Login / Register / ProfileMenu
 │     └─ App.tsx
 ├─ scripts/                    # 部署/运维脚本
@@ -108,6 +108,7 @@ APP_ORIGIN=https://chat.zzxandyl.cn
 MODEL_API_KEY=...
 MODEL_BASE_URL=https://your-endpoint/v1
 MODEL_NAME=your-model
+MODEL_MAX_ATTEMPTS=2
 ```
 
 ### 路由模型
@@ -197,10 +198,8 @@ RAG_BACKFILL_DELAY_MS=1000
 
 ```env
 AGENT_MAX_TOOL_CALLS=16
-AGENT_MAX_WEB_SEARCH_CALLS=4
 AGENT_MAX_IMAGE_GENERATION_CALLS=10
 AGENT_MAX_IMAGE_TO_IMAGE_CALLS=10
-AGENT_MAX_IMAGE_UNDERSTAND_CALLS=10
 AGENT_RECURSION_LIMIT=30
 ```
 
@@ -208,7 +207,6 @@ AGENT_RECURSION_LIMIT=30
 
 ```env
 ANSWER_HISTORY_LIMIT=20
-ROUTER_HISTORY_LIMIT=16
 ```
 
 ## 核心功能

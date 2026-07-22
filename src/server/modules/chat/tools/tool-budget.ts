@@ -1,4 +1,4 @@
-export type ToolName = 'web_search' | 'understand_image' | 'generate_image' | 'image_to_image';
+export type ToolName = 'web_search' | 'generate_image' | 'image_to_image';
 
 export function intEnv(name: string, fallback: number) {
   const value = Number(process.env[name]);
@@ -7,14 +7,12 @@ export function intEnv(name: string, fallback: number) {
 
 export function createToolBudget() {
   const limits: Record<ToolName, number> = {
-    web_search: intEnv('AGENT_MAX_WEB_SEARCH_CALLS', 5),
-    understand_image: intEnv('AGENT_MAX_IMAGE_UNDERSTAND_CALLS', 5),
+    web_search: Number.POSITIVE_INFINITY,
     generate_image: intEnv('AGENT_MAX_IMAGE_GENERATION_CALLS', 1),
     image_to_image: intEnv('AGENT_MAX_IMAGE_TO_IMAGE_CALLS', 10)
   };
   const counts: Record<ToolName, number> = {
     web_search: 0,
-    understand_image: 0,
     generate_image: 0,
     image_to_image: 0
   };

@@ -2,13 +2,15 @@ import { useEffect, useLayoutEffect, useRef } from 'react';
 import { gsap } from 'gsap';
 import type { MessageDTO } from '../../../shared/types';
 import MarkdownMessage from '../messages/MarkdownMessage';
+import InlineMessageEditor from './InlineMessageEditor';
 import MessageActions from './MessageActions';
+import { splitUserMessage } from './messageContent';
 
-function visibleContent(m: MessageDTO): string {
-  if (m.role === 'assistant') {
-    return String(m.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+function visibleContent(message: MessageDTO): string {
+  if (message.role === 'assistant') {
+    return String(message.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   }
-  return String(m.content || '');
+  return String(message.content || '');
 }
 
 function safeGetScroll(key: string) {
@@ -30,9 +32,22 @@ function isNearBottom(node: HTMLElement, threshold = 72) {
 
 type ScrollIntent = 'restore' | 'bottom' | 'follow';
 
-export default function MessageList({ messages, conversationId, storageKey, scrollIntent }: { messages: MessageDTO[]; conversationId?: string; storageKey: string; scrollIntent: ScrollIntent }) {
+type Props = {
+  messages: MessageDTO[];
+  conversationId?: string;
+  storageKey: string;
+  scrollIntent: ScrollIntent;
+  editingMessageId?: string;
+  actionsDisabled?: boolean;
+  editorDisabled?: boolean;
+  onEdit: (message: MessageDTO) => void;
+  onCancelEdit: () => void;
+  onConfirmEdit: (message: MessageDTO, text: string) => void;
+  onDelete: (message: MessageDTO) => void;
+};
+
+export default function MessageList({ messages, conversationId, storageKey, scrollIntent, editingMessageId, actionsDisabled, editorDisabled, onEdit, onCancelEdit, onConfirmEdit, onDelete }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const endRef = useRef<HTMLDivElement | null>(null);
   const lastAnimatedId = useRef<string>('');
   const restoredConversationRef = useRef<string>('');
   const lastScrollSignature = useRef<string>('');
@@ -64,10 +79,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
         window.requestAnimationFrame(() => { programmaticScrollRef.current = false; });
         return;
       }
-
-      if (scrollIntent === 'follow') return;
-
-      if (restoredConversationRef.current === conversationId) return;
+      if (scrollIntent === 'follow' || restoredConversationRef.current === conversationId) return;
       const saved = safeGetScroll(storageKey);
       if (typeof saved === 'number') {
         programmaticScrollRef.current = true;
@@ -114,7 +126,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
     lastAnimatedId.current = latest.id;
     const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(latest.id) : latest.id.replace(/"/g, '\\"');
     const node = rootRef.current?.querySelector(`[data-message-id="${safeId}"] .bubble`);
-    if (!node) return;
+    if (!node || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     const ctx = gsap.context(() => {
       gsap.fromTo(node, { autoAlpha: 0, y: 10, scale: 0.985 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.28, ease: 'power2.out' });
     }, rootRef);
@@ -123,25 +135,26 @@ export default function MessageList({ messages, conversationId, storageKey, scro
 
   return (
     <div className="messages" ref={rootRef}>
-      {messages.map(m => {
-        const copyText = visibleContent(m);
-        const showActions =
-          m.role !== 'system' &&
-          m.role !== 'tool' &&
-          m.status !== 'streaming' &&
-          copyText.length > 0;
+      {messages.map(message => {
+        const copyText = visibleContent(message);
+        const isUser = message.role === 'user';
+        const isEditing = isUser && editingMessageId === message.id;
+        const showActions = (isUser || message.role === 'assistant') && message.status !== 'streaming' && (isUser || copyText.length > 0);
+        const editable = isUser ? splitUserMessage(message) : undefined;
         return (
-          <div className={`msg ${m.role}`} data-message-id={m.id} key={m.id}>
+          <div className={`msg ${message.role} ${isEditing ? 'is-editing' : ''}`} data-message-id={message.id} key={message.id}>
             <div className="msg-row">
-              <div className="bubble">
-                <MarkdownMessage content={m.content || (m.status === 'streaming' ? '...' : '')} />
+              <div className={`bubble ${isEditing ? 'inline-edit-bubble' : ''}`}>
+                {isEditing && editable
+                  ? <InlineMessageEditor initialText={editable.text} images={editable.images} disabled={editorDisabled} onCancel={onCancelEdit} onConfirm={text => onConfirmEdit(message, text)} />
+                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} />}
               </div>
-              {showActions && <MessageActions text={copyText} />}
+              {showActions && !isEditing && <MessageActions text={copyText} isUser={isUser} disabled={actionsDisabled} onEdit={() => onEdit(message)} onDelete={() => onDelete(message)} />}
             </div>
           </div>
         );
       })}
-      <div ref={endRef} />
+      <div />
     </div>
   );
 }

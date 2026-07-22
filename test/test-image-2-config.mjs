@@ -13,8 +13,8 @@ const __dirname = path.dirname(__filename);
 // ============================================================
 // FILL THESE IN
 // ============================================================
-const API_URL = 'https://aicodelink.top/v1/images/generations';   // e.g. https://colorflowai.com/v1/images/generations
-const API_KEY = 'sk-sBBO1rmcbKAWIpXX9HYx5IaQxXEwbV8cu5BUGEgM5IyHD8VF';   // your api key
+const API_URL = 'https://colorflowai.com/v1/images/generations';   // e.g. https://colorflowai.com/v1/images/generations
+const API_KEY = '';   // your api key
 // ============================================================
 
 if (!API_URL || !API_KEY) {
@@ -28,7 +28,7 @@ const PROMPT           = '生成一张可爱泰迪棕色小狗图片，写实风
 const SIZE             = 'auto';
 const QUALITY          = 'low';
 const N                = 1;
-const RESPONSE_FORMAT  = 'url';
+const RESPONSE_FORMAT  = 'b64_json';
 const OUTPUT_PATH      = path.join(__dirname, 'output-puppy.png');
 const TIMEOUT_MS       = 5 * 60_000;
 

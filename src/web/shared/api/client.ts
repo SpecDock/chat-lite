@@ -17,13 +17,25 @@ export const api = {
   listConversations: () => fetch('/api/conversations', { credentials: 'include' }).then(r => parse<{ conversations: ConversationDTO[] }>(r)),
   createConversation: (title = '新会话') => fetch('/api/conversations', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title }) }).then(r => parse<{ conversation: ConversationDTO }>(r)),
   deleteConversation: (id: string) => fetch(`/api/conversations/${id}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
+  deleteMessage: (conversationId: string, userMessageId: string) => fetch(`/api/conversations/${conversationId}/messages/${userMessageId}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean; conversationDeleted: boolean }>(r)),
   messages: (id: string) => fetch(`/api/conversations/${id}/messages`, { credentials: 'include' }).then(r => parse<{ messages: MessageDTO[] }>(r)),
   upload: (file: File, conversationId?: string) => { const fd = new FormData(); fd.append('file', file); if (conversationId) fd.append('conversationId', conversationId); return fetch('/api/upload', { method: 'POST', credentials: 'include', body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
   usage: () => fetch('/api/usage', { credentials: 'include' }).then(r => parse<UsageDTO>(r))
 };
 
-export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], onEvent: (event: string, data: any) => void, signal?: AbortSignal) {
-  const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ conversationId, content: message, attachmentIds }), signal });
+export type ChatStreamData = {
+  conversationId?: string;
+  userMessageId?: string;
+  messageId?: string;
+  mode?: 'replace' | 'append';
+  text?: string;
+  error?: string;
+  ok?: boolean;
+};
+
+export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], onEvent: (event: string, data: ChatStreamData) => void, signal?: AbortSignal, editUserMessageId?: string) {
+  const body = { conversationId, content: message, attachmentIds, ...(editUserMessageId ? { editUserMessageId } : {}) };
+  const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
   if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error || '发送失败');
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

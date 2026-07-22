@@ -1,235 +1,194 @@
 import { z } from 'zod';
 import { executeWebSearch } from '../tools/web-search.tool.js';
-import { understandImageForUser } from '../tools/image-understand.tool.js';
 import { executeTextImageForUser } from '../tools/text-image.tool.js';
 import { executeImageEditForUser } from '../tools/image-edit.tool.js';
-import { streamAgentChat } from '../agent.js';
-import { streamFinalAnswer, streamLiteralText } from '../workflows/streaming.js';
-import { refineImageEditPrompt, refineTextImagePrompt, refineTextImagePrompts } from '../workflows/prompt-refine.js';
-import { answerHistoryLimit } from '../history-limits.js';
-import { ensureRagInitialized, getRagContext } from '../../rag/rag.js';
-import { ragConfig, ragReadActive } from '../../rag/rag.config.js';
-import { generateImageBatchForUser } from '../../images/image-generation.service.js';
-import type { ToolContext, ToolDef, ToolName, ToolResult } from './tool-def.js';
-import { assertNotAborted, historyText, toolError } from './tool-def.js';
+import { normalizeAttachmentId } from '../tools/normalize-attachment-id.js';
+import { readFile } from 'node:fs/promises';
+import { assertNotAborted, type AgentContext, type ToolDef, type ToolName } from './tool-def.js';
+import { row } from '../../../core/db.js';
 
-type ToolBudgetState = { maxTotal: number; usedTotal: number; perTool: Map<ToolName, number> };
-
-function markdownUrl(markdown: string): string | null {
-  const match = markdown.match(/\]\(([^)]+)\)/);
-  return match?.[1] || null;
-}
-
-function previewPrompt(prompt: string) {
-  const clean = String(prompt || '').replace(/\s+/g, ' ').trim();
-  return clean.length > 60 ? `${clean.slice(0, 60)}…` : clean;
-}
-
-async function ragBlock(ctx: ToolContext) {
-  ensureRagInitialized();
-  const cfg = ragConfig();
-  if (!ragReadActive() || cfg.topK <= 0) return '';
-  return await getRagContext(ctx.userId, ctx.input, ctx.history.length, cfg.topK, ctx.conversationId);
-}
-
-async function* streamLlmResponse(args: { mode?: string }, ctx: ToolContext): AsyncGenerator<ToolResult> {
-  const searchResults = ctx.artifacts.get<string>('searchResults');
-  const imageDescription = ctx.artifacts.get<string>('imageDescription');
-  const editedImages = ctx.artifacts.get<string[]>('editedImages');
-  const rag = await ragBlock(ctx);
-  let system = '你是 Chat Lite 的普通对话助手。使用中文优先回答，保持简洁、准确。不要声称自己已经或将要调用工具；如果问题需要实时信息、图片识别、图片生成、图片编辑等外部能力，而当前没有对应结果，请说明需要使用对应功能。';
-  let user = `${rag ? `${rag}\n\n` : ''}最近对话：\n${historyText(ctx.history, answerHistoryLimit()) || '(无)'}\n\n当前用户：${ctx.input}`;
-  if (editedImages?.length) {
-    const markdown = editedImages.join('\n\n');
-    system = '你是图片编辑结果助手。简短说明图片内容和编辑结果，必须原样包含给定 Markdown 图片链接。';
-    user = `用户要求：${ctx.input}\n\n图片识别结果：${imageDescription || '(未要求或未取得识别结果)'}\n\n生成图片链接：${markdown}\n\n最终回复必须包含这段 Markdown：${markdown}`;
-  } else if (searchResults) {
-    system = '你是联网搜索问答助手。必须基于搜索结果回答，不要编造。';
-    user = `${rag ? `${rag}\n\n` : ''}用户问题：${ctx.input}\n\n搜索结果：\n${searchResults}`;
-  } else if (imageDescription || args.mode === 'vision') {
-    system = '你是图片问答助手。基于图片识别结果回答用户，不要编造图片外信息。用户若上传题目且没有额外约束，直接解答。';
-    user = `用户问题：${ctx.input}\n\n图片识别结果：\n${imageDescription || '(未取得图片识别结果)'}`;
+/**
+ * Convert a zod schema to OpenAI function-calling parameters JSON.
+ *
+ * zod v4 ships `schema.toJSONSchema()` natively. We previously relied on
+ * `zod-to-json-schema@3.25.2`, but that library doesn't understand zod v4's
+ * internal `_def` and produces an empty schema, which causes OpenAI strict
+ * function calling to fail and the model to hallucinate tool arguments.
+ * See `opencode-agent-architecture.md` for related agent-loop tooling notes.
+ */
+function zodToOpenAIFunctionParameters(schema: z.ZodType): Record<string, unknown> {
+  if (typeof (schema as { toJSONSchema?: unknown }).toJSONSchema === 'function') {
+    const raw = (schema as unknown as { toJSONSchema: () => Record<string, unknown> }).toJSONSchema();
+    const { $schema: _ignored, ...parameters } = raw;
+    void _ignored;
+    return parameters;
   }
-  for await (const event of streamFinalAnswer({ system, user, signal: ctx.signal })) {
-    yield event;
-  }
+  const raw = (schema as unknown as { _def?: unknown })._def;
+  throw new Error('tool schema is not a zod v4 schema with toJSONSchema(); cannot convert to OpenAI function parameters');
 }
 
+/**
+ * Tool definitions exposed to the main agent loop. Each tool returns a string
+ * that gets fed back to the main model as a `tool` role message. The string is
+ * also wrapped so the model knows what kind of artifact it received (e.g.
+ * search snippets, generated image markdown).
+ */
 const toolDefs = [
   {
+    name: 'view_image',
+    description:
+      '查看本轮提供的历史图片候选。用户引用之前上传或生成的图片、需要识别/分析其内容，或要编辑历史图片时优先调用。只能传候选摘要中给出的 attachmentId；成功后主模型会在下一工具决策轮真正看到图片本体。当前轮上传图片已直接可见，不需要调用此工具。',
+    schema: z.object({ attachmentId: z.string().min(1).describe('历史用户图或生成图候选中的 attachmentId') }),
+    async execute(args: { attachmentId: string }, ctx: AgentContext) {
+      assertNotAborted(ctx.signal);
+      const attachmentId = normalizeAttachmentId(args.attachmentId);
+      const candidates = [...(ctx.imageCandidates?.historical || []), ...(ctx.imageCandidates?.generated || [])];
+      if (!candidates.some(candidate => candidate.attachmentId === attachmentId)) {
+        return { type: 'tool_error', text: '无法查看该图片：请选择本轮历史图片候选中的附件。' };
+      }
+      const attachment = row<{ file_path: string; mime_type: string }>(
+        "SELECT file_path, mime_type FROM attachments WHERE id=? AND user_id=? AND conversation_id=? AND mime_type LIKE 'image/%'",
+        attachmentId, ctx.userId, ctx.conversationId
+      );
+      if (!attachment) return { type: 'tool_error', text: '无法查看该图片：图片不存在、无权访问或不属于当前会话。' };
+      let buffer: Buffer;
+      try { buffer = await readFile(attachment.file_path); } catch (error) {
+        console.warn('[view_image] attachment read failed', { attachmentId, error: error instanceof Error ? error.message : error });
+        return { type: 'tool_error', text: '无法读取该图片文件，请重新上传后再试。' };
+      }
+      ctx.viewedImageIds?.add(attachmentId);
+      return {
+        type: 'view_image',
+        attachmentId,
+        dataUrl: `data:${attachment.mime_type || 'image/png'};base64,${buffer.toString('base64')}`,
+        text: `已加载历史图片 ${attachmentId}。下一工具决策轮将收到该图片本体，可据此识别、搜索或编辑。`
+      };
+    }
+  },
+  {
     name: 'web_search',
-    description: '联网搜索并保存搜索结果。',
-    schema: z.object({ query: z.string().min(1).optional() }),
-    async execute(args: { query?: string }, ctx) {
+    description:
+      '联网搜索工具。用于事实核验、证据不足、专业知识、医药咨询、实时信息，或用户明确要求搜索；医药问题可用不同 query 多次查询和比对。不要用于纯写作、翻译或闲聊。',
+    schema: z.object({ query: z.string().min(1).describe('搜索查询词；尽量保留用户原话的关键实体，避免额外修饰') }),
+    async execute(args: { query: string }, ctx: AgentContext) {
       assertNotAborted(ctx.signal);
-      const result = await executeWebSearch({ query: args.query || ctx.input });
-      return { type: 'result', status: 'success', output: result, artifacts: { searchResults: result }, think: '搜索完成，正在整理回复。' };
-    }
-  },
-  {
-    name: 'vision_understand',
-    description: '理解图片并保存描述。',
-    schema: z.object({ attachmentId: z.string().min(1).optional(), prompt: z.string().optional() }),
-    async execute(args: { attachmentId?: string; prompt?: string }, ctx) {
-      assertNotAborted(ctx.signal);
-      const attachmentId = args.attachmentId || ctx.sourceAttachmentId || ctx.route.sourceAttachmentId;
-      if (!attachmentId) return { type: 'result', status: 'error', error: '请先上传需要识别的图片。', recoverable: true };
-      const result = await understandImageForUser({ userId: ctx.userId, attachmentId, prompt: args.prompt || ctx.input || '请描述这张图片', signal: ctx.signal });
-      return { type: 'result', status: 'success', output: result, artifacts: { imageDescription: result, sourceAttachmentId: attachmentId }, think: '图片识别完成。' };
-    }
-  },
-  {
-    name: 'llm_respond',
-    description: '基于用户输入、RAG 和上游工具产物流式生成最终文本。',
-    schema: z.object({ mode: z.string().optional() }),
-    execute: streamLlmResponse
-  },
-  {
-    name: 'prompt_refine_text',
-    description: '优化单张文生图 prompt。',
-    schema: z.object({}),
-    async execute(_args, ctx) {
-      const refined = await refineTextImagePrompt({ userRequest: ctx.input, history: ctx.history, signal: ctx.signal });
-      return { type: 'result', status: 'success', output: refined, artifacts: { refinedPrompt: refined }, think: '生成 prompt 优化完成。' };
-    }
-  },
-  {
-    name: 'prompt_refine_text_batch',
-    description: '优化批量文生图 prompts。',
-    schema: z.object({ count: z.number().int().min(1).max(6).optional() }),
-    async execute(args: { count?: number }, ctx) {
-      const count = args.count || Math.max(2, Math.min(ctx.prompts?.length || 2, 6));
-      const refined = await refineTextImagePrompts({ userRequest: ctx.input, history: ctx.history, count, signal: ctx.signal });
-      return { type: 'result', status: 'success', output: refined, artifacts: { refinedPrompts: refined }, think: '批量生成 prompt 优化完成。' };
-    }
-  },
-  {
-    name: 'prompt_refine_edit',
-    description: '优化图生图编辑 prompt。',
-    schema: z.object({}),
-    async execute(_args, ctx) {
-      const refined = await refineImageEditPrompt({ userRequest: ctx.input, history: ctx.history, sourceDescription: ctx.artifacts.get<string>('imageDescription') || '', signal: ctx.signal });
-      return { type: 'result', status: 'success', output: refined, artifacts: { refinedPrompt: refined }, think: '编辑 prompt 优化完成。' };
+      const result = await executeWebSearch({ query: args.query });
+      const text = typeof result === 'string' ? result : JSON.stringify(result);
+      return `以下是联网搜索结果，请基于这些内容回答用户的问题，不要编造搜索结果之外的事实：\n\n${text}`;
     }
   },
   {
     name: 'text_to_image',
-    description: '执行文生图，支持单张或批量。',
-    schema: z.object({ batch: z.boolean().default(false) }),
-    async execute(args: { batch?: boolean }, ctx) {
+    description:
+      '高耗时且付费的文生图工具。仅当用户明确要求实际交付无原图的图片成品、且关键要求无歧义时调用。识别、分析、评价、答题、文字建议或构思不调用；歧义时不要调用，改为简短澄清。',
+    schema: z.object({ prompt: z.string().min(1).describe('完整的图片生成提示词；保留用户要求的风格、主体、比例、文字等细节') }),
+    async execute(args: { prompt: string }, ctx: AgentContext) {
       assertNotAborted(ctx.signal);
-      if (!args.batch) {
-        const prompt = ctx.artifacts.get<string>('refinedPrompt') || ctx.input;
-        const result = await executeTextImageForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompt, signal: ctx.signal });
-        if (!result.markdown.includes('/api/files/att_')) throw new Error('文生图未返回有效图片附件');
-        const finalText = `已生成图片：\n\n${result.markdown}`;
-        return { type: 'result', status: 'success', output: result.markdown, artifacts: { generatedImages: [result.markdown], finalText }, think: '图片生成完成。' };
-      }
-      const prompts = ctx.artifacts.get<string[]>('refinedPrompts') || ctx.prompts || [ctx.input];
-      const results = await generateImageBatchForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompts, signal: ctx.signal });
-      let anyValid = false;
-      let finalText = `以下为你生成 ${results.length} 张图：\n\n`;
-      for (let i = 0; i < results.length; i++) {
-        const item = results[i];
-        const idx = i + 1;
-        if (item.ok) {
-          const url = markdownUrl(item.markdown);
-          if (!url) {
-            finalText += `图 ${idx} 生成失败：返回内容不含图片链接\n\n`;
-            continue;
-          }
-          anyValid = true;
-          finalText += `${idx}. ${previewPrompt(item.prompt)}\n![图 ${idx}](${url})\n\n`;
-        } else {
-          finalText += `图 ${idx} 生成失败：${item.error}\n\n`;
-        }
-      }
-      if (!anyValid) throw new Error('文生图批量生成全部失败');
-      return { type: 'result', status: 'success', output: results, artifacts: { generatedImages: results, finalText }, think: '批量图片生成完成。' };
+      const result = await executeTextImageForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompt: args.prompt, signal: ctx.signal });
+      return `图片已真实生成并保存为附件。请在最终回复中原样包含这个 Markdown 图片链接，不要只说已生成：\n${result.markdown}`;
     }
   },
   {
     name: 'image_edit',
-    description: '执行图生图编辑。',
-    schema: z.object({ attachmentId: z.string().min(1).optional() }),
-    async execute(args: { attachmentId?: string }, ctx) {
+    description:
+      '高耗时且付费的图像编辑工具。仅当用户明确要求实际交付基于原图的编辑成品、且关键要求无歧义时调用；识别、分析、评价、答题、文字建议或构思不调用，歧义时简短澄清。attachmentId 可选：不传时使用当前图1；显式传当前候选可选择当前图；显式传历史/生成候选必须先 view_image；不属于候选的 ID 会被拒绝。不要传完整 URL。',
+    schema: z.object({
+      attachmentId: z.string().min(1).nullish().describe('可选源图附件 ID。传当前候选则使用该图；传历史或生成候选前必须先 view_image；未知 ID 会被拒绝。不传时默认当前图1。'),
+      prompt: z.string().min(1).describe('完整的编辑要求：写清楚要改什么、改成什么、保留什么、最终风格。例："保持原图构图与所有元素位置不变，仅把图中所有红色元素替换为深蓝色，自然写实风格，高清"。禁止写"修改图片""改成那样"这种占位文本。')
+    }),
+    async execute(args: { attachmentId?: string; prompt: string }, ctx: AgentContext) {
       assertNotAborted(ctx.signal);
-      const attachmentId = args.attachmentId || ctx.artifacts.get<string>('sourceAttachmentId') || ctx.sourceAttachmentId || ctx.route.sourceAttachmentId;
-      if (!attachmentId) return { type: 'result', status: 'error', error: '请先上传需要编辑的原图。', recoverable: true };
-      const prompt = ctx.artifacts.get<string>('refinedPrompt') || ctx.input;
-      const result = await executeImageEditForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompt, sourceAttachmentId: attachmentId, signal: ctx.signal });
-      if (!result.markdown.includes('/api/files/att_')) throw new Error('图生图未返回有效图片附件');
-      const imageDescription = ctx.artifacts.get<string>('imageDescription');
-      const finalText = imageDescription
-        ? `图片识别结果：${imageDescription}\n\n已完成图生图编辑：\n\n${result.markdown}`
-        : `已完成图生图编辑：\n\n${result.markdown}`;
-      return { type: 'result', status: 'success', output: result.markdown, artifacts: { editedImages: [result.markdown], finalText }, think: '图片编辑完成。' };
-    }
-  },
-  {
-    name: 'literal_response',
-    description: '把保存的文本或图片 Markdown 直接流式输出。',
-    schema: z.object({ artifact: z.string().default('finalText') }),
-    async *execute(args: { artifact: string }, ctx) {
-      const text = ctx.artifacts.get<string>(args.artifact) || String(ctx.artifacts.get('finalText') || '');
-      if (!text.trim()) {
-        yield { type: 'result', status: 'error', error: '没有可输出的工具结果', recoverable: false };
-        return;
+      // Backend picks the source image. Priority:
+      // 1. current-turn uploaded attachmentIds — ALWAYS preferred when present.
+      //    The model often hallucinates an attachmentId like "att_0" or "uploaded_image".
+      //    We deliberately ignore the model's value in that case because
+      //    ctx.attachmentIds is the authoritative source for "what was uploaded just now".
+      // 2. caller-provided attachmentId — only honored when user uploaded nothing
+      //    this turn AND the user explicitly referenced a historical image
+      //    (e.g. "刚才那张/上文那张/图2").
+      // 3. otherwise error.
+      let sourceAttachmentId = '';
+      const normalizedArg = args.attachmentId ? normalizeAttachmentId(args.attachmentId) : '';
+      const currentIds = (ctx.imageCandidates?.current || []).map(candidate => candidate.attachmentId);
+      if (normalizedArg && currentIds.includes(normalizedArg)) {
+        // If the current turn has multiple images and the model chose one of
+        // the real current attachment IDs (the user said 图2/第二张 etc), honor
+        // it. Otherwise keep the old safe default: current-turn first image.
+        sourceAttachmentId = normalizedArg;
+      } else if (normalizedArg) {
+        const historicalIds = new Set([...(ctx.imageCandidates?.historical || []), ...(ctx.imageCandidates?.generated || [])]
+          .map(candidate => candidate.attachmentId));
+        if (!historicalIds.has(normalizedArg)) {
+          return { type: 'tool_error', text: '无法编辑该图片：attachmentId 不属于本轮图片候选。' };
+        }
+        if (!ctx.viewedImageIds?.has(normalizedArg)) {
+          return { type: 'tool_error', text: '无法编辑该历史图片：请先使用 view_image 查看它。' };
+        }
+        sourceAttachmentId = normalizedArg;
+      } else {
+        sourceAttachmentId = currentIds[0] || '';
       }
-      for await (const event of streamLiteralText(text)) yield event;
-      yield { type: 'result', status: 'success', output: text };
-    }
-  },
-  {
-    name: 'agent_fallback',
-    description: '旧 mixed agent 兜底。',
-    schema: z.object({}),
-    async *execute(_args, ctx) {
-      for await (const event of streamAgentChat(ctx)) yield event;
-      yield { type: 'result', status: 'success' };
+      if (!sourceAttachmentId) {
+        return { type: 'tool_error', text: '无法编辑：请先上传图片，或提供本轮候选中的图片附件。' };
+      }
+      const result = await executeImageEditForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompt: args.prompt, sourceAttachmentId, signal: ctx.signal });
+      return `已基于原图真实生成新图片并保存为附件。请在最终回复中原样包含这个 Markdown 图片链接，不要只说已生成：\n${result.markdown}`;
     }
   }
 ] satisfies ToolDef[];
 
 export class ToolRegistry {
   private readonly defs = new Map<ToolName, ToolDef>();
-  private readonly budget: ToolBudgetState;
+  private readonly openAiTools: ChatOpenAITool[];
 
-  constructor(defs: ToolDef[] = toolDefs, maxTotal = 6) {
+  constructor(defs: ToolDef[] = toolDefs) {
     defs.forEach(def => this.defs.set(def.name, def));
-    this.budget = { maxTotal, usedTotal: 0, perTool: new Map() };
+    this.openAiTools = defs.map(toOpenAITool);
   }
 
-  async *execute(name: ToolName, args: unknown, ctx: ToolContext): AsyncGenerator<ToolResult> {
-    const def = this.defs.get(name);
-    if (!def) {
-      yield { type: 'result', status: 'error', error: `未注册工具：${name}` };
-      return;
-    }
-    const parsed = def.schema.safeParse(args || {});
-    if (!parsed.success) {
-      yield { type: 'result', status: 'error', error: `工具参数无效：${parsed.error.issues.map(i => i.message).join('；')}` };
-      return;
-    }
-    if (this.budget.usedTotal >= this.budget.maxTotal) {
-      yield { type: 'result', status: 'error', error: `工具调用超过预算 ${this.budget.maxTotal}` };
-      return;
-    }
-    this.budget.usedTotal += 1;
-    this.budget.perTool.set(name, (this.budget.perTool.get(name) || 0) + 1);
-    try {
-      const result = await def.execute(parsed.data, ctx);
-      if (result && typeof (result as AsyncGenerator<ToolResult>)[Symbol.asyncIterator] === 'function') {
-        for await (const item of result as AsyncGenerator<ToolResult>) yield item;
-      } else {
-        yield result as ToolResult;
-      }
-    } catch (error) {
-      yield toolError(error);
-    }
+  get(name: ToolName): ToolDef | undefined {
+    return this.defs.get(name);
+  }
+
+  list(): ToolDef[] {
+    return Array.from(this.defs.values());
+  }
+
+  /**
+   * Tools formatted for `ChatOpenAI.bindTools()`. Each entry is the
+   * OpenAI chat-completions function-calling shape (the same one the Chat
+   * Completions / Responses endpoints accept).
+   */
+  buildOpenAITools(): ChatOpenAITool[] {
+    return this.openAiTools;
   }
 }
 
-export function createDefaultToolRegistry() {
+export function createDefaultToolRegistry(): ToolRegistry {
   return new ToolRegistry();
+}
+
+/**
+ * OpenAI chat-completions tool shape used by `bindTools` and the Responses
+ * API. Mirrors `OpenAI.Chat.ChatCompletionTool`.
+ */
+export type ChatOpenAITool = {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+};
+
+function toOpenAITool(def: ToolDef): ChatOpenAITool {
+  const parameters = zodToOpenAIFunctionParameters(def.schema);
+  return {
+    type: 'function',
+    function: {
+      name: def.name,
+      description: def.description,
+      parameters
+    }
+  };
 }
