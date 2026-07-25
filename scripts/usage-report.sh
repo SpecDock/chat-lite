@@ -37,8 +37,13 @@ sqlite3 -header -column "$APP_DB" <<'SQL'
 SELECT
   u.id                         AS user_id,
   COALESCE(u.email, '(no email)') AS email,
-  COUNT(t.id)                  AS records,
-  COALESCE(SUM(t.total_tokens), 0) AS total_tokens
+  COUNT(t.id)                            AS records,
+  COALESCE(SUM(t.total_tokens), 0)       AS total_tokens,
+  COALESCE(SUM(t.cached_tokens), 0)      AS cached_tokens,
+  CASE WHEN SUM(t.cache_measured_prompt_tokens) > 0
+    THEN printf('%.1f%%', COALESCE(SUM(t.cached_tokens), 0) * 100.0 / SUM(t.cache_measured_prompt_tokens))
+    ELSE '--'
+  END                                    AS cache_rate
 FROM users u
 LEFT JOIN token_usage t ON t.user_id = u.id
 GROUP BY u.id
@@ -64,9 +69,26 @@ echo ""
 echo "[3/3] Grand totals"
 echo "------------------------------------------------------------"
 sqlite3 -header -column "$APP_DB" <<'SQL'
-SELECT 'token_usage' AS table_name, COUNT(*) AS rows, COALESCE(SUM(total_tokens), 0) AS total_tokens FROM token_usage
+SELECT
+  'token_usage' AS table_name,
+  COUNT(*) AS rows,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  NULL AS total_cost_units,
+  COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+  CASE WHEN SUM(cache_measured_prompt_tokens) > 0
+    THEN printf('%.1f%%', COALESCE(SUM(cached_tokens), 0) * 100.0 / SUM(cache_measured_prompt_tokens))
+    ELSE '--'
+  END AS cache_rate
+FROM token_usage
 UNION ALL
-SELECT 'image_usage' AS table_name, COUNT(*) AS rows, COALESCE(SUM(cost_units), 0) AS total_cost_units FROM image_usage;
+SELECT
+  'image_usage' AS table_name,
+  COUNT(*) AS rows,
+  NULL AS total_tokens,
+  COALESCE(SUM(cost_units), 0) AS total_cost_units,
+  NULL AS cached_tokens,
+  NULL AS cache_rate
+FROM image_usage;
 SQL
 
 echo ""

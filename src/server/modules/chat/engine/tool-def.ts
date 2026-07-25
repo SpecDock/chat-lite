@@ -39,7 +39,27 @@ export type AgentUsage = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cacheMeasuredPromptTokens?: number;
+  cachedTokens?: number;
 };
+
+export function aggregateAgentUsage(current: AgentUsage | undefined, next: AgentUsage): AgentUsage {
+  const currentHasCache = Number.isFinite(current?.cacheMeasuredPromptTokens) && Number.isFinite(current?.cachedTokens);
+  const nextHasCache = Number.isFinite(next.cacheMeasuredPromptTokens) && Number.isFinite(next.cachedTokens);
+  const hasCache = currentHasCache || nextHasCache;
+  return {
+    model: next.model ?? current?.model,
+    promptTokens: (current?.promptTokens || 0) + (next.promptTokens || 0),
+    completionTokens: (current?.completionTokens || 0) + (next.completionTokens || 0),
+    totalTokens: (current?.totalTokens || 0) + (next.totalTokens || 0),
+    ...(hasCache ? {
+      cacheMeasuredPromptTokens: (currentHasCache ? current?.cacheMeasuredPromptTokens || 0 : 0)
+        + (nextHasCache ? next.cacheMeasuredPromptTokens || 0 : 0),
+      cachedTokens: (currentHasCache ? current?.cachedTokens || 0 : 0)
+        + (nextHasCache ? next.cachedTokens || 0 : 0),
+    } : {}),
+  };
+}
 
 /**
  * Streamed events produced by the agent loop. `think` and `delta` are

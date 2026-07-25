@@ -1,6 +1,9 @@
 services:
   chat-lite:
-    build: .
+    build:
+      context: .
+      args:
+        VITE_STREAM_MARKDOWN_INTERVAL_MS: ${VITE_STREAM_MARKDOWN_INTERVAL_MS:-50}
     ports:
       - "3000:3000"
     env_file:

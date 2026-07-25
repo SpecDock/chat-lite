@@ -15,6 +15,13 @@ import {
   type ConversationActivities
 } from './conversationActivity';
 import { composeUserMessage, splitUserMessage } from './messageContent';
+import {
+  drainConversationDelta,
+  enqueueConversationDelta,
+  normalizeStreamingMarkdownInterval,
+  type ConversationDeltaBufferState,
+  type DeltaFlushScheduler,
+} from './conversationDeltaBuffer';
 import ProfileMenu from '../profile/ProfileMenu';
 
 const EMPTY_CONVERSATION_KEY = '__none__';
@@ -76,12 +83,19 @@ type ScrollIntent = 'restore' | 'bottom' | 'follow';
 type EditMode = 'replace' | 'append';
 type Operation = 'send' | 'edit';
 
-type ActiveTask = {
+type ActiveTask = ConversationDeltaBufferState & {
   controller: AbortController;
   assistantId: string;
   sentText: string;
   operation: Operation;
   cancelRequested: boolean;
+};
+
+const viteEnv = (import.meta as ImportMeta & { readonly env: Record<string, string | undefined> }).env;
+const streamingMarkdownInterval = normalizeStreamingMarkdownInterval(viteEnv.VITE_STREAM_MARKDOWN_INTERVAL_MS);
+const deltaFlushScheduler: DeltaFlushScheduler = {
+  schedule: callback => window.setTimeout(callback, streamingMarkdownInterval),
+  cancel: handle => window.clearTimeout(handle),
 };
 
 type Refill = { text: string; key: number };
@@ -114,7 +128,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const [drawer, setDrawer] = useState(false);
   const [scrollIntent, setScrollIntent] = useState<ScrollIntent>(initialScroll);
   const restoredRef = useRef(false);
-  const currentRef = useRef<string>();
+  const currentRef = useRef<string | undefined>(undefined);
   const tasksRef = useRef<Map<string, ActiveTask>>(new Map());
   const keyAliasesRef = useRef<Map<string, string>>(new Map());
 
@@ -136,6 +150,23 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   function updateMessages(key: string, update: (messages: MessageDTO[]) => MessageDTO[]) {
     setMessagesByConversation(cache => ({ ...cache, [key]: update(cache[key] || []) }));
+  }
+
+  function flushTaskDelta(task: ActiveTask) {
+    const pending = drainConversationDelta(task, deltaFlushScheduler);
+    if (!pending) return;
+    const targetKey = resolveKey(pending.targetKey);
+    updateMessages(targetKey, currentMessages => currentMessages.map(message => message.id === pending.assistantId
+      ? { ...message, content: message.content + pending.text }
+      : message));
+  }
+
+  function queueTaskDelta(task: ActiveTask, text: string, targetKey: string, assistantId: string) {
+    const delta = { text, targetKey: resolveKey(targetKey), assistantId };
+    if (!enqueueConversationDelta(task, delta, deltaFlushScheduler, () => flushTaskDelta(task))) {
+      flushTaskDelta(task);
+      enqueueConversationDelta(task, delta, deltaFlushScheduler, () => flushTaskDelta(task));
+    }
   }
 
   function setConversationError(key: string, error: string) {
@@ -160,6 +191,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }
 
   function removeTask(task: ActiveTask) {
+    flushTaskDelta(task);
     for (const [key, candidate] of tasksRef.current) {
       if (candidate === task) {
         tasksRef.current.delete(key);
@@ -191,7 +223,10 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   function removeConversationState(key: string) {
     const task = tasksRef.current.get(key);
-    if (task) task.controller.abort();
+    if (task) {
+      flushTaskDelta(task);
+      task.controller.abort();
+    }
     tasksRef.current.delete(key);
     setMessagesByConversation(cache => removeRecordValue(cache, key));
     setPendingByConversation(cache => removeRecordValue(cache, key));
@@ -349,7 +384,10 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   useEffect(() => {
     const abortTasks = () => {
-      for (const task of tasksRef.current.values()) task.controller.abort();
+      for (const task of tasksRef.current.values()) {
+        flushTaskDelta(task);
+        task.controller.abort();
+      }
       tasksRef.current.clear();
     };
     window.addEventListener('pagehide', abortTasks);
@@ -365,7 +403,9 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     let thinkClosed = false;
     let terminalEvent = false;
 
-    await streamChat(options.conversationId, options.text, options.attachmentIds, (event, data) => {
+    try {
+      await streamChat(options.conversationId, options.text, options.attachmentIds, (event, data) => {
+      if (event !== 'delta') flushTaskDelta(options.task);
       if (event === 'meta') {
         assistantMessageId = data.messageId || assistantMessageId;
         options.task.assistantId = assistantMessageId;
@@ -385,9 +425,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       if (event === 'delta') {
         const prefix = thinkStarted && !thinkClosed ? '</think>\n\n' : '';
         thinkClosed = thinkStarted || thinkClosed;
-        updateMessages(targetKey, currentMessages => currentMessages.map(message => message.id === assistantMessageId
-          ? { ...message, content: message.content + prefix + (data.text || '') }
-          : message));
+        queueTaskDelta(options.task, prefix + (data.text || ''), targetKey, assistantMessageId);
       }
       if (event === 'done') {
         terminalEvent = true;
@@ -418,7 +456,10 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         }));
         setActivity(targetKey, 'error');
       }
-    }, options.task.controller.signal, options.editUserMessageId);
+      }, options.task.controller.signal, options.editUserMessageId);
+    } finally {
+      flushTaskDelta(options.task);
+    }
 
     if (!terminalEvent && !options.task.controller.signal.aborted) throw new Error('回答连接已中断');
     return assistantMessageId;
@@ -428,6 +469,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const key = currentRef.current || EMPTY_CONVERSATION_KEY;
     const task = tasksRef.current.get(key);
     if (!task) return;
+    flushTaskDelta(task);
     task.cancelRequested = true;
     task.controller.abort();
     if (task.operation === 'send') {
@@ -461,7 +503,15 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const now = new Date().toISOString();
     const tempUser: MessageDTO = { id: crypto.randomUUID(), conversation_id: conversationId || '', role: 'user', content: userContent, status: 'completed', created_at: now };
     const tempAssistant: MessageDTO = { id: crypto.randomUUID(), conversation_id: conversationId || '', role: 'assistant', content: '', status: 'streaming', created_at: now };
-    const task: ActiveTask = { controller, assistantId: tempAssistant.id, sentText: userText, operation: 'send', cancelRequested: false };
+    const task: ActiveTask = {
+      controller,
+      assistantId: tempAssistant.id,
+      sentText: userText,
+      operation: 'send',
+      cancelRequested: false,
+      pendingDelta: '',
+      deltaFlushHandle: null,
+    };
     tasksRef.current.set(targetKey, task);
     bumpTasks();
     setActivity(targetKey, 'streaming');
@@ -490,6 +540,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       });
       await refreshConversations();
     } catch (cause) {
+      flushTaskDelta(task);
       const cancelled = task.cancelRequested || (cause instanceof DOMException && cause.name === 'AbortError');
       if (cancelled) {
         setRefillByConversation(refills => ({ ...refills, [targetKey]: { text: userText, key: (refills[targetKey]?.key || 0) + 1 } }));
@@ -506,6 +557,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       }
       setActivity(targetKey, 'error');
     } finally {
+      flushTaskDelta(task);
       removeTask(task);
       const resolvedConversationId = conversationIdForKey(targetKey);
       if (resolvedConversationId) await refreshMessages(resolvedConversationId).catch(() => undefined);
@@ -537,7 +589,15 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const tempAssistant: MessageDTO = { id: crypto.randomUUID(), conversation_id: targetKey, role: 'assistant', content: '', status: 'streaming', created_at: now };
     const optimisticUserId = optimisticMode === 'replace' ? replacementUser.id : appendedUser.id;
     const controller = new AbortController();
-    const task: ActiveTask = { controller, assistantId: tempAssistant.id, sentText: editedText, operation: 'edit', cancelRequested: false };
+    const task: ActiveTask = {
+      controller,
+      assistantId: tempAssistant.id,
+      sentText: editedText,
+      operation: 'edit',
+      cancelRequested: false,
+      pendingDelta: '',
+      deltaFlushHandle: null,
+    };
     let editAcknowledged = false;
 
     setEditingMessageId(undefined);
@@ -571,12 +631,20 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             const realUser = actualMode === 'replace'
               ? { ...replacementUser, id: data.userMessageId || replacementUser.id, conversation_id: realConversationId }
               : { ...appendedUser, id: data.userMessageId || appendedUser.id, conversation_id: realConversationId };
-            const realAssistant = { ...tempAssistant, id: assistantMessageId, conversation_id: realConversationId };
             setMessagesByConversation(cache => ({
               ...cache,
-              [targetKey]: actualMode === 'replace'
-                ? replacePair(baseMessages, userIndex, realUser, realAssistant)
-                : [...baseMessages, realUser, realAssistant]
+              [targetKey]: (() => {
+                const currentAssistant = (cache[targetKey] || []).find(candidate => candidate.id === tempAssistant.id);
+                const realAssistant = {
+                  ...tempAssistant,
+                  content: currentAssistant?.content || tempAssistant.content,
+                  id: assistantMessageId,
+                  conversation_id: realConversationId,
+                };
+                return actualMode === 'replace'
+                  ? replacePair(baseMessages, userIndex, realUser, realAssistant)
+                  : [...baseMessages, realUser, realAssistant];
+              })()
             }));
             return;
           }
@@ -589,6 +657,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       });
       await refreshConversations();
     } catch (cause) {
+      flushTaskDelta(task);
       if (task.cancelRequested || (cause instanceof DOMException && cause.name === 'AbortError')) {
         updateMessages(targetKey, currentMessages => currentMessages.map(candidate => candidate.id === task.assistantId
           ? { ...candidate, content: candidate.content || '已取消', status: 'interrupted' }
@@ -602,6 +671,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       }
       setActivity(targetKey, 'error');
     } finally {
+      flushTaskDelta(task);
       removeTask(task);
       if (editAcknowledged) await refreshMessages(targetKey).catch(() => undefined);
     }
@@ -650,7 +720,10 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }
 
   function abortAllTasks() {
-    for (const task of tasksRef.current.values()) task.controller.abort();
+    for (const task of tasksRef.current.values()) {
+      flushTaskDelta(task);
+      task.controller.abort();
+    }
     tasksRef.current.clear();
     bumpTasks();
   }

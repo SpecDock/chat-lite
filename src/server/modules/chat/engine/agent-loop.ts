@@ -97,8 +97,7 @@ Any attempt to call tools is a critical violation. Respond with text ONLY.`;
 const SYSTEM_PROMPT_BASE = `你是 Chat Lite 的单模型对话智能体，由 LangChain 编排。
 
 规则：
-- 使用中文优先回答；默认输出要精确且简洁，不要写冗长套话。
-- 涉及数学、物理、化学公式时：行内公式使用 $...$，独立公式使用 $$...$$；不要用 [ ... ] 包裹公式。
+- 使用中文优先回答；默认精确简洁，避免复述用户问题和无关背景。只有用户明确要求详细、完整、逐步或深入时才展开。
 
 # 证据与事实性要求
 
@@ -161,13 +160,11 @@ const TOOL_DECISION_PROMPT = `【工具决策轮 instruction】
 - 不需要工具：只输出 ${FINAL_CALL_MARKER}。
 - 不要写“我将调用工具/我准备搜索/我已经改好”等普通文本。`;
 
-const FINAL_RESPONSE_PROMPT = `Formatting re-enabled
-
-<final_response_instruction>
+const FINAL_RESPONSE_PROMPT = `<final_response_instruction>
 现在进入最终回答轮。工具已经禁用，本轮只能输出给用户看的最终答案。
 
 <answer_rules>
-- 默认精确、简洁；除非用户明确要求详细，不要重复用户问题，不要添加无关前言或结尾。
+- 默认精确简洁，避免复述用户问题和无关背景；只有用户明确要求详细、完整、逐步或深入时才展开。
 - 基于用户输入、图片内容、历史/RAG 和已经返回的 ToolMessage 回答；不要编造工具结果或缺失证据。
 - 工具失败时如实说明，不要假装成功。
 - ToolMessage 中存在真实图片 Markdown 时自然嵌入回答；不要伪造图片链接。
@@ -180,6 +177,7 @@ const FINAL_RESPONSE_PROMPT = `Formatting re-enabled
 <markdown_rules>
 - 使用标准 Markdown；只在有助于阅读时使用标题、列表、表格、引用、链接和代码块，简单回答不要堆叠标题。
 - 文件名、命令、代码标识符和短代码使用行内代码；多行程序或需要保持原样的文本使用 fenced code block。
+- 多行代码必须使用完整 fenced code block，并填写准确、规范的小写语言标识；未知时宁可使用 text，不要伪造语言。
 - 不输出 LaTeX 数学定界符或反斜杠数学命令。
 - 数学内容使用易读的普通文本和 Unicode 符号，例如 x^2、sqrt(x)、a/b、||x||、Σ；复杂推导使用 Markdown 代码块逐行展示。
 - 确保表格列数一致，代码围栏完整闭合，链接和图片使用合法 Markdown。
@@ -195,6 +193,10 @@ function numberFrom(value: unknown): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 /**
  * Extract token usage from an AIMessageChunk / AIMessage / response_metadata
  * envelope. ChatOpenAI populates `usage_metadata` and `response_metadata.tokenUsage`
@@ -205,16 +207,25 @@ function extractUsage(value: any): AgentUsage | undefined {
     || value?.response_metadata?.tokenUsage || value?.response_metadata?.usage
     || value?.llmOutput?.tokenUsage || value?.tokenUsage;
   if (!usage) return undefined;
-  const promptTokens = numberFrom(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens);
+  const rawPromptTokens = usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens;
+  const promptTokens = numberFrom(rawPromptTokens);
   const completionTokens = numberFrom(usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens);
   const totalTokens = numberFrom(usage.total_tokens ?? usage.totalTokens)
     ?? ((promptTokens || completionTokens) ? (promptTokens || 0) + (completionTokens || 0) : undefined);
-  if (!promptTokens && !completionTokens && !totalTokens) return undefined;
+  const cachedTokens = finiteNumber(
+    usage.input_token_details?.cache_read
+      ?? usage.prompt_tokens_details?.cached_tokens
+      ?? usage.input_tokens_details?.cached_tokens,
+  );
+  const cacheMeasuredPromptTokens = cachedTokens !== undefined ? finiteNumber(rawPromptTokens) : undefined;
+  const hasCacheMeasurement = cacheMeasuredPromptTokens !== undefined && cachedTokens !== undefined;
+  if (!promptTokens && !completionTokens && !totalTokens && !hasCacheMeasurement) return undefined;
   return {
     model: value?.response_metadata?.model_name || value?.response_metadata?.model || value?.model || modelName(),
     promptTokens,
     completionTokens,
-    totalTokens
+    totalTokens,
+    ...(hasCacheMeasurement ? { cacheMeasuredPromptTokens, cachedTokens } : {}),
   };
 }
 
@@ -593,16 +604,20 @@ async function ragBlockForInput(input: AgentContext, runCallId: string): Promise
  * `ANSWER_HISTORY_LIMIT`. Multimodal user content is built from
  * `attachmentIds` (read directly from disk as base64).
  */
-async function buildBaseMessages(input: AgentContext, runCallId: string): Promise<BaseMessage[]> {
+async function buildBaseMessages(input: AgentContext, runCallId: string): Promise<{ messages: BaseMessage[]; currentUserMessageIndex: number }> {
   const messages: BaseMessage[] = [];
   const sys = systemPromptForRun();
   const rag = await ragBlockForInput(input, runCallId);
   const history = selectModelVisibleHistory(input.history, answerHistoryLimit())
     .map(m => ({ role: m.role, content: m.role === 'assistant' ? stripThinkBlocks(m.content) : String(m.content || '') }));
-  const sysBody = rag
-    ? `${sys}\n\n以下是检索到的历史相关片段（参考资料）：\n${rag}\n\n如果与用户问题相关，可以引用；如果无关，请忽略并直接回答问题。`
-    : sys;
-  messages.push(new SystemMessage(sysBody));
+  const systemContent = [
+    { type: 'text', text: sys },
+    ...(rag ? [{
+      type: 'text',
+      text: `\n\n以下是检索到的历史相关片段（参考资料）：\n${rag}\n\n如果与用户问题相关，可以引用；如果无关，请忽略并直接回答问题。`,
+    }] : []),
+  ];
+  messages.push(new SystemMessage({ content: systemContent as any }));
   for (const m of history) {
     if (m.role === 'user') {
       messages.push(new HumanMessage(m.content));
@@ -611,12 +626,13 @@ async function buildBaseMessages(input: AgentContext, runCallId: string): Promis
     }
   }
   const userContent = await buildUserContent(input);
+  const currentUserMessageIndex = messages.length;
   if (typeof userContent === 'string') {
     messages.push(new HumanMessage(userContent));
   } else {
     messages.push(new HumanMessage({ content: userContent as any }));
   }
-  return messages;
+  return { messages, currentUserMessageIndex };
 }
 
 type ToolExecutionResult = {
@@ -810,9 +826,10 @@ export async function* runAgentLoop(input: RunAgentLoopInput): AsyncGenerator<Ag
   const maxModelAttempts = modelMaxAttempts();
   const registry = await withAgentStage(input, runCallId, 'tool_registry', () => createDefaultToolRegistry());
   const tools = await withAgentStage(input, runCallId, 'tool_registry', () => registry.buildOpenAITools());
-  const baseModel = await withAgentStage(input, runCallId, 'model_create', () => createChatModel());
+  const baseMessages = await withAgentStage(input, runCallId, 'build_messages', () => buildBaseMessages(input, runCallId));
+  const baseModel = await withAgentStage(input, runCallId, 'model_create', () => createChatModel({ currentUserMessageIndex: baseMessages.currentUserMessageIndex }));
   const modelAuto = await withAgentStage(input, runCallId, 'bind_tools', () => baseModel.bindTools(tools) as ChatOpenAI);
-  const messages = await withAgentStage(input, runCallId, 'build_messages', () => buildBaseMessages(input, runCallId));
+  const messages = baseMessages.messages;
   const imageCandidates = await withAgentStage(input, runCallId, 'image_candidates', () => loadImageCandidates(input));
   const toolContext: AgentContext = { ...input, imageCandidates, viewedImageIds: new Set<string>() };
 

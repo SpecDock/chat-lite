@@ -16,7 +16,7 @@ import {
 } from './chat.service.js';
 import { ensureRagInitialized, indexChatMessage } from '../rag/rag.js';
 import { runAgentLoop } from './engine/agent-loop.js';
-import type { AgentUsage } from './engine/tool-def.js';
+import { aggregateAgentUsage, type AgentUsage } from './engine/tool-def.js';
 import {
   classifyModelError,
   isPartialFinalStreamError,
@@ -253,12 +253,6 @@ export function registerChatRoutes(router: Router) {
       storedAssistantContent += `${text}\n`;
       send('think', { text });
     };
-    const addUsage = (current: AgentUsage | undefined, next: AgentUsage): AgentUsage => ({
-      model: next.model ?? current?.model,
-      promptTokens: (current?.promptTokens || 0) + (next.promptTokens || 0),
-      completionTokens: (current?.completionTokens || 0) + (next.completionTokens || 0),
-      totalTokens: (current?.totalTokens || 0) + (next.totalTokens || 0)
-    });
     const recordAssistantUsage = (output: string) => {
       recordTokenUsage({
         userId,
@@ -299,7 +293,7 @@ export function registerChatRoutes(router: Router) {
           storedAssistantContent += event.text;
           send('delta', { text: event.text });
         } else if (event.type === 'usage') {
-          capturedUsage = addUsage(capturedUsage, event.usage);
+          capturedUsage = aggregateAgentUsage(capturedUsage, event.usage);
         }
       }
       if (!full.trim() && !/!\[[^\]]*\]\(\/api\/files\/att_[^)]+\)/.test(storedAssistantContent)) {

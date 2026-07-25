@@ -1,15 +1,17 @@
-FROM node:22-bookworm-slim AS deps
+FROM node:24.18.0-bookworm-slim AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-FROM node:22-bookworm-slim AS build
+FROM node:24.18.0-bookworm-slim AS build
 WORKDIR /app
+ARG VITE_STREAM_MARKDOWN_INTERVAL_MS=50
+ENV VITE_STREAM_MARKDOWN_INTERVAL_MS=$VITE_STREAM_MARKDOWN_INTERVAL_MS
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
 
-FROM node:22-bookworm-slim AS runner
+FROM node:24.18.0-bookworm-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package*.json ./

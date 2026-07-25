@@ -68,7 +68,8 @@ export default function MessageList({ messages, conversationId, storageKey, scro
     const enteredFollow = scrollIntent === 'follow' && previousIntentRef.current !== 'follow';
     previousIntentRef.current = scrollIntent;
 
-    window.requestAnimationFrame(() => {
+    let releaseFrame = 0;
+    const frame = window.requestAnimationFrame(() => {
       if (scrollIntent === 'bottom' || enteredFollow || (scrollIntent === 'follow' && autoFollowRef.current)) {
         programmaticScrollRef.current = true;
         root.scrollTop = root.scrollHeight;
@@ -76,7 +77,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
         autoFollowRef.current = true;
         safeSetScroll(storageKey, root.scrollTop);
         if (scrollIntent === 'bottom' || enteredFollow) restoredConversationRef.current = conversationId;
-        window.requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+        releaseFrame = window.requestAnimationFrame(() => { programmaticScrollRef.current = false; });
         return;
       }
       if (scrollIntent === 'follow' || restoredConversationRef.current === conversationId) return;
@@ -85,11 +86,16 @@ export default function MessageList({ messages, conversationId, storageKey, scro
         programmaticScrollRef.current = true;
         root.scrollTop = Math.min(saved, Math.max(0, root.scrollHeight - root.clientHeight));
         lastScrollTopRef.current = root.scrollTop;
-        window.requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+        releaseFrame = window.requestAnimationFrame(() => { programmaticScrollRef.current = false; });
       }
       autoFollowRef.current = isNearBottom(root);
       restoredConversationRef.current = conversationId;
     });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(releaseFrame);
+      programmaticScrollRef.current = false;
+    };
   }, [conversationId, messages, scrollIntent, storageKey]);
 
   useEffect(() => {
@@ -147,7 +153,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
               <div className={`bubble ${isEditing ? 'inline-edit-bubble' : ''}`}>
                 {isEditing && editable
                   ? <InlineMessageEditor initialText={editable.text} images={editable.images} disabled={editorDisabled} onCancel={onCancelEdit} onConfirm={text => onConfirmEdit(message, text)} />
-                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} />}
+                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} streaming={message.status === 'streaming'} />}
               </div>
               {showActions && !isEditing && <MessageActions text={copyText} isUser={isUser} disabled={actionsDisabled} onEdit={() => onEdit(message)} onDelete={() => onDelete(message)} />}
             </div>

@@ -33,11 +33,16 @@ function tableHasForeignKeys(table: string) {
   return (db.prepare(`PRAGMA foreign_key_list(${table})`).all() as unknown[]).length > 0;
 }
 
+function tableColumns(table: string) {
+  return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name));
+}
+
 function migrateUsageTablesToAppendOnly() {
   const tokenExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='token_usage'").get();
   const imageExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='image_usage'").get();
   if (!tokenExists && !imageExists) return;
   if (!tableHasForeignKeys('token_usage') && !tableHasForeignKeys('image_usage')) return;
+  const tokenColumns = tokenExists ? tableColumns('token_usage') : new Set<string>();
 
   db.pragma('foreign_keys = OFF');
   try {
@@ -53,10 +58,14 @@ function migrateUsageTablesToAppendOnly() {
             prompt_tokens INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_measured_prompt_tokens INTEGER,
+            cached_tokens INTEGER,
             created_at TEXT NOT NULL
           );
-          INSERT INTO token_usage_new (id,user_id,conversation_id,message_id,model,prompt_tokens,completion_tokens,total_tokens,created_at)
-            SELECT id,user_id,conversation_id,message_id,model,prompt_tokens,completion_tokens,total_tokens,created_at FROM token_usage;
+          INSERT INTO token_usage_new (id,user_id,conversation_id,message_id,model,prompt_tokens,completion_tokens,total_tokens,cache_measured_prompt_tokens,cached_tokens,created_at)
+            SELECT id,user_id,conversation_id,message_id,model,prompt_tokens,completion_tokens,total_tokens,
+              ${tokenColumns.has('cache_measured_prompt_tokens') ? 'cache_measured_prompt_tokens' : 'NULL'},
+              ${tokenColumns.has('cached_tokens') ? 'cached_tokens' : 'NULL'},created_at FROM token_usage;
           DROP TABLE token_usage;
           ALTER TABLE token_usage_new RENAME TO token_usage;
           CREATE INDEX IF NOT EXISTS idx_token_usage_user_created ON token_usage(user_id, created_at DESC);
@@ -90,6 +99,18 @@ function migrateUsageTablesToAppendOnly() {
 }
 
 migrateUsageTablesToAppendOnly();
+
+function ensureUsageCacheColumns() {
+  const columns = tableColumns('token_usage');
+  if (!columns.has('cache_measured_prompt_tokens')) {
+    db.exec('ALTER TABLE token_usage ADD COLUMN cache_measured_prompt_tokens INTEGER');
+  }
+  if (!columns.has('cached_tokens')) {
+    db.exec('ALTER TABLE token_usage ADD COLUMN cached_tokens INTEGER');
+  }
+}
+
+ensureUsageCacheColumns();
 
 export const now = () => new Date().toISOString();
 
