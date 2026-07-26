@@ -81,10 +81,10 @@ Node.js 24 原生 HTTP API
 | --- | --- |
 | `web_search` | 联网搜索与事实核验，由 MCP 搜索服务执行 |
 | `text_to_image` | 生成无原图的新图片成品 |
-| `image_edit` | 基于当前上传图或已查看的历史图生成编辑结果 |
+| `image_edit` | 基于一张主图和最多三张参考图生成编辑结果 |
 | `view_image` | 把历史会话图片加载给主模型，供识别、搜索决策或后续编辑 |
 
-主模型本身支持多模态：当前轮上传图片直接进入模型上下文，不需要额外识图工具。历史用户图或历史生成图必须先成功调用 `view_image`，之后才能作为 `image_edit` 的源图；未知附件 ID、跨用户或跨会话图片会被拒绝。
+主模型本身支持多模态：当前轮上传图片直接进入模型上下文，不需要额外识图工具，单次最多四张。`image_edit` 把主图作为 API Image 1，最多三张参考图按 Image 2..4 发送；例如“图1放到图2右下角”会以图2为主图、图1为参考图。历史用户图或历史生成图作为主图或参考图时都必须先成功调用 `view_image`；未知附件 ID、跨用户或跨会话图片会被拒绝。OpenAI 兼容 `/images/edits` 多图使用 multipart `image[]`，MiniMax 图生图分支维持单图，传入参考图会明确报不支持而不会静默丢弃。
 
 `ToolRegistry` 持有工具 schema 与 executor，可以在不改 AgentLoop 控制流的情况下注册或替换工具。图片工具有费用且只在用户明确要求实际图片成品时调用。
 
@@ -126,7 +126,7 @@ chat-lite/
 │     └─ App.tsx
 ├─ scripts/                             # smoke、RAG 与运维脚本
 ├─ test/                                # 独立 sanity 脚本
-├─ deploy/                              # 容器重建与 uvx 安装脚本
+├─ deploy/                              # 容器重建脚本
 ├─ data/                                # app.db / rag.db / uploads
 ├─ Dockerfile
 ├─ docker-compose.yml
@@ -334,11 +334,7 @@ docker compose ps
 COMPOSE_FILE=docker-compose.yml bash deploy/rebuild-chat-lite.sh
 ```
 
-如果搜索 MCP 配置使用 `uvx`，容器重建后安装运行时：
-
-```bash
-COMPOSE_FILE=docker-compose.yml bash deploy/install-uvx-runtime.sh
-```
+Docker镜像内置固定版本的 `uv` / `uvx` 和Python运行时；重建后无需额外下载或执行运行时安装脚本。`uvx` 首次下载MiniMax MCP及依赖时使用镜像内置的阿里云 PyPI 源 `https://mirrors.aliyun.com/pypi/simple`。
 
 ## 运维
 

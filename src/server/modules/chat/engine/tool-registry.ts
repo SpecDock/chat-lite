@@ -4,7 +4,7 @@ import { executeTextImageForUser } from '../tools/text-image.tool.js';
 import { executeImageEditForUser } from '../tools/image-edit.tool.js';
 import { normalizeAttachmentId } from '../tools/normalize-attachment-id.js';
 import { readFile } from 'node:fs/promises';
-import { assertNotAborted, type AgentContext, type ToolDef, type ToolName } from './tool-def.js';
+import { assertNotAborted, type AgentContext, type ImageCandidate, type ToolDef, type ToolName } from './tool-def.js';
 import { row } from '../../../core/db.js';
 
 /**
@@ -25,6 +25,51 @@ function zodToOpenAIFunctionParameters(schema: z.ZodType): Record<string, unknow
   }
   const raw = (schema as unknown as { _def?: unknown })._def;
   throw new Error('tool schema is not a zod v4 schema with toJSONSchema(); cannot convert to OpenAI function parameters');
+}
+
+const CHINESE_NUMBERS = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+
+function candidateAliases(candidate: ImageCandidate): Set<string> {
+  const aliases = new Set([candidate.attachmentId, candidate.label]);
+  const match = candidate.label.match(/^(当前图|用户历史图|生成图)(\d+)$/);
+  if (!match) return aliases;
+  const group = match[1];
+  const index = Number(match[2]);
+  const chinese = CHINESE_NUMBERS[index - 1];
+  if (group === '当前图') {
+    aliases.add(`图${index}`);
+    aliases.add(`图片${index}`);
+    aliases.add(`图像${index}`);
+    aliases.add(`第${index}张`);
+    aliases.add(`第${index}张图`);
+    aliases.add(`第${index}张图片`);
+    if (chinese) {
+      aliases.add(`${chinese}张`);
+      aliases.add(`${chinese}张图`);
+      aliases.add(`${chinese}张图片`);
+      aliases.add(`第${chinese}张`);
+      aliases.add(`第${chinese}张图`);
+      aliases.add(`第${chinese}张图片`);
+    }
+  } else if (group === '用户历史图') {
+    aliases.add(`历史图${index}`);
+    aliases.add(`用户图${index}`);
+  } else {
+    aliases.add(`历史生成图${index}`);
+    aliases.add(`AI生成图${index}`);
+  }
+  return aliases;
+}
+
+function resolveCandidate(value: string | null | undefined, candidates: ImageCandidate[]): ImageCandidate | undefined {
+  const raw = String(value || '').trim();
+  if (!raw) return undefined;
+  const normalized = normalizeAttachmentId(raw);
+  return candidates.find(candidate => candidate.attachmentId === normalized || candidateAliases(candidate).has(raw));
+}
+
+function candidateListText(candidates: ImageCandidate[]) {
+  return candidates.map(candidate => `${candidate.label}=${candidate.attachmentId}`).join('，') || '无';
 }
 
 /**
@@ -91,48 +136,56 @@ const toolDefs = [
   {
     name: 'image_edit',
     description:
-      '高耗时且付费的图像编辑工具。仅当用户明确要求实际交付基于原图的编辑成品、且关键要求无歧义时调用；识别、分析、评价、答题、文字建议或构思不调用，歧义时简短澄清。attachmentId 可选：不传时使用当前图1；显式传当前候选可选择当前图；显式传历史/生成候选必须先 view_image；不属于候选的 ID 会被拒绝。不要传完整 URL。',
+      '高耗时且付费的图像编辑工具。仅当用户明确要求实际交付基于原图的编辑成品、且关键要求无歧义时调用。attachmentId 是主画布；referenceAttachmentIds 是最多3张参考图。多图时后端按主图、参考图1、参考图2、参考图3的顺序发送为 API Image 1..4。用户说“图1放到图2右下角”时，主图必须选图2，参考图必须包含图1。历史/生成图必须先 view_image；未知候选会被拒绝。不要传完整 URL。',
     schema: z.object({
-      attachmentId: z.string().min(1).nullish().describe('可选源图附件 ID。传当前候选则使用该图；传历史或生成候选前必须先 view_image；未知 ID 会被拒绝。不传时默认当前图1。'),
-      prompt: z.string().min(1).describe('完整的编辑要求：写清楚要改什么、改成什么、保留什么、最终风格。例："保持原图构图与所有元素位置不变，仅把图中所有红色元素替换为深蓝色，自然写实风格，高清"。禁止写"修改图片""改成那样"这种占位文本。')
+      attachmentId: z.string().min(1).nullish().describe('可选主图附件 ID 或候选标签。不传时默认当前图1；历史或生成候选必须先 view_image。'),
+      referenceAttachmentIds: z.array(z.string().min(1)).max(3).nullish().describe('可选参考图附件 ID/候选标签数组，最多3张。不要包含主图；历史或生成候选必须先逐张 view_image。'),
+      prompt: z.string().min(1).describe('完整编辑要求。多图时按 API 输入顺序描述：Image 1 是主图，Image 2..4 是参考图；写清从哪张图取什么、放到哪里、缩放比例及主图哪些内容必须保持不变。')
     }),
-    async execute(args: { attachmentId?: string; prompt: string }, ctx: AgentContext) {
+    async execute(args: { attachmentId?: string | null; referenceAttachmentIds?: string[] | null; prompt: string }, ctx: AgentContext) {
       assertNotAborted(ctx.signal);
-      // Backend picks the source image. Priority:
-      // 1. current-turn uploaded attachmentIds — ALWAYS preferred when present.
-      //    The model often hallucinates an attachmentId like "att_0" or "uploaded_image".
-      //    We deliberately ignore the model's value in that case because
-      //    ctx.attachmentIds is the authoritative source for "what was uploaded just now".
-      // 2. caller-provided attachmentId — only honored when user uploaded nothing
-      //    this turn AND the user explicitly referenced a historical image
-      //    (e.g. "刚才那张/上文那张/图2").
-      // 3. otherwise error.
-      let sourceAttachmentId = '';
-      const normalizedArg = args.attachmentId ? normalizeAttachmentId(args.attachmentId) : '';
-      const currentIds = (ctx.imageCandidates?.current || []).map(candidate => candidate.attachmentId);
-      if (normalizedArg && currentIds.includes(normalizedArg)) {
-        // If the current turn has multiple images and the model chose one of
-        // the real current attachment IDs (the user said 图2/第二张 etc), honor
-        // it. Otherwise keep the old safe default: current-turn first image.
-        sourceAttachmentId = normalizedArg;
-      } else if (normalizedArg) {
-        const historicalIds = new Set([...(ctx.imageCandidates?.historical || []), ...(ctx.imageCandidates?.generated || [])]
-          .map(candidate => candidate.attachmentId));
-        if (!historicalIds.has(normalizedArg)) {
-          return { type: 'tool_error', text: '无法编辑该图片：attachmentId 不属于本轮图片候选。' };
-        }
-        if (!ctx.viewedImageIds?.has(normalizedArg)) {
-          return { type: 'tool_error', text: '无法编辑该历史图片：请先使用 view_image 查看它。' };
-        }
-        sourceAttachmentId = normalizedArg;
-      } else {
-        sourceAttachmentId = currentIds[0] || '';
+      const current = ctx.imageCandidates?.current || [];
+      const historical = ctx.imageCandidates?.historical || [];
+      const generated = ctx.imageCandidates?.generated || [];
+      const allCandidates = [...current, ...historical, ...generated];
+      const historicalIds = new Set([...historical, ...generated].map(candidate => candidate.attachmentId));
+      const source = args.attachmentId ? resolveCandidate(args.attachmentId, allCandidates) : current[0];
+      if (!source && args.attachmentId) {
+        return { type: 'tool_error', text: `无法编辑主图：attachmentId 不属于本轮图片候选。可用候选：${candidateListText(allCandidates)}。请使用准确 ID 或候选标签重试。` };
       }
-      if (!sourceAttachmentId) {
+      if (!source) {
         return { type: 'tool_error', text: '无法编辑：请先上传图片，或提供本轮候选中的图片附件。' };
       }
-      const result = await executeImageEditForUser({ userId: ctx.userId, conversationId: ctx.conversationId, prompt: args.prompt, sourceAttachmentId, signal: ctx.signal });
-      return `已基于原图真实生成新图片并保存为附件。请在最终回复中原样包含这个 Markdown 图片链接，不要只说已生成：\n${result.markdown}`;
+      if (historicalIds.has(source.attachmentId) && !ctx.viewedImageIds?.has(source.attachmentId)) {
+        return { type: 'tool_error', text: `无法编辑历史主图 ${source.label}：请先使用 view_image 查看它。` };
+      }
+
+      const referenceAttachmentIds: string[] = [];
+      for (const rawReference of args.referenceAttachmentIds || []) {
+        const candidate = resolveCandidate(rawReference, allCandidates);
+        if (!candidate) {
+          return { type: 'tool_error', text: `无法使用参考图 ${rawReference}：它不属于本轮图片候选。可用候选：${candidateListText(allCandidates)}。` };
+        }
+        if (candidate.attachmentId === source.attachmentId || referenceAttachmentIds.includes(candidate.attachmentId)) continue;
+        if (historicalIds.has(candidate.attachmentId) && !ctx.viewedImageIds?.has(candidate.attachmentId)) {
+          return { type: 'tool_error', text: `无法使用历史参考图 ${candidate.label}：请先使用 view_image 查看它。` };
+        }
+        referenceAttachmentIds.push(candidate.attachmentId);
+      }
+
+      const providerPrompt = referenceAttachmentIds.length
+        ? `Input order: Image 1 is the primary canvas. Images 2-${referenceAttachmentIds.length + 1} are reference images. Preserve Image 1 except for the requested edit.\n\n${args.prompt}`
+        : args.prompt;
+      const result = await executeImageEditForUser({
+        userId: ctx.userId,
+        conversationId: ctx.conversationId,
+        prompt: providerPrompt,
+        sourceAttachmentId: source.attachmentId,
+        referenceAttachmentIds,
+        signal: ctx.signal
+      });
+      const referenceNote = referenceAttachmentIds.length ? `和 ${referenceAttachmentIds.length} 张参考图` : '';
+      return `已基于主图${referenceNote}真实生成新图片并保存为附件。请在最终回复中原样包含这个 Markdown 图片链接，不要只说已生成：\n${result.markdown}`;
     }
   }
 ] satisfies ToolDef[];

@@ -1,6 +1,29 @@
-node_modules
+# 注意：Docker 的 `node_modules` 只匹配顶层。要排掉嵌套的必须写 **/node_modules，
+# 否则 .opencode/node_modules（实测 60MB）会被 COPY . . 打进 build 层。
+**/node_modules
+
 dist
 dist-server
 data
+
+# .git 实测 6.6MB，且任何一次 commit 都会击穿 build 层缓存，
+# 逼着重跑峰值 565MB 的 vite build。
+.git
+.gitignore
+
+.opencode
+.cortexkit
+
+# 构建用不到，但会撑大上下文
+test
+deploy
+*.md
+!README.md
+.nvmrc
+
+# 运行时由 compose 的 env_file 注入，绝不能进镜像
 .env
+.env.*
 *.log
+
+# 注意：scripts/ 不能整体排除 —— build:server 结尾要调 scripts/copy-schema.mjs
