@@ -11,8 +11,13 @@ export function insertImageUsage(input: { userId: string; imageGenerationId: str
 }
 
 export function sumTokenUsage(userId: string) {
-  return db.prepare(`SELECT COALESCE(SUM(total_tokens), 0) AS total,
-    COALESCE(SUM(cached_tokens), 0) AS cachedTotal FROM token_usage WHERE user_id=?`).get(userId) as { total: number; cachedTotal: number };
+  return db.prepare(`SELECT SUM(prompt_tokens) AS inputTotal,
+    SUM(completion_tokens) AS outputTotal,
+    COALESCE(SUM(cached_tokens), 0) AS cachedTotal FROM token_usage WHERE user_id=?`).get(userId) as {
+      inputTotal: number | null;
+      outputTotal: number | null;
+      cachedTotal: number;
+    };
 }
 
 export function sumImageUsage(userId: string) {
@@ -20,9 +25,12 @@ export function sumImageUsage(userId: string) {
 }
 
 export function listTokenUsageDays(userId: string) {
-  return all<{ date: string; value: number; cachedValue: number; measuredPromptValue: number | null }>(`SELECT date(created_at) AS date, SUM(total_tokens) AS value,
+  return all<{ date: string; inputValue: number; outputValue: number; cachedValue: number; measuredInputValue: number; measuredInputCount: number }>(`SELECT date(created_at) AS date,
+      SUM(prompt_tokens) AS inputValue,
+      SUM(completion_tokens) AS outputValue,
       COALESCE(SUM(cached_tokens), 0) AS cachedValue,
-      SUM(cache_measured_prompt_tokens) AS measuredPromptValue
+      SUM(CASE WHEN cache_measured_prompt_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END) AS measuredInputValue,
+      COUNT(cache_measured_prompt_tokens) AS measuredInputCount
     FROM token_usage WHERE user_id=? GROUP BY date(created_at) ORDER BY date(created_at) DESC LIMIT 7`, userId);
 }
 

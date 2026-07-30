@@ -4,5 +4,5 @@ function intEnv(name: string, fallback: number) {
 }
 
 export function answerHistoryLimit() {
-  return intEnv('ANSWER_HISTORY_LIMIT', 80);
+  return intEnv('ANSWER_HISTORY_LIMIT', 6);
 }

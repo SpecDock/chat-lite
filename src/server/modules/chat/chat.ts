@@ -1,5 +1,5 @@
 import { unlink } from 'node:fs/promises';
-import { jsonError, type Router } from '../../core/http.js';
+import { jsonError, type Handler, type Router } from '../../core/http.js';
 import { auth, newId, requireAuth, safeTitle } from '../../core/security.js';
 import { emitToUser } from '../../core/events.js';
 import { scheduleConversationTitle } from '../conversation-titles/title.js';
@@ -8,12 +8,12 @@ import {
   attachmentIdsFromContent,
   cloneUserAttachments,
   discardClonedAttachments,
-  loadModelHistory,
   parseChatRequest,
   removeAttachmentFiles,
   stripUserImageContent,
   userMessageContent
 } from './chat.service.js';
+import { prepareConversationContext } from './conversation-context.service.js';
 import { ensureRagInitialized, indexChatMessage } from '../rag/rag.js';
 import { runAgentLoop } from './engine/agent-loop.js';
 import { aggregateAgentUsage, type AgentUsage } from './engine/tool-def.js';
@@ -43,7 +43,9 @@ import {
   listMessageAttachments,
   listConversations,
   listMessages,
+  renameConversation,
   replaceLatestMessagePair,
+  setConversationPinned,
   touchConversation,
   updateConversationTitle,
 } from './chat.repo.js';
@@ -67,10 +69,44 @@ export function registerConversationRoutes(router: Router) {
     ctx.sendJson({ conversation });
   });
 
+  (router as unknown as { add(method: string, path: string, handlers: Handler[]): void })
+    .add('PATCH', '/api/conversations/:id', [requireAuth, async (ctx) => {
+    const userId = auth(ctx).userId;
+    const conversationId = ctx.params.id;
+    if (!conversationExists(conversationId, userId)) return jsonError(ctx, 404, '会话不存在');
+    const body = await ctx.json().catch(() => undefined);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonError(ctx, 400, '请求必须包含且仅包含一个有效操作');
+    }
+    const input = body as Record<string, unknown>;
+    const keys = Object.keys(input);
+    if (keys.length !== 1) return jsonError(ctx, 400, '请求必须包含且仅包含一个有效操作');
+
+    let conversation;
+    let reason: 'pinned' | 'unpinned' | 'renamed';
+    if (keys[0] === 'pinned' && typeof input.pinned === 'boolean') {
+      conversation = setConversationPinned(conversationId, userId, input.pinned);
+      reason = input.pinned ? 'pinned' : 'unpinned';
+    } else if (keys[0] === 'title' && typeof input.title === 'string') {
+      const title = input.title.replace(/\s+/g, ' ').trim();
+      if (!title || title.length > 40) return jsonError(ctx, 400, '标题长度必须为 1 到 40 个字符');
+      conversation = renameConversation(conversationId, userId, title);
+      reason = 'renamed';
+    } else {
+      return jsonError(ctx, 400, '请求必须包含且仅包含一个有效操作');
+    }
+    if (!conversation) return jsonError(ctx, 404, '会话不存在');
+    emitToUser(userId, 'conversations_changed', { conversationId, reason });
+    ctx.sendJson({ conversation });
+  }]);
+
   router.delete('/api/conversations/:id', requireAuth, async (ctx) => {
     const userId = auth(ctx).userId;
     const conversationId = ctx.params.id;
     if (!conversationExists(conversationId, userId)) return jsonError(ctx, 404, '会话不存在');
+    if (conversationHasStreamingAssistant(conversationId, userId)) {
+      return jsonError(ctx, 409, '会话正在生成回复，请先停止生成后再删除');
+    }
     const attachments = deleteConversationData(conversationId, userId);
     await Promise.allSettled(attachments.map(a => unlink(a.file_path)));
     emitToUser(userId, 'conversation_deleted', { conversationId });
@@ -120,8 +156,10 @@ export function registerChatRoutes(router: Router) {
     const { content, editUserMessageId } = parsed;
     let { attachmentIds, userInput } = parsed;
     const userId = auth(ctx).userId;
+    const requestAt = new Date().toISOString();
     let createdConversation = false;
-    let history;
+    let history: Awaited<ReturnType<typeof prepareConversationContext>>['history'] = [];
+    let conversationSummary = '';
     let firstTurn = false;
     let editMode: 'replace' | 'append' | undefined;
     let userMessageId: string;
@@ -141,7 +179,6 @@ export function registerChatRoutes(router: Router) {
         if (pair.isLatest) {
           attachmentIds = originalAttachments.map(attachment => attachment.id);
           const storedUserContent = userMessageContent(userInput, attachmentIds);
-          history = loadModelHistory(conversationId, userId, [pair.user.id, ...(pair.assistant ? [pair.assistant.id] : [])]);
           const replacement = replaceLatestMessagePair({
             conversationId,
             userId,
@@ -158,7 +195,6 @@ export function registerChatRoutes(router: Router) {
           editMode = 'replace';
           if (firstTurn) updateConversationTitle(conversationId, userId, safeTitle(userInput));
         } else {
-          history = loadModelHistory(conversationId, userId);
           const clones = await cloneUserAttachments(originalAttachments, userId, conversationId);
           if (conversationHasStreamingAssistant(conversationId, userId)) {
             await discardClonedAttachments(clones, userId);
@@ -196,15 +232,24 @@ export function registerChatRoutes(router: Router) {
           const count = countValidAttachments(attachmentIds, userId, conversationId);
           if (count !== attachmentIds.length) return jsonError(ctx, 400, '包含无效图片附件');
         }
-        history = loadModelHistory(conversationId, userId);
-        firstTurn = history.length === 0;
-        if (!createdConversation && firstTurn) updateConversationTitle(conversationId, userId, safeTitle(userInput));
         userMessageId = newId('msg');
         assistantId = newId('msg');
         insertUserMessage(userMessageId, userId, conversationId, userMessageContent(userInput, attachmentIds));
         linkAttachmentsToMessage(attachmentIds, userId, conversationId, userMessageId);
         insertAssistantStreamingMessage(assistantId, userId, conversationId);
         assistantPersisted = true;
+      }
+      const preparedContext = await prepareConversationContext({
+        userId,
+        conversationId,
+        currentMessageId: userMessageId,
+        requestAt,
+      });
+      history = preparedContext.history;
+      conversationSummary = preparedContext.summaryText;
+      if (!editMode) {
+        firstTurn = history.length === 0 && !conversationSummary.trim();
+        if (!createdConversation && firstTurn) updateConversationTitle(conversationId, userId, safeTitle(userInput));
       }
       ensureRagInitialized();
       const storedUserContent = userMessageContent(userInput, attachmentIds);
@@ -277,6 +322,7 @@ export function registerChatRoutes(router: Router) {
         userInput,
         attachmentIds,
         history,
+        conversationSummary,
         signal: abortController.signal
       })) {
         if (abortController.signal.aborted) {

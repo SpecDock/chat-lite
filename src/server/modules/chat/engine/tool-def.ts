@@ -17,7 +17,8 @@ export type AgentContext = {
   conversationId: string;
   requestId?: string;
   userInput: string;
-  history: Pick<MessageDTO, 'role' | 'content' | 'status'>[];
+  history: Pick<MessageDTO, 'role' | 'content' | 'status' | 'created_at'>[];
+  conversationSummary?: string;
   attachmentIds: string[];
   imageCandidates?: { current: ImageCandidate[]; historical: ImageCandidate[]; generated: ImageCandidate[] };
   viewedImageIds?: Set<string>;

@@ -8,6 +8,7 @@ import { registerFileRoutes } from './modules/uploads/files.js';
 import { registerImageRoutes } from './modules/images/image.js';
 import { registerProfileRoutes } from './modules/profile/profile.js';
 import { registerUsageRoutes } from './modules/usage/usage.js';
+import { registerSearchRoutes } from './modules/search/search.js';
 import { registerEventRoutes } from './core/events.js';
 import { cors, jsonError, RequestContext, Router, serveStaticOrSpa } from './core/http.js';
 import './core/db.js';
@@ -23,6 +24,7 @@ registerFileRoutes(router);
 registerImageRoutes(router);
 registerProfileRoutes(router);
 registerUsageRoutes(router);
+registerSearchRoutes(router);
 registerEventRoutes(router);
 
 router.get('/api/health', (ctx) => ctx.sendJson({ ok: true }));

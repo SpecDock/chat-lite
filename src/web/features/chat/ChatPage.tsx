@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AttachmentDTO, ConversationDTO, MessageDTO, UserDTO } from '../../../shared/types';
+import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessageResultDTO, UserDTO } from '../../../shared/types';
 import { api, streamChat, type ChatStreamData } from '../../shared/api/client';
 import ConversationList from './ConversationList';
+import ConversationSearch from './ConversationSearch';
+import DeleteConversationDialog from './DeleteConversationDialog';
 import DeleteMessageDialog from './DeleteMessageDialog';
 import MessageInput from './MessageInput';
 import MessageList from './MessageList';
+import RenameConversationDialog from './RenameConversationDialog';
 import {
   clearConversationUnread,
   migrateConversationActivity,
@@ -99,6 +102,8 @@ const deltaFlushScheduler: DeltaFlushScheduler = {
 };
 
 type Refill = { text: string; key: number };
+type JumpTarget = { conversationId: string; messageId: string };
+type ConversationDialogTarget = { conversation: ConversationDTO; trigger: HTMLButtonElement };
 
 type StreamOptions = {
   conversationId?: string;
@@ -125,12 +130,19 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const [, setTaskRevision] = useState(0);
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const [deleteTarget, setDeleteTarget] = useState<MessageDTO>();
+  const [renameConversationTarget, setRenameConversationTarget] = useState<ConversationDialogTarget>();
+  const [deleteConversationTarget, setDeleteConversationTarget] = useState<ConversationDialogTarget>();
   const [drawer, setDrawer] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [jumpTarget, setJumpTarget] = useState<JumpTarget>();
   const [scrollIntent, setScrollIntent] = useState<ScrollIntent>(initialScroll);
   const restoredRef = useRef(false);
   const currentRef = useRef<string | undefined>(undefined);
   const tasksRef = useRef<Map<string, ActiveTask>>(new Map());
   const keyAliasesRef = useRef<Map<string, string>>(new Map());
+  const searchTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const searchSelectionRef = useRef(0);
+  const [jumpReady, setJumpReady] = useState(false);
 
   const currentKey = current || EMPTY_CONVERSATION_KEY;
   const currentConversationId = conversationIdForKey(current);
@@ -236,27 +248,34 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     bumpTasks();
   }
 
+  function clearDeletedConversation(conversationId: string) {
+    removeConversationState(conversationId);
+    if (currentRef.current === conversationId) {
+      currentRef.current = undefined;
+      keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
+      safeRemoveItem(storageKey);
+      setCurrent(undefined);
+    }
+  }
+
   const refreshConversations = async () => {
     const result = await api.listConversations();
     setConvs(result.conversations);
     return result.conversations;
   };
 
-  const refreshMessages = async (conversationId?: string) => {
-    if (!conversationId || tasksRef.current.has(conversationId)) return;
+  const refreshMessages = async (conversationId?: string, propagateError = false, isRelevant?: () => boolean) => {
+    if (!conversationId) return;
+    if (tasksRef.current.has(conversationId)) return messagesByConversation[conversationId];
     const result = await api.messages(conversationId).catch(error => {
+      if (isRelevant && !isRelevant()) return undefined;
       if (error instanceof Error && /404|会话不存在|文件不存在/.test(error.message)) {
-        removeConversationState(conversationId);
-        if (currentRef.current === conversationId) {
-          currentRef.current = undefined;
-          keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
-          setCurrent(undefined);
-          safeRemoveItem(storageKey);
-        }
+        clearDeletedConversation(conversationId);
       }
+      if (propagateError) throw error;
       return undefined;
     });
-    if (result && !tasksRef.current.has(conversationId)) {
+    if (result && (!isRelevant || isRelevant()) && !tasksRef.current.has(conversationId)) {
       setMessagesByConversation(cache => ({ ...cache, [conversationId]: result.messages }));
       setActivities(currentActivities => {
         if (result.messages.some(message => message.status === 'streaming')) {
@@ -278,17 +297,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         return currentActivities;
       });
     }
+    return result?.messages;
   };
 
   const refreshAll = async () => {
     const list = await refreshConversations();
     const active = conversationIdForKey(currentRef.current);
     if (active && !list.some(conversation => conversation.id === active)) {
-      removeConversationState(active);
-      currentRef.current = undefined;
-      keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
-      setCurrent(undefined);
-      safeRemoveItem(storageKey);
+      clearDeletedConversation(active);
       return;
     }
     await refreshMessages(active);
@@ -359,13 +375,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const onConversationDeleted = (event: MessageEvent) => {
       const data = parseEventData(event);
       if (!data.conversationId) return;
-      removeConversationState(data.conversationId);
-      if (data.conversationId === currentRef.current) {
-        currentRef.current = undefined;
-        keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
-        setCurrent(undefined);
-        safeRemoveItem(storageKey);
-      }
+      clearDeletedConversation(data.conversationId);
       void refreshConversations().catch(() => undefined);
     };
     const onFocus = () => { void refreshAll().catch(() => undefined); };
@@ -692,13 +702,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     try {
       const result = await api.deleteMessage(conversationId, target.id);
       if (result.conversationDeleted) {
-        removeConversationState(conversationId);
-        if (currentRef.current === conversationId) {
-          currentRef.current = undefined;
-          keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
-          safeRemoveItem(storageKey);
-          setCurrent(undefined);
-        }
+        clearDeletedConversation(conversationId);
         await refreshConversations();
         return;
       }
@@ -710,13 +714,95 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }
 
   function selectConversation(id: string) {
+    searchSelectionRef.current += 1;
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
+    setJumpTarget(undefined);
+    setJumpReady(false);
     setScrollIntent('bottom');
     currentRef.current = id;
     setCurrent(id);
     setActivities(currentActivities => clearConversationUnread(currentActivities, id));
     setDrawer(false);
+  }
+
+  async function pinConversation(id: string, pinned: boolean) {
+    const errorKey = currentRef.current || EMPTY_CONVERSATION_KEY;
+    setConversationError(errorKey, '');
+    try {
+      await api.pinConversation(id, pinned);
+      await refreshConversations();
+    } catch (cause) {
+      setConversationError(errorKey, cause instanceof Error ? cause.message : '置顶操作失败');
+      throw cause;
+    }
+  }
+
+  async function renameConversation(id: string, title: string) {
+    const errorKey = currentRef.current || EMPTY_CONVERSATION_KEY;
+    setConversationError(errorKey, '');
+    try {
+      await api.renameConversation(id, title);
+      await refreshConversations();
+    } catch (cause) {
+      setConversationError(errorKey, cause instanceof Error ? cause.message : '重命名失败');
+      throw cause;
+    }
+  }
+
+  async function deleteConversation(id: string) {
+    const errorKey = currentRef.current || EMPTY_CONVERSATION_KEY;
+    if (activities[id]?.status === 'streaming') throw new Error('请先停止生成');
+    setConversationError(errorKey, '');
+    try {
+      await api.deleteConversation(id);
+      clearDeletedConversation(id);
+      await refreshConversations();
+    } catch (cause) {
+      setConversationError(errorKey, cause instanceof Error ? cause.message : '删除会话失败');
+      throw cause;
+    }
+  }
+
+  function selectSearchResult(result: SearchMessageResultDTO) {
+    const conversationId = result.conversationId;
+    const selectionId = ++searchSelectionRef.current;
+    const isSelectionActive = () => searchSelectionRef.current === selectionId;
+    const isViewCurrent = () => isSelectionActive() && currentRef.current === conversationId;
+    setSearchOpen(false);
+    setDrawer(false);
+    setEditingMessageId(undefined);
+    setDeleteTarget(undefined);
+    setJumpTarget(undefined);
+    setJumpReady(false);
+    setScrollIntent('restore');
+    setConversationError(conversationId, '');
+    currentRef.current = conversationId;
+    setCurrent(conversationId);
+    setActivities(currentActivities => clearConversationUnread(currentActivities, conversationId));
+
+    const cachedMessages = messagesByConversation[conversationId];
+    setJumpTarget({ conversationId, messageId: result.messageId });
+    if (cachedMessages?.some(message => message.id === result.messageId)) {
+      setJumpReady(true);
+      return;
+    }
+
+    void refreshMessages(conversationId, true, isViewCurrent).then(loadedMessages => {
+      if (!isViewCurrent()) return;
+      if (loadedMessages?.some(message => message.id === result.messageId)) {
+        setJumpReady(true);
+      } else {
+        setJumpTarget(undefined);
+        setConversationError(conversationId, '消息已不存在');
+      }
+    }).catch(cause => {
+      if (!isSelectionActive()) return;
+      const missing = cause instanceof Error && /404|会话不存在|文件不存在/.test(cause.message);
+      setJumpTarget(undefined);
+      const targetKey = currentRef.current === conversationId ? conversationId : EMPTY_CONVERSATION_KEY;
+      setConversationError(targetKey, missing ? '消息已不存在' : (cause instanceof Error ? cause.message : '消息加载失败'));
+    });
   }
 
   function abortAllTasks() {
@@ -744,24 +830,21 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             conversations={convs}
             currentId={currentConversationId}
             statuses={activities}
+            searchTriggerRef={searchTriggerRef}
+            onSearch={() => setSearchOpen(true)}
             onSelect={selectConversation}
             onNew={async () => {
               const conversation = (await api.createConversation()).conversation;
-              setConvs(currentConversations => [conversation, ...currentConversations]);
+              setConvs(currentConversations => [
+                ...currentConversations.filter(candidate => candidate.pinned_at),
+                conversation,
+                ...currentConversations.filter(candidate => !candidate.pinned_at),
+              ]);
               selectConversation(conversation.id);
             }}
-            onDelete={async id => {
-              if (activities[id]?.status === 'streaming') return;
-              await api.deleteConversation(id);
-              removeConversationState(id);
-              if (id === currentRef.current) {
-                currentRef.current = undefined;
-                keyAliasesRef.current.delete(EMPTY_CONVERSATION_KEY);
-                safeRemoveItem(storageKey);
-                setCurrent(undefined);
-              }
-              await refreshConversations();
-            }}
+            onPin={pinConversation}
+            onRename={(conversation, trigger) => setRenameConversationTarget({ conversation, trigger })}
+            onDelete={(conversation, trigger) => setDeleteConversationTarget({ conversation, trigger })}
           />
         </div>
         <main className="chat">
@@ -778,6 +861,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             onCancelEdit={() => setEditingMessageId(undefined)}
             onConfirmEdit={(message, text) => void confirmEdit(message, text)}
             onDelete={requestDelete}
+            jumpMessageId={jumpTarget && jumpTarget.conversationId === currentConversationId ? jumpTarget.messageId : undefined}
+            jumpReady={jumpReady}
+            onJumpComplete={found => {
+              const target = jumpTarget;
+              setJumpTarget(undefined);
+              setJumpReady(false);
+              if (!found && target) setConversationError(target.conversationId, '消息已不存在');
+            }}
           />
           <MessageInput
             disabled={interactionBusy || Boolean(editingMessageId) || Boolean(deleteTarget)}
@@ -804,6 +895,29 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           />
         </main>
       </div>
+      <ConversationSearch
+        open={searchOpen}
+        triggerRef={searchTriggerRef}
+        onClose={() => setSearchOpen(false)}
+        onSelect={selectSearchResult}
+      />
+      {renameConversationTarget && <RenameConversationDialog
+        key={renameConversationTarget.conversation.id}
+        open
+        conversation={renameConversationTarget.conversation}
+        trigger={renameConversationTarget.trigger}
+        onClose={() => setRenameConversationTarget(undefined)}
+        onConfirm={title => renameConversation(renameConversationTarget.conversation.id, title)}
+      />}
+      {deleteConversationTarget && <DeleteConversationDialog
+        key={deleteConversationTarget.conversation.id}
+        open
+        conversation={deleteConversationTarget.conversation}
+        trigger={deleteConversationTarget.trigger}
+        streaming={activities[deleteConversationTarget.conversation.id]?.status === 'streaming'}
+        onClose={() => setDeleteConversationTarget(undefined)}
+        onConfirm={() => deleteConversation(deleteConversationTarget.conversation.id)}
+      />}
       <DeleteMessageDialog key={deleteTarget?.id || 'closed'} open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(undefined)} onConfirm={deleteMessage} />
     </div>
   );

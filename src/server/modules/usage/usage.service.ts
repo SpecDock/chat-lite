@@ -85,27 +85,35 @@ function usageDays(rows: Array<{ date: string; value: number }>) {
   return rows.reverse().map(row => ({ date: row.date, label: labelForDate(row.date), value: Number(row.value || 0) }));
 }
 
-function tokenUsageDays(rows: Array<{ date: string; value: number; cachedValue: number; measuredPromptValue: number | null }>) {
+function tokenUsageDays(rows: Array<{ date: string; inputValue: number; outputValue: number; cachedValue: number; measuredInputValue: number; measuredInputCount: number }>) {
   return rows.reverse().map(row => {
-    const measuredPromptValue = row.measuredPromptValue === null ? null : Number(row.measuredPromptValue);
+    const inputValue = Number(row.inputValue || 0);
+    const outputValue = Number(row.outputValue || 0);
     const cachedValue = Number(row.cachedValue || 0);
+    const measuredInputValue = Number(row.measuredInputValue || 0);
     return {
       date: row.date,
       label: labelForDate(row.date),
-      value: Number(row.value || 0),
+      inputValue,
+      outputValue,
       cachedValue,
-      cacheRate: measuredPromptValue && measuredPromptValue > 0 ? (cachedValue / measuredPromptValue) * 100 : null,
+      cacheRate: row.measuredInputCount > 0 && measuredInputValue > 0 ? (cachedValue / measuredInputValue) * 100 : null,
+      value: inputValue + outputValue,
     };
   });
 }
 
 export function getUsage(userId: string): UsageDTO {
-  const tokenTotal = repo.sumTokenUsage(userId);
+  const tokenUsage = repo.sumTokenUsage(userId);
+  const inputTotal = Number(tokenUsage.inputTotal || 0);
+  const outputTotal = Number(tokenUsage.outputTotal || 0);
   return {
     token: {
-      total: Number(tokenTotal.total || 0),
-      cachedTotal: Number(tokenTotal.cachedTotal || 0),
+      inputTotal,
+      outputTotal,
+      cachedTotal: Number(tokenUsage.cachedTotal || 0),
       days: tokenUsageDays(repo.listTokenUsageDays(userId)),
+      total: inputTotal + outputTotal,
     },
     image: { total: Number(repo.sumImageUsage(userId).total || 0), days: usageDays(repo.listImageUsageDays(userId)) }
   };

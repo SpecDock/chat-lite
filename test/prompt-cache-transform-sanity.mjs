@@ -25,36 +25,98 @@ function bodyWith(role = 'system', rag = 'rag-a', currentContent = 'tail') {
   };
 }
 
+function breakpointCount(body) {
+  return (JSON.stringify(body).match(/prompt_cache_breakpoint/g) || []).length;
+}
+
+function assertTwoBreakpoints(body, label) {
+  assert.equal(breakpointCount(body), 2, `${label} contains exactly two breakpoints`);
+}
+
 const original = bodyWith();
+original.messages[0].content[1].prompt_cache_breakpoint = { mode: 'stale' };
+original.messages[1].prompt_cache_breakpoint = { mode: 'stale' };
 const snapshot = structuredClone(original);
-const transformed = transformPromptCacheBody(original, 2);
+const transformed = transformPromptCacheBody(original);
 assert.deepEqual(original, snapshot, 'transform must not mutate the source body');
 assert.deepEqual(transformed.messages[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 assert.equal(transformed.messages[0].content[1].prompt_cache_breakpoint, undefined, 'RAG block has no breakpoint');
+assert.equal(transformed.messages[1].prompt_cache_breakpoint, undefined, 'stale message breakpoint is cleared');
 assert.deepEqual(transformed.messages[2].content, [
   { type: 'text', text: 'tail', prompt_cache_breakpoint: { mode: 'explicit' } },
 ]);
+assertTwoBreakpoints(transformed, 'initial text turn');
 assert.deepEqual(transformed.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
 assert.match(transformed.prompt_cache_key, /^chat-lite-[a-f0-9]{24}$/);
 
-const developer = transformPromptCacheBody(bodyWith('developer'), 2);
+const developer = transformPromptCacheBody(bodyWith('developer'));
 assert.deepEqual(developer.messages[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 
-const changedRag = transformPromptCacheBody(bodyWith('system', 'rag-b'), 2);
+const changedRag = transformPromptCacheBody(bodyWith('system', 'rag-b'));
 assert.equal(changedRag.prompt_cache_key, transformed.prompt_cache_key, 'RAG must not affect the cache key');
-assert.equal(transformPromptCacheBody(bodyWith(), 2).prompt_cache_key, transformed.prompt_cache_key, 'same stable inputs produce the same key');
+assert.equal(transformPromptCacheBody(bodyWith()).prompt_cache_key, transformed.prompt_cache_key, 'same stable inputs produce the same key');
 
 const reorderedToolsBody = bodyWith();
 reorderedToolsBody.tools = [...tools].reverse();
-assert.notEqual(transformPromptCacheBody(reorderedToolsBody, 2).prompt_cache_key, transformed.prompt_cache_key, 'tool array order affects the cache key');
+assert.notEqual(transformPromptCacheBody(reorderedToolsBody).prompt_cache_key, transformed.prompt_cache_key, 'tool array order affects the cache key');
 
 const imageBody = bodyWith('system', 'rag-a', [
   { type: 'text', text: 'look at this image' },
   { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
 ]);
-const imageTransformed = transformPromptCacheBody(imageBody, 2);
+const imageTransformed = transformPromptCacheBody(imageBody);
 assert.equal(imageTransformed.messages[2].content[0].prompt_cache_breakpoint, undefined);
 assert.deepEqual(imageTransformed.messages[2].content[1].prompt_cache_breakpoint, { mode: 'explicit' });
+assertTwoBreakpoints(imageTransformed, 'initial image turn');
+
+const imageCandidatesBody = structuredClone(imageBody);
+imageCandidatesBody.messages.push({ role: 'user', content: 'one-time image candidates' });
+const imageCandidatesTransformed = transformPromptCacheBody(imageCandidatesBody);
+assert.equal(imageCandidatesTransformed.messages[2].content[1].prompt_cache_breakpoint, undefined, 'candidate prompt moves the dynamic breakpoint forward');
+assert.deepEqual(imageCandidatesTransformed.messages.at(-1).content, [
+  { type: 'text', text: 'one-time image candidates', prompt_cache_breakpoint: { mode: 'explicit' } },
+]);
+assertTwoBreakpoints(imageCandidatesTransformed, 'image candidates turn');
+
+const toolTurnBody = structuredClone(imageBody);
+toolTurnBody.messages.push(
+  {
+    role: 'assistant',
+    content: 'tool preface retained',
+    tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'first', arguments: '{"q":"raw"}' } }],
+  },
+  { role: 'tool', tool_call_id: 'call_1', content: 'tool-result' },
+  { role: 'assistant', content: null },
+);
+const toolTurnTransformed = transformPromptCacheBody(toolTurnBody);
+assert.equal(toolTurnTransformed.messages[3].content[0].prompt_cache_breakpoint, undefined, 'assistant preface is before latest tool result');
+assert.deepEqual(toolTurnTransformed.messages[4].content, [
+  { type: 'text', text: 'tool-result', prompt_cache_breakpoint: { mode: 'explicit' } },
+]);
+assertTwoBreakpoints(toolTurnTransformed, 'tool result turn');
+
+const viewImageBody = structuredClone(toolTurnBody);
+viewImageBody.messages.push({ role: 'user', content: [
+  { type: 'text', text: 'view_image attachment att_1' },
+  { type: 'image_url', image_url: { url: 'data:image/png;base64,FIXED==' } },
+] });
+const viewImageTransformed = transformPromptCacheBody(viewImageBody);
+assert.equal(viewImageTransformed.messages[4].content[0].prompt_cache_breakpoint, undefined, 'tool breakpoint moves forward');
+assert.deepEqual(viewImageTransformed.messages.at(-1).content.at(-1).prompt_cache_breakpoint, { mode: 'explicit' });
+assertTwoBreakpoints(viewImageTransformed, 'view_image turn');
+
+const finalControlBody = structuredClone(viewImageBody);
+finalControlBody.messages.push({
+  role: 'system',
+  content: '<chat_lite_runtime_control priority="highest"><mode>FINAL_RESPONSE</mode><tools>DISABLED</tools></chat_lite_runtime_control>',
+});
+const finalControlTransformed = transformPromptCacheBody(finalControlBody);
+assert.deepEqual(finalControlTransformed.messages.at(-1).content, [{
+  type: 'text',
+  text: finalControlBody.messages.at(-1).content,
+  prompt_cache_breakpoint: { mode: 'explicit' },
+}]);
+assertTwoBreakpoints(finalControlTransformed, 'final control turn');
 
 const requestBody = JSON.stringify(bodyWith());
 const fallbackCalls = [];
@@ -68,7 +130,7 @@ const fallbackFetch = async (_input, init) => {
 const originalWarn = console.warn;
 try {
   console.warn = () => undefined;
-  const wrapped = createPromptCacheFetch(2, fallbackFetch);
+  const wrapped = createPromptCacheFetch(fallbackFetch);
   assert.equal((await wrapped('https://example.test/v1/chat/completions', { method: 'POST', body: requestBody })).status, 200);
   assert.equal((await wrapped('https://example.test/v1/chat/completions', { method: 'POST', body: requestBody })).status, 200);
 } finally {
@@ -84,7 +146,7 @@ const ordinaryFetch = async () => {
   ordinaryCalls += 1;
   return new Response(JSON.stringify({ error: { message: 'ordinary bad request' } }), { status: 400 });
 };
-const ordinaryResponse = await createPromptCacheFetch(2, ordinaryFetch)(
+const ordinaryResponse = await createPromptCacheFetch(ordinaryFetch)(
   'https://example.test/v1/chat/completions',
   { method: 'POST', body: requestBody },
 );
@@ -97,14 +159,14 @@ const abortFetch = async () => {
   throw new DOMException('aborted', 'AbortError');
 };
 await assert.rejects(
-  createPromptCacheFetch(2, abortFetch)('https://example.test/v1/chat/completions', { method: 'POST', body: requestBody }),
+  createPromptCacheFetch(abortFetch)('https://example.test/v1/chat/completions', { method: 'POST', body: requestBody }),
   error => error?.name === 'AbortError',
 );
 assert.equal(abortCalls, 1, 'abort must not retry');
 
-for (const [label, invalidBody, invalidIndex] of [
-  ['invalid user index', bodyWith(), 99],
-  ['invalid system shape', { ...bodyWith(), messages: [{ role: 'system', content: 'not-blocks' }, ...bodyWith().messages.slice(1)] }, 2],
+for (const [label, invalidBody] of [
+  ['missing dynamic block', { ...bodyWith(), messages: [{ role: 'system', content: [{ type: 'text', text: 'only-stable' }] }] }],
+  ['invalid system shape', { ...bodyWith(), messages: [{ role: 'system', content: 'not-blocks' }, ...bodyWith().messages.slice(1)] }],
 ]) {
   const invalidCalls = [];
   const invalidWarnings = [];
@@ -115,7 +177,7 @@ for (const [label, invalidBody, invalidIndex] of [
   const savedWarn = console.warn;
   try {
     console.warn = (...args) => invalidWarnings.push(args);
-    const response = await createPromptCacheFetch(invalidIndex, invalidFetch)(
+    const response = await createPromptCacheFetch(invalidFetch)(
       'https://example.test/v1/chat/completions',
       { method: 'POST', body: JSON.stringify(invalidBody) },
     );
@@ -177,7 +239,7 @@ const wireModel = new ChatOpenAI({
   maxRetries: 0,
   configuration: {
     baseURL: 'https://example.test/v1',
-    fetch: createPromptCacheFetch(3, wireFetch),
+    fetch: createPromptCacheFetch(wireFetch),
   },
 });
 const wireStream = await wireModel.bindTools(wireTools, { tool_choice: 'none' }).stream(wireMessages);
@@ -191,8 +253,7 @@ assert.ok(wireStableMessage, 'wire body keeps a system/developer message');
 assert.deepEqual(wireStableMessage.content[0].prompt_cache_breakpoint, { mode: 'explicit' });
 assert.equal(wireStableMessage.content[1].prompt_cache_breakpoint, undefined, 'wire RAG block is outside the first breakpoint');
 assert.deepEqual(capturedWireBody.messages[3].content.at(-1).prompt_cache_breakpoint, { mode: 'explicit' });
-const breakpointCount = (JSON.stringify(capturedWireBody).match(/prompt_cache_breakpoint/g) || []).length;
-assert.equal(breakpointCount, 2, 'wire body contains exactly two breakpoints');
+assertTwoBreakpoints(capturedWireBody, 'wire body');
 assert.deepEqual(capturedWireBody.tools.map(tool => tool.function.name), ['wire_first', 'wire_second']);
 assert.match(capturedWireBody.prompt_cache_key, /^chat-lite-[a-f0-9]{24}$/);
 assert.deepEqual(capturedWireBody.prompt_cache_options, { mode: 'explicit', ttl: '30m' });

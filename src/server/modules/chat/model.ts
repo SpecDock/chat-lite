@@ -13,12 +13,10 @@ export function modelName() {
   return process.env.MODEL_NAME || process.env.OPENAI_MODEL || 'gpt-4o-mini';
 }
 
-export function createChatModel(options?: { currentUserMessageIndex?: number }) {
+export function createChatModel(options?: { promptCache?: boolean }) {
   const apiKey = modelApiKey();
   if (!apiKey) throw new Error('未配置模型 API Key：请设置 MODEL_API_KEY 或 OPENAI_API_KEY');
-  const promptCacheFetch = options?.currentUserMessageIndex === undefined
-    ? undefined
-    : createPromptCacheFetch(options.currentUserMessageIndex);
+  const promptCacheFetch = options?.promptCache ? createPromptCacheFetch() : undefined;
   return new ChatOpenAI({
     model: modelName(),
     apiKey,

@@ -1,10 +1,12 @@
 import { all, db, now, row } from '../../core/db.js';
 import { deleteConversationChunks, deleteMessageChunks } from '../rag/rag.repo.js';
+import { syncMessageSearchDocument } from '../search/search.repo.js';
 import type { MessageDTO } from '../../../shared/types.js';
 
 export type ConversationRow = {
   id: string;
   title: string;
+  pinned_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -30,11 +32,11 @@ export type CloneAttachmentRow = AttachmentFileRow & {
 };
 
 export function listConversations(userId: string) {
-  return all<ConversationRow>('SELECT id,title,created_at,updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC', userId);
+  return all<ConversationRow>('SELECT id,title,pinned_at,created_at,updated_at FROM conversations WHERE user_id=? ORDER BY pinned_at DESC,updated_at DESC,id DESC', userId);
 }
 
 export function getConversation(conversationId: string, userId: string) {
-  return row<ConversationRow>('SELECT id,title,created_at,updated_at FROM conversations WHERE id=? AND user_id=?', conversationId, userId);
+  return row<ConversationRow>('SELECT id,title,pinned_at,created_at,updated_at FROM conversations WHERE id=? AND user_id=?', conversationId, userId);
 }
 
 export function conversationExists(conversationId: string, userId: string) {
@@ -47,7 +49,17 @@ export function createConversation(conversationId: string, userId: string, title
 }
 
 export function updateConversationTitle(conversationId: string, userId: string, title: string) {
-  db.prepare('UPDATE conversations SET title=?, updated_at=? WHERE id=? AND user_id=?').run(title, now(), conversationId, userId);
+  db.prepare('UPDATE conversations SET title=? WHERE id=? AND user_id=? AND title_manually_set=0').run(title, conversationId, userId);
+}
+
+export function setConversationPinned(conversationId: string, userId: string, pinned: boolean) {
+  db.prepare('UPDATE conversations SET pinned_at=? WHERE id=? AND user_id=?').run(pinned ? now() : null, conversationId, userId);
+  return getConversation(conversationId, userId);
+}
+
+export function renameConversation(conversationId: string, userId: string, title: string) {
+  db.prepare('UPDATE conversations SET title=?,title_manually_set=1 WHERE id=? AND user_id=?').run(title, conversationId, userId);
+  return getConversation(conversationId, userId);
 }
 
 export function touchConversation(conversationId: string, userId: string) {
@@ -231,9 +243,11 @@ export function replaceLatestMessagePair(input: {
     const attachments = attachmentsForRemoval(input.conversationId, input.userId, assistantMessageIds, input.referencedAssistantAttachmentIds, pair.user.id);
     deleteAttachmentRows(attachments, input.userId);
     db.prepare("UPDATE messages SET content=?,status='completed' WHERE id=? AND conversation_id=? AND user_id=? AND role='user'").run(input.userContent, pair.user.id, input.conversationId, input.userId);
+    syncMessageSearchDocument(pair.user.id);
     const assistantId = pair.assistant?.id || input.newAssistantId;
     if (pair.assistant) {
       db.prepare("UPDATE messages SET content='',status='streaming' WHERE id=? AND conversation_id=? AND user_id=? AND role='assistant'").run(assistantId, input.conversationId, input.userId);
+      syncMessageSearchDocument(assistantId);
     } else {
       insertAssistantStreamingMessage(assistantId, input.userId, input.conversationId);
     }
@@ -281,6 +295,7 @@ export function countValidAttachments(attachmentIds: string[], userId: string, c
 
 export function insertUserMessage(messageId: string, userId: string, conversationId: string, content: string) {
   db.prepare('INSERT INTO messages (id,user_id,conversation_id,role,content,status,created_at) VALUES (?,?,?,?,?,?,?)').run(messageId, userId, conversationId, 'user', content, 'completed', now());
+  syncMessageSearchDocument(messageId);
 }
 
 export function linkAttachmentsToMessage(attachmentIds: string[], userId: string, conversationId: string, messageId: string) {
@@ -291,16 +306,20 @@ export function linkAttachmentsToMessage(attachmentIds: string[], userId: string
 
 export function insertAssistantStreamingMessage(messageId: string, userId: string, conversationId: string) {
   db.prepare('INSERT INTO messages (id,user_id,conversation_id,role,content,status,created_at) VALUES (?,?,?,?,?,?,?)').run(messageId, userId, conversationId, 'assistant', '', 'streaming', now());
+  syncMessageSearchDocument(messageId);
 }
 
 export function completeAssistantMessage(messageId: string, userId: string, content: string) {
   db.prepare('UPDATE messages SET content=?, status=? WHERE id=? AND user_id=?').run(content, 'completed', messageId, userId);
+  syncMessageSearchDocument(messageId);
 }
 
 export function interruptAssistantMessage(messageId: string, userId: string, content: string) {
   db.prepare('UPDATE messages SET content=?, status=? WHERE id=? AND user_id=?').run(content, 'interrupted', messageId, userId);
+  syncMessageSearchDocument(messageId);
 }
 
 export function failAssistantMessage(messageId: string, userId: string, content: string) {
   db.prepare('UPDATE messages SET content=?, status=? WHERE id=? AND user_id=?').run(content, 'error', messageId, userId);
+  syncMessageSearchDocument(messageId);
 }

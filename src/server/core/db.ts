@@ -14,6 +14,20 @@ export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+function migrateConversationSidebarColumns() {
+  const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'").get();
+  if (!tableExists) return;
+  const columns = db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;
+  if (!columns.some(column => column.name === 'pinned_at')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN pinned_at TEXT');
+  }
+  if (!columns.some(column => column.name === 'title_manually_set')) {
+    db.exec('ALTER TABLE conversations ADD COLUMN title_manually_set INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
+migrateConversationSidebarColumns();
+
 const here = dirname(fileURLToPath(import.meta.url));
 const schemaPath = [
   process.env.SCHEMA_PATH,

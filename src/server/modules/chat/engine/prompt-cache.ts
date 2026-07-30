@@ -4,6 +4,7 @@ type JsonObject = Record<string, any>;
 
 const CACHE_BREAKPOINT = { mode: 'explicit' } as const;
 const CACHEABLE_CONTENT_TYPES = new Set(['text', 'image_url', 'input_audio', 'file', 'refusal']);
+const CACHEABLE_MESSAGE_ROLES = new Set(['user', 'assistant', 'tool', 'system', 'developer']);
 const CACHE_FIELD_PATTERN = /prompt_cache_(?:key|options|breakpoint)/i;
 const UNSUPPORTED_FIELD_PATTERN = /\b(?:unknown|unrecognized|unsupported|unexpected)\b|not\s+(?:recognized|supported)|extra inputs are not permitted/i;
 
@@ -19,6 +20,17 @@ function canonicalize(value: unknown): unknown {
     .map(key => [key, canonicalize((value as JsonObject)[key])]));
 }
 
+function clearPromptCacheBreakpoints(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) clearPromptCacheBreakpoints(item);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const object = value as JsonObject;
+  delete object.prompt_cache_breakpoint;
+  for (const child of Object.values(object)) clearPromptCacheBreakpoints(child);
+}
+
 function promptCacheKey(body: JsonObject, stableSystemText: string) {
   const payload = canonicalize({
     version: 1,
@@ -29,9 +41,10 @@ function promptCacheKey(body: JsonObject, stableSystemText: string) {
   return `chat-lite-${createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 24)}`;
 }
 
-export function transformPromptCacheBody(body: JsonObject, currentUserMessageIndex: number): JsonObject {
+export function transformPromptCacheBody(body: JsonObject): JsonObject {
   const transformed = cloneJson(body);
   if (!Array.isArray(transformed.messages)) throw new Error('Prompt cache requires a messages array');
+  clearPromptCacheBreakpoints(transformed);
 
   const stableMessage = transformed.messages.find((message: JsonObject) => message?.role === 'system' || message?.role === 'developer');
   if (!stableMessage || !Array.isArray(stableMessage.content)) {
@@ -41,20 +54,20 @@ export function transformPromptCacheBody(body: JsonObject, currentUserMessageInd
   if (!stableTextBlock) throw new Error('Prompt cache requires a stable system text block');
   stableTextBlock.prompt_cache_breakpoint = CACHE_BREAKPOINT;
 
-  const currentUserMessage = transformed.messages[currentUserMessageIndex];
-  if (!currentUserMessage || currentUserMessage.role !== 'user') {
-    throw new Error('Prompt cache current user message index is invalid');
+  let dynamicBreakpointBlock: JsonObject | undefined;
+  for (let index = transformed.messages.length - 1; index >= 0 && !dynamicBreakpointBlock; index -= 1) {
+    const message = transformed.messages[index] as JsonObject;
+    if (!message || !CACHEABLE_MESSAGE_ROLES.has(message.role)) continue;
+    if (typeof message.content === 'string') {
+      message.content = [{ type: 'text', text: message.content }];
+    }
+    if (!Array.isArray(message.content)) continue;
+    dynamicBreakpointBlock = [...message.content]
+      .reverse()
+      .find((block: JsonObject) => block !== stableTextBlock && CACHEABLE_CONTENT_TYPES.has(block?.type));
   }
-  if (typeof currentUserMessage.content === 'string') {
-    currentUserMessage.content = [{ type: 'text', text: currentUserMessage.content }];
-  }
-  if (!Array.isArray(currentUserMessage.content)) {
-    throw new Error('Prompt cache current user content is not cacheable');
-  }
-  const currentBlocks = currentUserMessage.content as JsonObject[];
-  const currentBreakpointBlock = [...currentBlocks].reverse().find(block => CACHEABLE_CONTENT_TYPES.has(block?.type));
-  if (!currentBreakpointBlock) throw new Error('Prompt cache current user content has no cacheable block');
-  currentBreakpointBlock.prompt_cache_breakpoint = CACHE_BREAKPOINT;
+  if (!dynamicBreakpointBlock) throw new Error('Prompt cache messages have no dynamic cacheable block');
+  dynamicBreakpointBlock.prompt_cache_breakpoint = CACHE_BREAKPOINT;
 
   transformed.prompt_cache_options = { mode: 'explicit', ttl: '30m' };
   transformed.prompt_cache_key = promptCacheKey(transformed, stableTextBlock.text);
@@ -79,7 +92,6 @@ function safeErrorDetail(value: unknown, fallback: string, maxLength: number) {
 }
 
 export function createPromptCacheFetch(
-  currentUserMessageIndex: number,
   nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis),
 ): typeof fetch {
   let cacheUnsupported = false;
@@ -100,7 +112,7 @@ export function createPromptCacheFetch(
 
     let transformedBody: string;
     try {
-      transformedBody = JSON.stringify(transformPromptCacheBody(parsed, currentUserMessageIndex));
+      transformedBody = JSON.stringify(transformPromptCacheBody(parsed));
     } catch (error) {
       cacheUnsupported = true;
       console.warn('[prompt-cache] transform failed; disabled for this agent run', {

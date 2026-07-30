@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { gsap } from 'gsap';
+import { useGSAP } from '@gsap/react';
 import type { MessageDTO } from '../../../shared/types';
 import MarkdownMessage from '../messages/MarkdownMessage';
 import InlineMessageEditor from './InlineMessageEditor';
@@ -30,6 +31,8 @@ function isNearBottom(node: HTMLElement, threshold = 72) {
   return node.scrollHeight - node.scrollTop - node.clientHeight <= threshold;
 }
 
+gsap.registerPlugin(useGSAP);
+
 type ScrollIntent = 'restore' | 'bottom' | 'follow';
 
 type Props = {
@@ -40,13 +43,16 @@ type Props = {
   editingMessageId?: string;
   actionsDisabled?: boolean;
   editorDisabled?: boolean;
+  jumpMessageId?: string;
+  jumpReady?: boolean;
+  onJumpComplete?: (found: boolean) => void;
   onEdit: (message: MessageDTO) => void;
   onCancelEdit: () => void;
   onConfirmEdit: (message: MessageDTO, text: string) => void;
   onDelete: (message: MessageDTO) => void;
 };
 
-export default function MessageList({ messages, conversationId, storageKey, scrollIntent, editingMessageId, actionsDisabled, editorDisabled, onEdit, onCancelEdit, onConfirmEdit, onDelete }: Props) {
+export default function MessageList({ messages, conversationId, storageKey, scrollIntent, editingMessageId, actionsDisabled, editorDisabled, jumpMessageId, jumpReady = true, onJumpComplete, onEdit, onCancelEdit, onConfirmEdit, onDelete }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const lastAnimatedId = useRef<string>('');
   const restoredConversationRef = useRef<string>('');
@@ -55,10 +61,13 @@ export default function MessageList({ messages, conversationId, storageKey, scro
   const autoFollowRef = useRef(true);
   const programmaticScrollRef = useRef(false);
   const lastScrollTopRef = useRef(0);
+  const onJumpCompleteRef = useRef(onJumpComplete);
+  onJumpCompleteRef.current = onJumpComplete;
 
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root || !conversationId) return;
+    if (jumpMessageId) return;
     if (scrollIntent === 'restore' && messages.length === 0) return;
 
     const latest = messages[messages.length - 1];
@@ -96,7 +105,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
       window.cancelAnimationFrame(releaseFrame);
       programmaticScrollRef.current = false;
     };
-  }, [conversationId, messages, scrollIntent, storageKey]);
+  }, [conversationId, messages, scrollIntent, storageKey, jumpMessageId]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -126,18 +135,73 @@ export default function MessageList({ messages, conversationId, storageKey, scro
     };
   }, [conversationId, storageKey, scrollIntent]);
 
-  useEffect(() => {
+  useGSAP(() => {
+    const root = rootRef.current;
+    if (!root || !conversationId || !jumpMessageId) return;
+    if (!jumpReady) return;
+    let disposed = false;
+    let completed = false;
+    const completeOnce = (found: boolean) => {
+      if (disposed || completed) return;
+      completed = true;
+      onJumpCompleteRef.current?.(found);
+    };
+    const frame = window.requestAnimationFrame(() => {
+      if (disposed) return;
+      const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(jumpMessageId) : jumpMessageId.replace(/"/g, '\\"');
+      const messageNode = root.querySelector<HTMLElement>(`[data-message-id="${safeId}"]`);
+      if (!messageNode) {
+        completeOnce(false);
+        return;
+      }
+
+      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      programmaticScrollRef.current = true;
+      autoFollowRef.current = false;
+      messageNode.scrollIntoView({ block: 'center', behavior: reduce ? 'auto' : 'smooth' });
+      const bubble = messageNode.querySelector<HTMLElement>('.bubble');
+      if (!bubble) {
+        programmaticScrollRef.current = false;
+        restoredConversationRef.current = conversationId;
+        completeOnce(true);
+        return;
+      }
+
+      const complete = () => {
+        if (disposed) return;
+        gsap.set(bubble, { clearProps: 'boxShadow' });
+        programmaticScrollRef.current = false;
+        lastScrollTopRef.current = root.scrollTop;
+        safeSetScroll(storageKey, root.scrollTop);
+        restoredConversationRef.current = conversationId;
+        completeOnce(true);
+      };
+      if (reduce) {
+        gsap.set(bubble, { boxShadow: '0 0 0 4px rgba(204, 120, 92, 0.3)' });
+        gsap.delayedCall(2, complete);
+        return;
+      }
+      gsap.timeline()
+        .to(bubble, { boxShadow: '0 0 0 4px rgba(204, 120, 92, 0.32)', duration: 0.2, ease: 'power2.out' })
+        .to(bubble, { boxShadow: '0 0 0 0 rgba(204, 120, 92, 0)', duration: 0.25, ease: 'power2.in' }, '+=1.5')
+        .call(complete);
+    });
+    return () => {
+      disposed = true;
+      window.cancelAnimationFrame(frame);
+      programmaticScrollRef.current = false;
+    };
+  }, { scope: rootRef, dependencies: [conversationId, jumpMessageId, jumpReady, storageKey], revertOnUpdate: true });
+
+  useGSAP(() => {
     const latest = messages[messages.length - 1];
     if (!latest || latest.id === lastAnimatedId.current) return;
     lastAnimatedId.current = latest.id;
     const safeId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(latest.id) : latest.id.replace(/"/g, '\\"');
     const node = rootRef.current?.querySelector(`[data-message-id="${safeId}"] .bubble`);
     if (!node || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-    const ctx = gsap.context(() => {
-      gsap.fromTo(node, { autoAlpha: 0, y: 10, scale: 0.985 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.28, ease: 'power2.out' });
-    }, rootRef);
-    return () => ctx.revert();
-  }, [messages]);
+    gsap.fromTo(node, { autoAlpha: 0, y: 10, scale: 0.985 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.28, ease: 'power2.out' });
+  }, { scope: rootRef, dependencies: [messages], revertOnUpdate: true });
 
   return (
     <div className="messages" ref={rootRef}>
