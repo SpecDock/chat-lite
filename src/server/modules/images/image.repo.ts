@@ -1,9 +1,10 @@
 import { db, now } from '../../core/db.js';
 
-export function findUserAttachmentPath(attachmentId: string, userId: string, conversationId?: string) {
+export function findUserAttachmentPath(attachmentId: string, userId: string, conversationId: string) {
+  if (!conversationId) return undefined;
   const sql = `SELECT id,file_path,mime_type,original_name FROM attachments
-    WHERE id=? AND user_id=?${conversationId ? ' AND conversation_id=?' : ''}`;
-  const params = conversationId ? [attachmentId, userId, conversationId] : [attachmentId, userId];
+    WHERE id=? AND user_id=? AND conversation_id=?`;
+  const params = [attachmentId, userId, conversationId];
   return db.prepare(sql).get(...params) as { id: string; file_path: string; mime_type: string; original_name?: string | null } | undefined;
 }
 

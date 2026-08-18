@@ -2,7 +2,7 @@ import { ragConfig, ragReadActive } from './rag.config.js';
 import { ragDb, closeRagDb } from './rag-db.js';
 import { retrieveForUser, formatHitsForPrompt, scheduleIndexMessage, purgeNonVisibleRagChunks, purgeOrphanedRagChunks, ragAvailable, ragStatus, type RagHit } from './rag.service.js';
 import { deleteMessageChunks } from './rag.repo.js';
-import { isModelVisibleMessage } from '../chat/message-visibility.js';
+import { isModelVisibleMessage, stripThinkBlocks } from '../chat/message-visibility.js';
 
 let warmupTried = false;
 
@@ -32,7 +32,11 @@ export function shutdownRag() {
 
 export async function getRagContext(userId: string, query: string, historyCount: number, topK?: number, currentConversationId?: string, signal?: AbortSignal): Promise<string> {
   const hits = await retrieveForUser(userId, query, historyCount, topK, currentConversationId, signal);
-  return ragConfig().readEnabled ? formatHitsForPrompt(hits) : '';
+  if (!ragConfig().readEnabled) return '';
+  const visibleHits = hits
+    .map(hit => ({ ...hit, text: stripThinkBlocks(hit.text) }))
+    .filter(hit => hit.text.length > 0);
+  return formatHitsForPrompt(visibleHits);
 }
 
 export function indexChatMessage(input: {
@@ -51,7 +55,11 @@ export function indexChatMessage(input: {
     return;
   }
   ensureRagInitialized();
-  scheduleIndexMessage({ ...input, status });
+  scheduleIndexMessage({
+    ...input,
+    content: stripThinkBlocks(input.content),
+    status,
+  });
 }
 
 export { ragStatus };

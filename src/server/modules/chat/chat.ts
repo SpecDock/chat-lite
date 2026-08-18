@@ -14,8 +14,11 @@ import {
   userMessageContent
 } from './chat.service.js';
 import { prepareConversationContext } from './conversation-context.service.js';
+import { stripThinkBlocks } from './message-visibility.js';
 import { ensureRagInitialized, indexChatMessage } from '../rag/rag.js';
 import { runAgentLoop } from './engine/agent-loop.js';
+import { removeConversationWorkspace } from '../workspace/workspace.service.js';
+import { encodeExecutionBlock } from '../../../shared/execution-block.js';
 import { aggregateAgentUsage, type AgentUsage } from './engine/tool-def.js';
 import {
   classifyModelError,
@@ -109,6 +112,7 @@ export function registerConversationRoutes(router: Router) {
     }
     const attachments = deleteConversationData(conversationId, userId);
     await Promise.allSettled(attachments.map(a => unlink(a.file_path)));
+    await removeConversationWorkspace(conversationId);
     emitToUser(userId, 'conversation_deleted', { conversationId });
     emitToUser(userId, 'conversations_changed', { conversationId, reason: 'deleted' });
     ctx.sendJson({ ok: true });
@@ -131,6 +135,7 @@ export function registerConversationRoutes(router: Router) {
     try {
       const result = deleteMessagePairData({ conversationId, userId, userMessageId: pair.user.id, referencedAttachmentIds });
       await removeAttachmentFiles(result.attachments);
+      if (result.conversationDeleted) await removeConversationWorkspace(conversationId);
       if (!result.conversationDeleted && result.pair.isFirst && result.nextPair) {
         const nextUserInput = stripUserImageContent(result.nextPair.user.content);
         updateConversationTitle(conversationId, userId, safeTitle(nextUserInput));
@@ -160,6 +165,7 @@ export function registerChatRoutes(router: Router) {
     let createdConversation = false;
     let history: Awaited<ReturnType<typeof prepareConversationContext>>['history'] = [];
     let conversationSummary = '';
+    let contextThinkLog = '';
     let firstTurn = false;
     let editMode: 'replace' | 'append' | undefined;
     let userMessageId: string;
@@ -230,7 +236,7 @@ export function registerChatRoutes(router: Router) {
         } else if (!conversationExists(conversationId, userId)) return jsonError(ctx, 404, '会话不存在');
         if (attachmentIds.length) {
           const count = countValidAttachments(attachmentIds, userId, conversationId);
-          if (count !== attachmentIds.length) return jsonError(ctx, 400, '包含无效图片附件');
+          if (count !== attachmentIds.length) return jsonError(ctx, 400, '包含无效图片或表格附件');
         }
         userMessageId = newId('msg');
         assistantId = newId('msg');
@@ -247,6 +253,7 @@ export function registerChatRoutes(router: Router) {
       });
       history = preparedContext.history;
       conversationSummary = preparedContext.summaryText;
+      contextThinkLog = preparedContext.contextThinkLog || '';
       if (!editMode) {
         firstTurn = history.length === 0 && !conversationSummary.trim();
         if (!createdConversation && firstTurn) updateConversationTitle(conversationId, userId, safeTitle(userInput));
@@ -288,6 +295,17 @@ export function registerChatRoutes(router: Router) {
     let capturedUsage: AgentUsage | undefined;
     let thinkStarted = false;
     let thinkClosed = false;
+    let executionContent = '';
+    let executionInserted = false;
+    let executionInsertAt = 0;
+    let finalBodyStart = 0;
+    const deferredCleanups: Array<() => Promise<void> | void> = [];
+    let cleanupsRun = false;
+    const runDeferredCleanups = async () => {
+      if (cleanupsRun) return;
+      cleanupsRun = true;
+      await Promise.allSettled(deferredCleanups.map(cleanup => Promise.resolve().then(cleanup)));
+    };
     send('meta', { conversationId, userMessageId, messageId: assistantId, ...(editMode ? { mode: editMode } : {}) });
     const appendThink = (text: string) => {
       if (!thinkStarted || thinkClosed) {
@@ -297,6 +315,28 @@ export function registerChatRoutes(router: Router) {
       }
       storedAssistantContent += `${text}\n`;
       send('think', { text });
+    };
+    if (contextThinkLog) appendThink(contextThinkLog);
+    const closeThink = () => {
+      if (!thinkStarted || thinkClosed) return;
+      thinkClosed = true;
+      storedAssistantContent += '</think>\n\n';
+    };
+    const placeExecutionContent = (establishBodyBoundary: boolean) => {
+      if (executionInserted || (!establishBodyBoundary && !executionContent)) return;
+      closeThink();
+      executionInsertAt = storedAssistantContent.length;
+      storedAssistantContent += executionContent;
+      executionInserted = true;
+      finalBodyStart = storedAssistantContent.length;
+    };
+    const appendExecutionContent = (block: string) => {
+      executionContent += `${block}\n\n`;
+      if (executionInserted) {
+        const body = storedAssistantContent.slice(finalBodyStart);
+        storedAssistantContent = `${storedAssistantContent.slice(0, executionInsertAt)}${executionContent}${body}`;
+        finalBodyStart = executionInsertAt + executionContent.length;
+      }
     };
     const recordAssistantUsage = (output: string) => {
       recordTokenUsage({
@@ -322,8 +362,9 @@ export function registerChatRoutes(router: Router) {
         userInput,
         attachmentIds,
         history,
-        conversationSummary,
-        signal: abortController.signal
+        conversationSummary: stripThinkBlocks(conversationSummary),
+        signal: abortController.signal,
+        deferCleanup: cleanup => { deferredCleanups.push(cleanup); }
       })) {
         if (abortController.signal.aborted) {
           throw Object.assign(new Error('请求已取消'), { name: 'AbortError' });
@@ -331,13 +372,27 @@ export function registerChatRoutes(router: Router) {
         if (event.type === 'think') {
           appendThink(event.text);
         } else if (event.type === 'delta') {
-          if (thinkStarted && !thinkClosed) {
-            thinkClosed = true;
-            storedAssistantContent += '</think>\n\n';
-          }
+          placeExecutionContent(true);
           full += event.text;
           storedAssistantContent += event.text;
           send('delta', { text: event.text });
+        } else if (event.type === 'execution') {
+          let executionBlock: string;
+          try {
+            executionBlock = encodeExecutionBlock({
+              language: event.language,
+              code: event.code,
+              output: event.output,
+            });
+          } catch {
+            continue;
+          }
+          appendExecutionContent(executionBlock);
+          send('execution', {
+            language: event.language,
+            code: event.code,
+            output: event.output,
+          });
         } else if (event.type === 'usage') {
           capturedUsage = aggregateAgentUsage(capturedUsage, event.usage);
         }
@@ -346,10 +401,12 @@ export function registerChatRoutes(router: Router) {
         appendThink('主模型未返回正文，请尝试重新提问或调整描述。');
         full = '主模型未返回正文，请尝试重新提问或调整描述。';
       }
+      placeExecutionContent(false);
       if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
       completed = true;
       const completedContent = storedAssistantContent || full || '（助手未返回内容）';
       completeAssistantMessage(assistantId, userId, completedContent);
+      await runDeferredCleanups();
       indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: completedContent, status: 'completed' });
       recordAssistantUsage(completedContent);
       touchConversation(conversationId, userId);
@@ -373,9 +430,11 @@ export function registerChatRoutes(router: Router) {
         requestId: classified.requestId
       });
       if (aborted) {
+        placeExecutionContent(false);
         if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
         const interruptedContent = storedAssistantContent || full || '已取消';
         interruptAssistantMessage(assistantId, userId, interruptedContent);
+        await runDeferredCleanups();
         indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: interruptedContent, status: 'interrupted' });
         recordAssistantUsage(interruptedContent);
         touchConversation(conversationId, userId);
@@ -387,6 +446,7 @@ export function registerChatRoutes(router: Router) {
         return;
       }
       if (partial && full.trim()) {
+        placeExecutionContent(false);
         if (thinkStarted && !thinkClosed) {
           thinkClosed = true;
           storedAssistantContent += '</think>\n\n';
@@ -397,6 +457,7 @@ export function registerChatRoutes(router: Router) {
         send('delta', { text: interruptionNotice });
         const interruptedContent = storedAssistantContent || full;
         interruptAssistantMessage(assistantId, userId, interruptedContent);
+        await runDeferredCleanups();
         indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: interruptedContent, status: 'interrupted' });
         recordAssistantUsage(interruptedContent);
         touchConversation(conversationId, userId);
@@ -408,9 +469,11 @@ export function registerChatRoutes(router: Router) {
         return;
       }
       const msg = userFacingModelError(classified);
+      placeExecutionContent(false);
       if (thinkStarted && !thinkClosed) storedAssistantContent += '</think>';
       const errorContent = storedAssistantContent ? `${storedAssistantContent}\n\n${msg}` : msg;
       failAssistantMessage(assistantId, userId, errorContent);
+      await runDeferredCleanups();
       indexChatMessage({ userId, conversationId, messageId: assistantId, role: 'assistant', content: errorContent, status: 'error' });
       recordAssistantUsage(errorContent);
       scheduleEditedTitleAfterFailure(errorContent);

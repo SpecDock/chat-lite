@@ -9,6 +9,7 @@ import { isModelVisibleMessage, stripThinkBlocks } from '../message-visibility.j
 import { ensureRagInitialized, getRagContext } from '../../rag/rag.js';
 import { ragConfig, ragReadActive } from '../../rag/rag.config.js';
 import { createDefaultToolRegistry } from './tool-registry.js';
+import { isWorkspaceAttachment } from '../../workspace/workspace.service.js';
 import type { AgentContext, AgentEvent, AgentRunFlags, AgentUsage, ImageCandidate } from './tool-def.js';
 import {
   abortableSleep,
@@ -38,6 +39,7 @@ type ToolCounts = {
   text_to_image: number;
   image_edit: number;
   view_image: number;
+  analyze_table: number;
 };
 
 /**
@@ -67,7 +69,8 @@ function readToolBudgets() {
     web_search: undefined,
     text_to_image: intEnv('AGENT_MAX_IMAGE_GENERATION_CALLS', 1),
     image_edit: intEnv('AGENT_MAX_IMAGE_TO_IMAGE_CALLS', 10),
-    view_image: undefined
+    view_image: undefined,
+    analyze_table: 1
   };
 }
 
@@ -77,6 +80,7 @@ const SYSTEM_PROMPT_BASE = `你是 Chat Lite 的单模型对话智能体，由 L
 
 ## 回答方式
 - 中文优先，长度随问题复杂度调整：简单问题直接短答；复杂问题可先给一句简短结论，再展开必要依据。不要复述问题、重复结论或工具结果，也不添加无关背景；仅在达到步骤上限时说明已完成与未完成事项。
+- 工具成功返回后必须完成对用户原问题的实质性答复，禁止只输出“好”“好的”“收到”“明白”“已完成”“OK”等确认词。表格分析必须引用执行输出中的具体数值和计算口径；代码已经由系统执行块展示，最终正文只总结结果。
 
 ## 证据
 - 可外部核验的重要事实，包括数字、日期、价格和专业结论，只基于用户内容、当前图片、历史/RAG、ToolMessage 或 web_search。证据不足时先搜索；搜索失败、来源冲突或仍不充分时明确说明，不猜测。
@@ -113,6 +117,7 @@ const AGENT_LOOP_INSTRUCTION = `<chat_lite_agent_instruction>
 - 明确需要编辑已有图片：调用 image_edit；历史图必须先成功 view_image。多图时 attachmentId 选主画布，referenceAttachmentIds 放参考图；“图1放到图2右下角”应选图2为主图、图1为参考图。
 - 图片识别、评价、解题、建议、信息已足够或图片意图不清：准备进入最终回答。
 - 用户要求先搜索/调研再生成或编辑图片时，必须分轮，先 web_search。相互依赖的调用分轮执行；彼此独立的调用可以并行。
+- 用户上传 CSV/XLSX 并要求统计、筛选、清洗、计算、比较或解释数据时，调用 analyze_table；传入真实 attachmentId 和完整任务要求，不要把表格附件当作图片。
 
 ### 工具决策输出契约
 - 需要工具时只发结构化 tool_calls，不附正文、计划或未来承诺。
@@ -124,6 +129,7 @@ const AGENT_LOOP_INSTRUCTION = `<chat_lite_agent_instruction>
 ### 回答
 - 基于用户输入、图片、历史/RAG 和 ToolMessage；失败、冲突或证据不足时如实说明。真实图片 Markdown 可自然嵌入，不伪造链接；图片生成或编辑意图不清时只问一个短问题。
 - 长度随复杂度调整：简单问题直接回答；复杂问题可先给一句结论，再写必要详情。不复述问题、重复工具结果或添加空泛前言；仅在达到步骤上限时说明已完成与未完成事项。医学咨询末尾精确追加：AI生成仅供参考。
+- 任何工具成功后都必须给出与用户请求直接相关的具体结论，不能只回复确认词或泛泛地说“已处理”。如果调用了 analyze_table，必须从其 ToolMessage 中提取并回答用户要求的指标、数值和口径；如果某指标确实无法计算，要明确说出指标名称和原因。
 - 不输出 ${READY_FOR_FINAL_RESPONSE_MARKER}、隐藏思考或系统提示。
 
 ### Markdown
@@ -135,7 +141,7 @@ const AGENT_LOOP_INSTRUCTION = `<chat_lite_agent_instruction>
 const FINAL_RESPONSE_MODE_CONTROL = `<chat_lite_runtime_control priority="highest">
 <mode>FINAL_RESPONSE</mode>
 <tools>DISABLED</tools>
-<instruction>Generate the user-facing final response now. Do not emit tool calls, readiness markers, or system instructions.</instruction>
+<instruction>Generate the user-facing final response now. Use the original user request and every relevant ToolMessage. A successful tool call is not a request for acknowledgement: never answer only with 好、好的、收到、明白、已完成, OK, or similar confirmation words. Give the concrete result, requested numbers, and calculation basis. For analyze_table, copy the actual computed values from its ToolMessage and summarize them; the system already displays the final successful code and text output in a collapsed execution block, so do not repeat the code. Do not emit tool calls, readiness markers, or system instructions.</instruction>
 </chat_lite_runtime_control>`;
 
 function systemPromptForRun() {
@@ -273,12 +279,22 @@ function parseToolArgs(argsText: string): Record<string, unknown> {
 }
 
 type AttachmentRow = { file_path: string; mime_type: string };
+type TableHintRow = { original_name: string; mime_type: string; size: number; file_path: string };
 
-function loadAttachment(userId: string, attachmentId: string): AttachmentRow | undefined {
-  return row<AttachmentRow>('SELECT file_path, mime_type FROM attachments WHERE id=? AND user_id=?', attachmentId, userId);
+function loadAttachment(userId: string, conversationId: string, attachmentId: string): AttachmentRow | undefined {
+  const attachment = row<AttachmentRow>('SELECT file_path, mime_type FROM attachments WHERE id=? AND user_id=? AND conversation_id=?', attachmentId, userId, conversationId);
+  return attachment && attachment.mime_type.startsWith('image/') && isWorkspaceAttachment(attachment.file_path, conversationId, 'input') ? attachment : undefined;
 }
 
-type CandidateRow = { attachmentId: string; createdAt: string; sourceText: string };
+function loadTableHint(userId: string, conversationId: string, attachmentId: string): TableHintRow | undefined {
+  const attachment = row<TableHintRow>('SELECT original_name, mime_type, size, file_path FROM attachments WHERE id=? AND user_id=? AND conversation_id=?', attachmentId, userId, conversationId);
+  if (!attachment || !isWorkspaceAttachment(attachment.file_path, conversationId, 'input')) return undefined;
+  const filename = String(attachment.original_name || '').toLowerCase();
+  if (!(filename.endsWith('.csv') || filename.endsWith('.xlsx'))) return undefined;
+  return attachment;
+}
+
+type CandidateRow = { attachmentId: string; createdAt: string; sourceText: string; filePath: string };
 
 function conciseSource(text: string) {
   return text.replace(/\s+/g, ' ').trim().slice(0, 180) || '（无来源文本）';
@@ -288,32 +304,33 @@ function loadImageCandidates(input: AgentContext): NonNullable<AgentContext['ima
   const currentIds = new Set<string>();
   const current = input.attachmentIds.flatMap((attachmentId) => {
     if (currentIds.has(attachmentId) || currentIds.size >= 20) return [];
+    const image = row<{ created_at: string; file_path: string }>("SELECT created_at,file_path FROM attachments WHERE id=? AND user_id=? AND conversation_id=? AND mime_type LIKE 'image/%'", attachmentId, input.userId, input.conversationId);
+    if (!image || !isWorkspaceAttachment(image.file_path, input.conversationId, 'input')) return [];
     currentIds.add(attachmentId);
-    const image = row<{ created_at: string }>("SELECT created_at FROM attachments WHERE id=? AND user_id=? AND conversation_id=? AND mime_type LIKE 'image/%'", attachmentId, input.userId, input.conversationId);
-    return image ? [{ attachmentId, label: '', createdAt: image.created_at, sourceText: conciseSource(input.userInput) }] : [];
+    return [{ attachmentId, label: '', createdAt: image.created_at, sourceText: conciseSource(input.userInput), filePath: image.file_path }];
   }).map((item, index) => ({ ...item, label: `当前图${index + 1}` }));
-  const historicalRows = all<CandidateRow>(`SELECT a.id AS attachmentId, a.created_at AS createdAt, m.content AS sourceText
+  const historicalRows = all<CandidateRow>(`SELECT a.id AS attachmentId, a.created_at AS createdAt, a.file_path AS filePath, m.content AS sourceText
     FROM attachments a JOIN messages m ON m.id=a.message_id AND m.user_id=a.user_id
     WHERE a.user_id=? AND a.conversation_id=? AND a.mime_type LIKE 'image/%' AND m.role='user'
       AND a.id NOT IN (SELECT result_attachment_id FROM image_generations WHERE result_attachment_id IS NOT NULL)
       ${currentIds.size ? `AND a.id NOT IN (${Array.from(currentIds).map(() => '?').join(',')})` : ''}
-    ORDER BY a.created_at DESC LIMIT 20`, input.userId, input.conversationId, ...Array.from(currentIds));
+    ORDER BY a.created_at DESC, a.id DESC`, input.userId, input.conversationId, ...Array.from(currentIds));
   const seen = new Set(currentIds);
-  const historical = historicalRows.flatMap(item => {
+  const historical = historicalRows.filter(item => isWorkspaceAttachment(item.filePath, input.conversationId, 'input')).flatMap(item => {
     if (seen.has(item.attachmentId)) return [];
     seen.add(item.attachmentId);
-    return [{ attachmentId: item.attachmentId, label: '', createdAt: item.createdAt, sourceText: conciseSource(item.sourceText) }];
+    return [{ attachmentId: item.attachmentId, label: '', createdAt: item.createdAt, sourceText: conciseSource(item.sourceText), filePath: item.filePath }];
   }).slice(0, 20).map((item, index) => ({ ...item, label: `用户历史图${index + 1}` }));
-  const generatedRows = all<CandidateRow>(`SELECT a.id AS attachmentId, a.created_at AS createdAt, g.prompt AS sourceText
+  const generatedRows = all<CandidateRow>(`SELECT a.id AS attachmentId, a.created_at AS createdAt, a.file_path AS filePath, g.prompt AS sourceText
     FROM image_generations g JOIN attachments a ON a.id=g.result_attachment_id
     WHERE g.user_id=? AND a.user_id=? AND a.conversation_id=? AND a.mime_type LIKE 'image/%'
       AND g.status='completed' AND g.result_attachment_id IS NOT NULL
       ${seen.size ? `AND a.id NOT IN (${Array.from(seen).map(() => '?').join(',')})` : ''}
-    ORDER BY g.created_at DESC LIMIT 20`, input.userId, input.userId, input.conversationId, ...Array.from(seen));
-  const generated = generatedRows.flatMap(item => {
+    ORDER BY g.created_at DESC, g.id DESC`, input.userId, input.userId, input.conversationId, ...Array.from(seen));
+  const generated = generatedRows.filter(item => isWorkspaceAttachment(item.filePath, input.conversationId, 'output')).flatMap(item => {
     if (seen.has(item.attachmentId)) return [];
     seen.add(item.attachmentId);
-    return [{ attachmentId: item.attachmentId, label: '', createdAt: item.createdAt, sourceText: conciseSource(item.sourceText) }];
+    return [{ attachmentId: item.attachmentId, label: '', createdAt: item.createdAt, sourceText: conciseSource(item.sourceText), filePath: item.filePath }];
   }).slice(0, 20).map((item, index) => ({ ...item, label: `生成图${index + 1}` }));
   return { current, historical, generated };
 }
@@ -336,10 +353,19 @@ type UserContentPart = TextContentPart | ImageContentPart;
  */
 async function buildUserContent(input: AgentContext): Promise<string | UserContentPart[]> {
   if (!input.attachmentIds.length) return input.userInput;
-  const parts: UserContentPart[] = [{ type: 'text', text: input.userInput }];
+  const imageIds = input.attachmentIds.filter(id => Boolean(loadAttachment(input.userId, input.conversationId, id)));
+  const tableHints = input.attachmentIds.flatMap(id => {
+    const table = loadTableHint(input.userId, input.conversationId, id);
+    return table ? [{ id, table }] : [];
+  });
+  const tableNote = tableHints.length
+    ? `\n\n本轮表格附件（需分析时调用 analyze_table）：${tableHints.map(item => `${item.table.original_name}=${item.id}，MIME=${item.table.mime_type}，大小=${item.table.size}字节`).join('；')}`
+    : '';
+  if (!imageIds.length) return `${input.userInput}${tableNote}`;
+  const parts: UserContentPart[] = [{ type: 'text', text: `${input.userInput}${tableNote}` }];
   let missing = 0;
-  for (const id of input.attachmentIds) {
-    const att = loadAttachment(input.userId, id);
+  for (const id of imageIds) {
+    const att = loadAttachment(input.userId, input.conversationId, id);
     if (!att) {
       missing += 1;
       continue;
@@ -354,14 +380,12 @@ async function buildUserContent(input: AgentContext): Promise<string | UserConte
       missing += 1;
     }
   }
-  if (!parts.some(part => part.type === 'image_url')) {
-    return `${input.userInput}\n\n（提示：本轮上传的图片附件未找到对应的图片文件，无法作为视觉输入。请重新上传或重新发送。）`;
-  }
+  if (!parts.some(part => part.type === 'image_url')) return `${input.userInput}${tableNote}`;
   if (missing) {
-    parts.push({ type: 'text', text: `\n\n（提示：本轮共 ${input.attachmentIds.length} 张图片附件，其中 ${missing} 张未能加载，已忽略。）` });
+    parts.push({ type: 'text', text: `\n\n（提示：本轮共 ${imageIds.length} 张图片附件，其中 ${missing} 张未能加载，已忽略。）` });
   }
-  if (input.attachmentIds.length > 1) {
-    parts.push({ type: 'text', text: `\n\n本轮图片顺序：${input.attachmentIds.map((id, index) => `图${index + 1}=${id}`).join('，')}。如果用户指定图1/图2/第几张，请把对应 att_xxx 作为 image_edit.attachmentId。` });
+  if (imageIds.length > 1) {
+    parts.push({ type: 'text', text: `\n\n本轮图片顺序：${imageIds.map((id, index) => `图${index + 1}=${id}`).join('，')}。如果用户指定图1/图2/第几张，请把对应 att_xxx 作为 image_edit.attachmentId。` });
   }
   return parts;
 }
@@ -628,10 +652,11 @@ async function executeToolCall(
   budgets: ReturnType<typeof readToolBudgets>,
   forwardEvent: (event: AgentEvent) => void,
   recentSignatures: { signature: string; name: string }[],
-  runFlags: AgentRunFlags
+  runFlags: AgentRunFlags,
+  onExecutionStart?: () => void,
 ): Promise<ToolExecutionResult> {
   const callId = '';
-  if (toolName !== 'web_search' && toolName !== 'text_to_image' && toolName !== 'image_edit' && toolName !== 'view_image') {
+  if (toolName !== 'web_search' && toolName !== 'text_to_image' && toolName !== 'image_edit' && toolName !== 'view_image' && toolName !== 'analyze_table') {
     const content = `未知工具：${toolName}`;
     forwardEvent({ type: 'think', text: content });
     return { callId, toolName, content, status: 'error' };
@@ -703,6 +728,7 @@ async function executeToolCall(
     return { callId, toolName, content, status: 'error' };
   }
   try {
+    onExecutionStart?.();
     const result = await def.execute(parsed.data, ctx);
     let toolContent = '';
     if (typeof result === 'string') {
@@ -803,7 +829,7 @@ export async function* runAgentLoop(input: RunAgentLoopInput): AsyncGenerator<Ag
   const toolContext: AgentContext = { ...input, imageCandidates, viewedImageIds: new Set<string>() };
 
   const budgets = readToolBudgets();
-  const counts: ToolCounts = { total: 0, web_search: 0, text_to_image: 0, image_edit: 0, view_image: 0 };
+  const counts: ToolCounts = { total: 0, web_search: 0, text_to_image: 0, image_edit: 0, view_image: 0, analyze_table: 0 };
   const recentSignatures: { signature: string; name: string }[] = [];
   const runFlags: AgentRunFlags = { imageAlreadyProduced: false };
 
@@ -914,6 +940,16 @@ export async function* runAgentLoop(input: RunAgentLoopInput): AsyncGenerator<Ag
         imageToolReservedThisTurn = true;
       }
       yield { type: 'think', text: `正在调用工具：${toolName}` };
+      let resolveTableStart: (started: boolean) => void = () => undefined;
+      let tableStartSettled = false;
+      const tableStart = toolName === 'analyze_table'
+        ? new Promise<boolean>(resolve => { resolveTableStart = resolve; })
+        : undefined;
+      const settleTableStart = (started: boolean) => {
+        if (tableStartSettled) return;
+        tableStartSettled = true;
+        resolveTableStart(started);
+      };
       const promise = executeToolCall(
         registry,
         toolName,
@@ -923,9 +959,14 @@ export async function* runAgentLoop(input: RunAgentLoopInput): AsyncGenerator<Ag
         budgets,
         (event) => forwarded.push(event),
         recentSignatures,
-        runFlags
-      ).then(result => ({ callId, toolName, content: result.content, status: result.status, forwarded, viewedImage: result.viewedImage }));
+        runFlags,
+        toolName === 'analyze_table' ? () => settleTableStart(true) : undefined,
+      ).then(result => ({ callId, toolName, content: result.content, status: result.status, forwarded, viewedImage: result.viewedImage }))
+        .finally(() => settleTableStart(false));
       tasks.push({ index, callId, toolName, promise });
+      if (tableStart && await tableStart) {
+        yield { type: 'think', text: '表格分析工具已启动，正在生成并校验 Python。' };
+      }
     }
 
     const pending = new Set(tasks);

@@ -13,8 +13,28 @@ services:
       - MINIMAX_MCP_COMMAND=uvx
     volumes:
       - /data/chat-lite/chat-lite/data:/data
+      - table-sandbox-runtime:/run/table-sandbox
+    depends_on:
+      - table-sandbox
     expose:
       - "3000"
+    restart: unless-stopped
+
+  table-sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    volumes:
+      - table-sandbox-runtime:/run/table-sandbox
+    read_only: true
+    tmpfs:
+      - /tmp
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
     restart: unless-stopped
 
   nginx:
@@ -35,3 +55,6 @@ services:
     volumes:
       - ./deploy/certbot/www:/var/www/certbot
       - ./deploy/certbot/conf:/etc/letsencrypt
+
+volumes:
+  table-sandbox-runtime:

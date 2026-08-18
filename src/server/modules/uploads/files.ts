@@ -5,7 +5,9 @@ import { auth, requireAuth } from '../../core/security.js';
 import { findAttachment, findUserAttachment } from './upload.repo.js';
 
 function sourceSecret() {
-  return process.env.FILE_SOURCE_SECRET || process.env.SESSION_SECRET || process.env.INVITE_CODE || 'chat-lite-file-source';
+  const secret = process.env.FILE_SOURCE_SECRET || process.env.SESSION_SECRET;
+  if (!secret) throw new Error('缺少图片源签名密钥');
+  return secret;
 }
 
 function signSource(attachmentId: string, expiresAt: number) {
@@ -32,7 +34,10 @@ export function registerFileRoutes(router: Router) {
     if (!rec) return jsonError(ctx, 404, '文件不存在');
     const buf = await readFile(rec.file_path).catch(() => undefined);
     if (!buf) return jsonError(ctx, 404, '文件不存在');
-    ctx.res.writeHead(200, { 'content-type': rec.mime_type, 'cache-control': 'private, max-age=3600' });
+    const disposition = ctx.url.searchParams.get('download') === '1'
+      ? `attachment; filename*=UTF-8''${encodeURIComponent(rec.original_name || 'download')}`
+      : 'inline';
+    ctx.res.writeHead(200, { 'content-type': rec.mime_type, 'content-disposition': disposition, 'cache-control': 'private, max-age=3600' });
     ctx.res.end(buf);
   });
 

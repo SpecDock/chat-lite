@@ -2,26 +2,28 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
+import { LogOut, X } from 'lucide-react';
 import type { UserDTO } from '../../../shared/types';
 import { api } from '../../shared/api/client';
 import UsageDialog, { type UsageKind } from './UsageDialog';
 
 gsap.registerPlugin(useGSAP);
 
-type Dialog = 'avatar' | 'password' | UsageKind | null;
+type Dialog = 'avatar' | 'password' | 'logout' | UsageKind | null;
 
 const dialogTitles: Record<Exclude<Dialog, null>, string> = {
   avatar: '更改头像',
   password: '更改密码',
   token: 'Token统计',
-  image: '生图统计'
+  image: '生图统计',
+  logout: '退出登录'
 };
 
 function isUsageDialog(dialog: Dialog): dialog is UsageKind {
   return dialog === 'token' || dialog === 'image';
 }
 
-export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onUserChange: (user: UserDTO) => void }) {
+export default function ProfileMenu({ user, onUserChange, onLogout }: { user: UserDTO; onUserChange: (user: UserDTO) => void; onLogout?: () => void | Promise<void> }) {
   const [open, setOpen] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
@@ -32,10 +34,13 @@ export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onU
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordMsg, setPasswordMsg] = useState('');
   const [passwordBusy, setPasswordBusy] = useState(false);
+  const [logoutMsg, setLogoutMsg] = useState('');
+  const [logoutBusy, setLogoutBusy] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const avatarButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const dialogRef = useRef<HTMLElement | null>(null);
+  const dialogReturnFocusRef = useRef<HTMLElement | null>(null);
   const menuId = useId();
   const dialogTitleId = useId();
   const initials = user.email.slice(0, 1).toUpperCase();
@@ -91,8 +96,44 @@ export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onU
     });
   }, { scope: dialogRef, dependencies: [dialog], revertOnUpdate: true });
 
-  const closeDialog = () => { setDialog(null); setAvatarMsg(''); setPasswordMsg(''); setAvatarFile(null); setCurrentPassword(''); setNewPassword(''); setConfirmPassword(''); };
-  const openDialog = (nextDialog: Exclude<Dialog, null>) => { setOpen(false); setDialog(nextDialog); };
+  const closeDialog = () => { setDialog(null); setAvatarMsg(''); setPasswordMsg(''); setLogoutMsg(''); setLogoutBusy(false); setAvatarFile(null); setCurrentPassword(''); setNewPassword(''); setConfirmPassword(''); };
+  const openDialog = (nextDialog: Exclude<Dialog, null>) => { dialogReturnFocusRef.current = avatarButtonRef.current; setOpen(false); setDialog(nextDialog); };
+
+  useEffect(() => {
+    if (!dialog) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeDialog();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      const element = dialogReturnFocusRef.current;
+      dialogReturnFocusRef.current = null;
+      if (element?.isConnected) window.requestAnimationFrame(() => element.focus({ preventScroll: true }));
+    };
+  }, [dialog]);
+
+  async function submitLogout() {
+    if (logoutBusy) return;
+    setLogoutMsg('');
+    setLogoutBusy(true);
+    try {
+      if (onLogout) {
+        await onLogout();
+        closeDialog();
+        return;
+      }
+      await api.logout();
+      window.location.reload();
+      closeDialog();
+    } catch (error) {
+      setLogoutMsg(error instanceof Error ? error.message : '退出登录失败');
+    } finally {
+      setLogoutBusy(false);
+    }
+  }
 
   async function submitAvatar(e: React.FormEvent) {
     e.preventDefault();
@@ -148,8 +189,9 @@ export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onU
       <button type="button" role="menuitem" onClick={() => openDialog('password')}>更改密码</button>
       <button type="button" role="menuitem" onClick={() => openDialog('token')}>token消耗</button>
       <button type="button" role="menuitem" onClick={() => openDialog('image')}>生图消耗</button>
+      <button type="button" role="menuitem" onClick={() => openDialog('logout')}><LogOut size={16} aria-hidden="true" />退出</button>
     </div>}
-    {dialog && createPortal(<div className="modal-backdrop" onPointerDown={closeDialog}>
+    {dialog && createPortal(<div className="modal-backdrop" onPointerDown={event => { if (event.target === event.currentTarget && !(dialog === 'logout' && logoutBusy)) closeDialog(); }}>
       <section
         className={`profile-modal${isUsageDialog(dialog) ? ' usage-dialog' : ''}`}
         ref={dialogRef}
@@ -160,7 +202,7 @@ export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onU
       >
         <header>
           <strong id={dialogTitleId}>{dialogTitles[dialog]}</strong>
-          <button type="button" className="icon-button" onClick={closeDialog} aria-label={`关闭${dialogTitles[dialog]}`} title="关闭">×</button>
+          <button type="button" className="icon-button" onClick={closeDialog} disabled={dialog === 'logout' && logoutBusy} aria-label={`关闭${dialogTitles[dialog]}`} title="关闭"><X size={19} /></button>
         </header>
         {dialog === 'avatar' ? <form onSubmit={submitAvatar}>
           <label className="avatar-drop">
@@ -176,7 +218,11 @@ export default function ProfileMenu({ user, onUserChange }: { user: UserDTO; onU
           <input type="password" placeholder="原始密码" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} />
           {passwordMsg && <div className={passwordMsg === '修改成功' ? 'hint' : 'error'}>{passwordMsg}</div>}
           <button disabled={passwordBusy || passwordMismatch}>{passwordBusy ? '校验中' : '提交'}</button>
-        </form> : <UsageDialog kind={dialog} />}
+        </form> : dialog === 'logout' ? <div className="logout-confirm">
+          <p>确定退出当前账号吗？你的会话工作区和文件会保留。</p>
+          {logoutMsg && <div className="error" role="alert">{logoutMsg}</div>}
+          <div className="logout-confirm__actions"><button type="button" className="secondary" onClick={closeDialog} disabled={logoutBusy}>取消</button><button type="button" className="danger-button" onClick={() => { void submitLogout(); }} disabled={logoutBusy}>{logoutBusy ? '退出中' : '确认退出'}</button></div>
+        </div> : <UsageDialog kind={dialog} />}
       </section>
     </div>, document.body)}
   </div>;

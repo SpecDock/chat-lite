@@ -1,4 +1,5 @@
 import type { MessageDTO, MessageStatus } from '../../../shared/types.js';
+import { stripExecutionBlocks } from '../../../shared/execution-block.js';
 
 export type MessageVisibilityInput = Pick<MessageDTO, 'role' | 'content'> & { status?: MessageStatus };
 
@@ -11,7 +12,7 @@ const FAILED_ASSISTANT_PLACEHOLDERS = new Set([
 ]);
 
 export function stripThinkBlocks(text: string): string {
-  return String(text || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  return stripExecutionBlocks(String(text || '').replace(/<think>[\s\S]*?<\/think>/g, ''));
 }
 
 export function isKnownFailedAssistantPlaceholder(content: string): boolean {

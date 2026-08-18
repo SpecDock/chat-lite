@@ -1,4 +1,4 @@
-import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO } from '../../../shared/types';
+import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO, WorkspaceFilesDTO } from '../../../shared/types';
 
 async function parse<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}));
@@ -26,6 +26,7 @@ export const api = {
   deleteConversation: (id: string) => fetch(`/api/conversations/${id}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
   deleteMessage: (conversationId: string, userMessageId: string) => fetch(`/api/conversations/${conversationId}/messages/${userMessageId}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean; conversationDeleted: boolean }>(r)),
   messages: (id: string) => fetch(`/api/conversations/${id}/messages`, { credentials: 'include' }).then(r => parse<{ messages: MessageDTO[] }>(r)),
+  workspace: (id: string) => fetch(`/api/conversations/${id}/workspace`, { credentials: 'include' }).then(r => parse<{ workspace: WorkspaceFilesDTO }>(r)),
   searchMessages: (q: string, offset: number, signal?: AbortSignal) => fetch(buildSearchMessagesUrl(q, offset), { credentials: 'include', signal }).then(r => parse<SearchMessagesResponseDTO>(r)),
   upload: (file: File, conversationId?: string) => { const fd = new FormData(); fd.append('file', file); if (conversationId) fd.append('conversationId', conversationId); return fetch('/api/upload', { method: 'POST', credentials: 'include', body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
   usage: () => fetch('/api/usage', { credentials: 'include' }).then(r => parse<UsageDTO>(r))
@@ -37,6 +38,9 @@ export type ChatStreamData = {
   messageId?: string;
   mode?: 'replace' | 'append';
   text?: string;
+  language?: string;
+  code?: string;
+  output?: string;
   error?: string;
   ok?: boolean;
 };

@@ -9,8 +9,9 @@ import { answerHistoryLimit } from './history-limits.js';
 import { selectModelVisibleHistory } from './message-visibility.js';
 import { copyFile, mkdir, unlink } from 'node:fs/promises';
 import { extname, join } from 'node:path';
-import { uploadDir } from '../../core/db.js';
 import { newId } from '../../core/security.js';
+import { row } from '../../core/db.js';
+import { conversationInputDir } from '../workspace/workspace.service.js';
 import {
   deleteUnlinkedAttachments,
   insertClonedAttachment,
@@ -41,13 +42,18 @@ export function loadModelHistory(conversationId: string, userId: string, exclude
 
 export function userMessageContent(input: string, attachmentIds: string[]) {
   if (!attachmentIds.length) return input;
-  const imageMarkdown = attachmentIds.map(id => `![image](/api/files/${id})`).join('\n');
-  return input ? `${input}\n\n${imageMarkdown}` : imageMarkdown;
+  const attachmentMarkdown = attachmentIds.map(id => {
+    const attachment = row<{ mime_type: string; original_name: string | null }>('SELECT mime_type,original_name FROM attachments WHERE id=?', id);
+    if (attachment?.mime_type.startsWith('image/')) return `![image](/api/files/${id})`;
+    const label = String(attachment?.original_name || '表格附件').replace(/[\[\]()`]/g, '').slice(0, 120) || '表格附件';
+    return `[${label}](/api/files/${id})`;
+  }).join('\n');
+  return input ? `${input}\n\n${attachmentMarkdown}` : attachmentMarkdown;
 }
 
 export function attachmentIdsFromContent(content: string) {
   const ids = new Set<string>();
-  const pattern = /!\[[^\]]*\]\(\/api\/files\/([^\s)]+)(?:\s+["'][^"']*["'])?\)/g;
+  const pattern = /!?\[[^\]]*\]\(\/api\/files\/([^\s)]+)(?:\s+["'][^"']*["'])?\)/g;
   for (const match of content.matchAll(pattern)) {
     try {
       ids.add(decodeURIComponent(match[1]));
@@ -60,7 +66,7 @@ export function attachmentIdsFromContent(content: string) {
 
 export function stripUserImageContent(content: string) {
   return content
-    .replace(/!\[[^\]]*\]\(\/api\/files\/[^\s)]+(?:\s+["'][^"']*["'])?\)/g, '')
+    .replace(/!?\[[^\]]*\]\(\/api\/files\/[^\s)]+(?:\s+["'][^"']*["'])?\)/g, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -68,7 +74,7 @@ export function stripUserImageContent(content: string) {
 
 export async function cloneUserAttachments(attachments: CloneAttachmentRow[], userId: string, conversationId: string) {
   if (!attachments.length) return [];
-  const userDirectory = join(uploadDir, userId);
+  const userDirectory = conversationInputDir(conversationId);
   await mkdir(userDirectory, { recursive: true });
   const clones: ClonedAttachment[] = [];
   try {

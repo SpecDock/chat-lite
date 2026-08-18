@@ -2,11 +2,14 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { migrateAttachmentWorkspaces } from './workspace-migration.js';
 
 const root = process.cwd();
 export const dataDir = process.env.DATA_DIR || join(root, 'data');
 export const uploadDir = process.env.UPLOAD_DIR || join(dataDir, 'uploads');
+export const workDir = join(dataDir, 'work');
 mkdirSync(uploadDir, { recursive: true });
+mkdirSync(workDir, { recursive: true });
 
 const dbPath = process.env.DATABASE_PATH || join(dataDir, 'app.db');
 mkdirSync(dirname(dbPath), { recursive: true });
@@ -125,6 +128,7 @@ function ensureUsageCacheColumns() {
 }
 
 ensureUsageCacheColumns();
+migrateAttachmentWorkspaces(db, dataDir);
 
 export const now = () => new Date().toISOString();
 

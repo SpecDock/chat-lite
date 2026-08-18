@@ -1,9 +1,10 @@
 import type { z } from 'zod';
 import type { MessageDTO } from '../../../../shared/types.js';
+import type { ExecutionBlock } from '../../../../shared/execution-block.js';
 import { answerHistoryLimit } from '../history-limits.js';
 import { selectModelVisibleHistory, stripThinkBlocks } from '../message-visibility.js';
 
-export type ToolName = 'web_search' | 'text_to_image' | 'image_edit' | 'view_image';
+export type ToolName = 'web_search' | 'text_to_image' | 'image_edit' | 'view_image' | 'analyze_table';
 
 export type ImageCandidate = {
   attachmentId: string;
@@ -23,6 +24,7 @@ export type AgentContext = {
   imageCandidates?: { current: ImageCandidate[]; historical: ImageCandidate[]; generated: ImageCandidate[] };
   viewedImageIds?: Set<string>;
   signal?: AbortSignal;
+  deferCleanup?: (cleanup: () => Promise<void> | void) => void;
 };
 
 /**
@@ -64,13 +66,15 @@ export function aggregateAgentUsage(current: AgentUsage | undefined, next: Agent
 
 /**
  * Streamed events produced by the agent loop. `think` and `delta` are
- * forwarded to the SSE stream as `think` / `delta` events. `usage` is
- * forwarded as `usage` events for billing. The chat.ts layer emits terminal
- * events (`done` / `cancelled` / `error`).
+ * forwarded to the SSE stream as `think` / `delta` events. `execution` is
+ * reserved for a final successful execution result. `usage` is forwarded as
+ * `usage` events for billing. The chat.ts layer emits terminal events
+ * (`done` / `cancelled` / `error`).
  */
 export type AgentEvent =
   | { type: 'think'; text: string }
   | { type: 'delta'; text: string }
+  | ({ type: 'execution' } & ExecutionBlock)
   | { type: 'usage'; usage: AgentUsage };
 
 /**

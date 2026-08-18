@@ -50,9 +50,10 @@ type Props = {
   onCancelEdit: () => void;
   onConfirmEdit: (message: MessageDTO, text: string) => void;
   onDelete: (message: MessageDTO) => void;
+  onImageClick?: (src: string, alt: string) => void;
 };
 
-export default function MessageList({ messages, conversationId, storageKey, scrollIntent, editingMessageId, actionsDisabled, editorDisabled, jumpMessageId, jumpReady = true, onJumpComplete, onEdit, onCancelEdit, onConfirmEdit, onDelete }: Props) {
+export default function MessageList({ messages, conversationId, storageKey, scrollIntent, editingMessageId, actionsDisabled, editorDisabled, jumpMessageId, jumpReady = true, onJumpComplete, onEdit, onCancelEdit, onConfirmEdit, onDelete, onImageClick }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const lastAnimatedId = useRef<string>('');
   const restoredConversationRef = useRef<string>('');
@@ -217,7 +218,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
               <div className={`bubble ${isEditing ? 'inline-edit-bubble' : ''}`}>
                 {isEditing && editable
                   ? <InlineMessageEditor initialText={editable.text} images={editable.images} disabled={editorDisabled} onCancel={onCancelEdit} onConfirm={text => onConfirmEdit(message, text)} />
-                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} streaming={message.status === 'streaming'} />}
+                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} streaming={message.status === 'streaming'} onImageClick={onImageClick} />}
               </div>
               {showActions && !isEditing && <MessageActions text={copyText} isUser={isUser} disabled={actionsDisabled} onEdit={() => onEdit(message)} onDelete={() => onDelete(message)} />}
             </div>

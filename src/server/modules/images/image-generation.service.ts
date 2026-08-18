@@ -305,6 +305,7 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
 
 async function loadSourceImage(userId: string, attachmentId: string, conversationId?: string): Promise<SourceImage> {
   const normalizedAttachmentId = normalizeAttachmentId(attachmentId);
+  if (!conversationId) throw Object.assign(new Error('图像操作必须指定会话'), { status: 400 });
   const att = repo.findUserAttachmentPath(normalizedAttachmentId, userId, conversationId);
   if (!att) throw Object.assign(new Error(`图片不存在：${normalizedAttachmentId || attachmentId}`), { status: 404 });
   return {
@@ -376,7 +377,10 @@ export async function generateImageBatchForUser(input: {
 }
 
 export async function generateImageForUser({ userId, prompt, conversationId, sourceAttachmentId, referenceAttachmentIds, signal }: GenerateImageInput) {
-  if (conversationId && !userConversationExists(conversationId, userId)) {
+  if (!conversationId) {
+    throw Object.assign(new Error('图像操作必须指定会话'), { status: 400 });
+  }
+  if (!userConversationExists(conversationId, userId)) {
     throw Object.assign(new Error('会话不存在'), { status: 404 });
   }
 
@@ -397,7 +401,7 @@ export async function generateImageForUser({ userId, prompt, conversationId, sou
     } else {
       image = await callImageApi(prompt, signal);
     }
-    const attachment = await saveImageBuffer(userId, image, conversationId);
+    const attachment = await saveImageBuffer(userId, image, conversationId, undefined, undefined, 'output');
     repo.completeImageGeneration(generationId, userId, attachment.id);
     recordImageUsage(userId, generationId, model || null);
     return {

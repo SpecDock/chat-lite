@@ -1,6 +1,7 @@
 import { all, db, now, row } from '../../core/db.js';
 import { deleteConversationChunks, deleteMessageChunks } from '../rag/rag.repo.js';
 import { syncMessageSearchDocument } from '../search/search.repo.js';
+import { ensureConversationWorkspace, isWorkspaceAttachment } from '../workspace/workspace.service.js';
 import type { MessageDTO } from '../../../shared/types.js';
 
 export type ConversationRow = {
@@ -44,6 +45,7 @@ export function conversationExists(conversationId: string, userId: string) {
 }
 
 export function createConversation(conversationId: string, userId: string, title: string) {
+  ensureConversationWorkspace(conversationId);
   db.prepare('INSERT INTO conversations (id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)').run(conversationId, userId, title, now(), now());
   return getConversation(conversationId, userId);
 }
@@ -175,7 +177,13 @@ function attachmentsForRemoval(conversationId: string, userId: string, messageId
     sql += ' AND (message_id IS NULL OR message_id<>?)';
     params.push(protectMessageId);
   }
-  return all<AttachmentFileRow>(sql, ...params);
+  const attachments = all<AttachmentFileRow>(sql, ...params);
+  if (!referencedAttachmentIds.length) return attachments;
+  const remainingParams: unknown[] = [conversationId, userId];
+  const excludedMessages = messageIds.length ? ` AND id NOT IN (${messageIds.map(() => '?').join(',')})` : '';
+  remainingParams.push(...messageIds);
+  const remainingMessages = all<{ content: string }>(`SELECT content FROM messages WHERE conversation_id=? AND user_id=?${excludedMessages}`, ...remainingParams);
+  return attachments.filter(attachment => !referencedAttachmentIds.includes(attachment.id) || !remainingMessages.some(message => message.content.includes(`/api/files/${attachment.id}`)));
 }
 
 function deleteAttachmentRows(attachments: AttachmentFileRow[], userId: string) {
@@ -290,7 +298,8 @@ export function appendEditedMessagePair(input: {
 export function countValidAttachments(attachmentIds: string[], userId: string, conversationId: string) {
   if (!attachmentIds.length) return 0;
   const placeholders = attachmentIds.map(() => '?').join(',');
-  return row<{ count: number }>(`SELECT COUNT(*) as count FROM attachments WHERE id IN (${placeholders}) AND user_id=? AND mime_type LIKE 'image/%' AND message_id IS NULL AND (conversation_id IS NULL OR conversation_id=?)`, ...attachmentIds, userId, conversationId)?.count || 0;
+  const rows = all<{ id: string; file_path: string }>(`SELECT id,file_path FROM attachments WHERE id IN (${placeholders}) AND user_id=? AND conversation_id=? AND message_id IS NULL AND (mime_type LIKE 'image/%' OR lower(original_name) LIKE '%.csv' OR lower(original_name) LIKE '%.xlsx')`, ...attachmentIds, userId, conversationId);
+  return rows.filter(attachment => isWorkspaceAttachment(attachment.file_path, conversationId, 'input')).length;
 }
 
 export function insertUserMessage(messageId: string, userId: string, conversationId: string, content: string) {
@@ -301,7 +310,12 @@ export function insertUserMessage(messageId: string, userId: string, conversatio
 export function linkAttachmentsToMessage(attachmentIds: string[], userId: string, conversationId: string, messageId: string) {
   if (!attachmentIds.length) return;
   const placeholders = attachmentIds.map(() => '?').join(',');
-  db.prepare(`UPDATE attachments SET conversation_id=?, message_id=? WHERE id IN (${placeholders}) AND user_id=? AND mime_type LIKE 'image/%' AND message_id IS NULL AND (conversation_id IS NULL OR conversation_id=?)`).run(conversationId, messageId, ...attachmentIds, userId, conversationId);
+  const validIds = all<{ id: string; file_path: string }>(`SELECT id,file_path FROM attachments WHERE id IN (${placeholders}) AND user_id=? AND conversation_id=? AND message_id IS NULL AND (mime_type LIKE 'image/%' OR lower(original_name) LIKE '%.csv' OR lower(original_name) LIKE '%.xlsx')`, ...attachmentIds, userId, conversationId)
+    .filter(attachment => isWorkspaceAttachment(attachment.file_path, conversationId, 'input'))
+    .map(attachment => attachment.id);
+  if (!validIds.length) return;
+  const validPlaceholders = validIds.map(() => '?').join(',');
+  db.prepare(`UPDATE attachments SET message_id=? WHERE id IN (${validPlaceholders}) AND user_id=? AND conversation_id=? AND message_id IS NULL`).run(messageId, ...validIds, userId, conversationId);
 }
 
 export function insertAssistantStreamingMessage(messageId: string, userId: string, conversationId: string) {

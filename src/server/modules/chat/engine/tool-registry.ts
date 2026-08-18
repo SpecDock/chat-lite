@@ -6,6 +6,7 @@ import { normalizeAttachmentId } from '../tools/normalize-attachment-id.js';
 import { readFile } from 'node:fs/promises';
 import { assertNotAborted, type AgentContext, type ImageCandidate, type ToolDef, type ToolName } from './tool-def.js';
 import { row } from '../../../core/db.js';
+import { executeTableAnalysis } from '../../table-analysis/table-analysis.service.js';
 
 /**
  * Convert a zod schema to OpenAI function-calling parameters JSON.
@@ -186,6 +187,17 @@ const toolDefs = [
       });
       const referenceNote = referenceAttachmentIds.length ? `和 ${referenceAttachmentIds.length} 张参考图` : '';
       return `已基于主图${referenceNote}真实生成新图片并保存为附件。请在最终回复中原样包含这个 Markdown 图片链接，不要只说已生成：\n${result.markdown}`;
+    }
+  },
+  {
+    name: 'analyze_table',
+    description: '分析当前会话中用户上传的 CSV/XLSX 表格。用户要求统计、筛选、清洗、比较、计算或解释表格数据时调用；必须传入真实候选中的 attachmentId 和完整分析要求。工具内部会生成并执行 Python，只有最终成功代码和输出会展示给用户。',
+    schema: z.object({
+      attachmentId: z.string().min(1).describe('当前会话 CSV/XLSX 附件 ID'),
+      instruction: z.string().min(1).describe('完整的表格分析目标、筛选条件、输出要求'),
+    }),
+    execute(args: { attachmentId: string; instruction: string }, ctx: AgentContext) {
+      return executeTableAnalysis(args, ctx);
     }
   }
 ] satisfies ToolDef[];

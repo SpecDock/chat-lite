@@ -31,6 +31,7 @@ export type PrepareConversationContextInput = {
 export type PreparedConversationContext = {
   summaryText: string;
   history: MessageDTO[];
+  contextThinkLog?: string;
 };
 
 function toMessageDTO(message: ContextMessage, conversationId: string): MessageDTO {
@@ -82,6 +83,12 @@ export async function prepareConversationContext(
     && Number.isFinite(previousUserTime)
     && requestTime - previousUserTime > CONVERSATION_CACHE_IDLE_MINUTES * 60_000;
   const shouldCompact = droppedMessages.length > 0 && (costTriggered || idleTriggered);
+  const compactTrigger = costTriggered && idleTriggered
+    ? 'cost_and_idle'
+    : costTriggered ? 'cost' : 'idle';
+  const contextThinkLog = shouldCompact
+    ? `已将 ${droppedMessages.length} 条较早消息压缩为摘要（触发原因：${compactTrigger}）。`
+    : undefined;
 
   let summaryText = state?.summaryText || '';
   let summaryTokenEstimate = state?.summaryTokenEstimate || 0;
@@ -121,12 +128,9 @@ export async function prepareConversationContext(
   });
 
   if (shouldCompact) {
-    const trigger = costTriggered && idleTriggered
-      ? 'cost_and_idle'
-      : costTriggered ? 'cost' : 'idle';
     console.info('[conversation-context] compacted', {
       conversationId: input.conversationId,
-      trigger,
+      trigger: compactTrigger,
       M: roundedCost(M),
       N: roundedCost(N),
       activeTokenEstimate: Math.round(activeTokenEstimate),
@@ -141,5 +145,6 @@ export async function prepareConversationContext(
   return {
     summaryText,
     history: shouldCompact ? tail : activeHistory,
+    ...(contextThinkLog ? { contextThinkLog } : {}),
   };
 }
