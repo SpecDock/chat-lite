@@ -1,6 +1,9 @@
 services:
   chat-lite:
-    build: .
+    build:
+      context: .
+      args:
+        VITE_STREAM_MARKDOWN_INTERVAL_MS: ${VITE_STREAM_MARKDOWN_INTERVAL_MS:-50}
     ports:
       - "3000:3000"
     env_file:
@@ -10,4 +13,27 @@ services:
       - NODE_ENV=production
     volumes:
       - ./data:/data
+      - table-sandbox-runtime:/run/table-sandbox
+    depends_on:
+      - table-sandbox
     restart: unless-stopped
+
+  table-sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    volumes:
+      - table-sandbox-runtime:/run/table-sandbox
+    read_only: true
+    tmpfs:
+      - /tmp
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
+    restart: unless-stopped
+
+volumes:
+  table-sandbox-runtime:

@@ -1,4 +1,5 @@
 import { ChatOpenAI } from '@langchain/openai';
+import { createPromptCacheFetch } from './engine/prompt-cache.js';
 
 export function modelApiKey() {
   return process.env.MODEL_API_KEY || process.env.OPENAI_API_KEY || '';
@@ -12,14 +13,16 @@ export function modelName() {
   return process.env.MODEL_NAME || process.env.OPENAI_MODEL || 'gpt-4o-mini';
 }
 
-export function createChatModel() {
+export function createChatModel(options?: { promptCache?: boolean }) {
   const apiKey = modelApiKey();
   if (!apiKey) throw new Error('未配置模型 API Key：请设置 MODEL_API_KEY 或 OPENAI_API_KEY');
+  const promptCacheFetch = options?.promptCache ? createPromptCacheFetch() : undefined;
   return new ChatOpenAI({
     model: modelName(),
     apiKey,
     temperature: Number(process.env.MODEL_TEMPERATURE || 0.3),
-    configuration: { baseURL: modelBaseUrl() }
+    maxRetries: 0,
+    configuration: { baseURL: modelBaseUrl(), ...(promptCacheFetch ? { fetch: promptCacheFetch } : {}) }
   });
 }
 

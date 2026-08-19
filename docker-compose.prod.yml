@@ -1,0 +1,60 @@
+services:
+  chat-lite:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - DATA_DIR=/data
+      - UPLOAD_DIR=/data/uploads
+      - DATABASE_PATH=/data/app.db
+      - RAG_DATABASE_PATH=/data/rag.db
+      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - MINIMAX_MCP_COMMAND=uvx
+    volumes:
+      - /data/chat-lite/chat-lite/data:/data
+      - table-sandbox-runtime:/run/table-sandbox
+    depends_on:
+      - table-sandbox
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+  table-sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    volumes:
+      - table-sandbox-runtime:/run/table-sandbox
+    read_only: true
+    tmpfs:
+      - /tmp
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "1000:1000"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d
+      - ./deploy/certbot/www:/var/www/certbot
+      - ./deploy/certbot/conf:/etc/letsencrypt
+    depends_on:
+      - chat-lite
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./deploy/certbot/www:/var/www/certbot
+      - ./deploy/certbot/conf:/etc/letsencrypt
+
+volumes:
+  table-sandbox-runtime:

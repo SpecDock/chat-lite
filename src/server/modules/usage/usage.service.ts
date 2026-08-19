@@ -9,6 +9,8 @@ export type TokenUsageInput = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  cacheMeasuredPromptTokens?: number;
+  cachedTokens?: number;
 };
 
 export type TokenEstimateInput = {
@@ -30,6 +32,11 @@ function positiveInt(value: unknown) {
   return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 0;
 }
 
+function nullableNonnegativeInt(value: unknown) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  return Math.ceil(value);
+}
+
 function estimateTokens(text: string) {
   return Math.max(1, Math.ceil(text.length / 4));
 }
@@ -46,6 +53,9 @@ export function recordTokenUsage(input: TokenUsageInput) {
   const completionTokens = positiveInt(input.completionTokens);
   const totalTokens = positiveInt(input.totalTokens) || promptTokens + completionTokens;
   if (totalTokens <= 0) return;
+  const cacheMeasuredPromptTokens = nullableNonnegativeInt(input.cacheMeasuredPromptTokens);
+  const cachedTokens = nullableNonnegativeInt(input.cachedTokens);
+  const hasCacheMeasurement = cacheMeasuredPromptTokens !== null && cachedTokens !== null;
   repo.insertTokenUsage({
     userId: input.userId,
     conversationId: input.conversationId,
@@ -53,7 +63,9 @@ export function recordTokenUsage(input: TokenUsageInput) {
     model: input.model || defaultChatModelName(),
     promptTokens,
     completionTokens,
-    totalTokens
+    totalTokens,
+    cacheMeasuredPromptTokens: hasCacheMeasurement ? cacheMeasuredPromptTokens : null,
+    cachedTokens: hasCacheMeasurement ? cachedTokens : null,
   });
 }
 
@@ -73,9 +85,36 @@ function usageDays(rows: Array<{ date: string; value: number }>) {
   return rows.reverse().map(row => ({ date: row.date, label: labelForDate(row.date), value: Number(row.value || 0) }));
 }
 
+function tokenUsageDays(rows: Array<{ date: string; inputValue: number; outputValue: number; cachedValue: number; measuredInputValue: number; measuredInputCount: number }>) {
+  return rows.reverse().map(row => {
+    const inputValue = Number(row.inputValue || 0);
+    const outputValue = Number(row.outputValue || 0);
+    const cachedValue = Number(row.cachedValue || 0);
+    const measuredInputValue = Number(row.measuredInputValue || 0);
+    return {
+      date: row.date,
+      label: labelForDate(row.date),
+      inputValue,
+      outputValue,
+      cachedValue,
+      cacheRate: row.measuredInputCount > 0 && measuredInputValue > 0 ? (cachedValue / measuredInputValue) * 100 : null,
+      value: inputValue + outputValue,
+    };
+  });
+}
+
 export function getUsage(userId: string): UsageDTO {
+  const tokenUsage = repo.sumTokenUsage(userId);
+  const inputTotal = Number(tokenUsage.inputTotal || 0);
+  const outputTotal = Number(tokenUsage.outputTotal || 0);
   return {
-    token: { total: Number(repo.sumTokenUsage(userId).total || 0), days: usageDays(repo.listTokenUsageDays(userId)) },
+    token: {
+      inputTotal,
+      outputTotal,
+      cachedTotal: Number(tokenUsage.cachedTotal || 0),
+      days: tokenUsageDays(repo.listTokenUsageDays(userId)),
+      total: inputTotal + outputTotal,
+    },
     image: { total: Number(repo.sumImageUsage(userId).total || 0), days: usageDays(repo.listImageUsageDays(userId)) }
   };
 }

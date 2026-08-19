@@ -1,66 +1,49 @@
 import { useEffect, useRef, useState } from 'react';
+import { Check, Copy, Pencil, Trash2 } from 'lucide-react';
 import { gsap } from 'gsap';
 
 type Props = {
   text: string;
-  className?: string;
-  ariaLabel?: string;
+  isUser?: boolean;
+  disabled?: boolean;
+  onEdit?: () => void;
+  onDelete?: () => void;
 };
 
-const ICON_COPY = (
-  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-    <rect x="5.5" y="5.5" width="8" height="8" rx="1.6" stroke="currentColor" strokeWidth="1.4" fill="none" />
-    <path
-      d="M3 11V4a1 1 0 0 1 1-1h7"
-      stroke="currentColor"
-      strokeWidth="1.4"
-      fill="none"
-      strokeLinecap="round"
-    />
-  </svg>
-);
+function reducedMotion() {
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 
-const ICON_CHECK = (
-  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-    <path
-      d="M3.5 8.4l3 3L12.6 5"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      fill="none"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-  </svg>
-);
-
-export default function MessageActions({ text, className, ariaLabel }: Props) {
+export default function MessageActions({ text, isUser, disabled, onEdit, onDelete }: Props) {
   const [copied, setCopied] = useState(false);
-  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const copyRef = useRef<HTMLButtonElement | null>(null);
   const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const node = btnRef.current;
-    if (!node) return;
+    const node = rootRef.current;
+    if (!node || reducedMotion()) return;
     const ctx = gsap.context(() => {
       gsap.fromTo(
-        node,
+        '.message-action-btn',
         { autoAlpha: 0, y: 4 },
-        { autoAlpha: 1, y: 0, duration: 0.28, ease: 'power2.out', delay: 0.08 }
+        { autoAlpha: 1, y: 0, duration: 0.28, ease: 'power2.out', stagger: 0.035, delay: 0.06 }
       );
     }, node);
-    return () => {
-      ctx.revert();
-    };
+    return () => ctx.revert();
+  }, []);
+
+  useEffect(() => () => {
+    if (timerRef.current) window.clearTimeout(timerRef.current);
   }, []);
 
   function flashCopy() {
     setCopied(true);
-    if (btnRef.current) {
-      gsap.fromTo(
-        btnRef.current,
-        { scale: 0.88 },
-        { scale: 1, duration: 0.22, ease: 'back.out(2.2)' }
-      );
+    if (copyRef.current && !reducedMotion()) {
+      const ctx = gsap.context(() => {
+        gsap.fromTo(copyRef.current, { scale: 0.9 }, { scale: 1, duration: 0.2, ease: 'back.out(2)' });
+      }, copyRef);
+      window.setTimeout(() => ctx.revert(), 240);
     }
     if (timerRef.current) window.clearTimeout(timerRef.current);
     timerRef.current = window.setTimeout(() => {
@@ -75,15 +58,15 @@ export default function MessageActions({ text, className, ariaLabel }: Props) {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);
       } else {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
         document.execCommand('copy');
-        document.body.removeChild(ta);
+        document.body.removeChild(textarea);
       }
       flashCopy();
     } catch (error) {
@@ -92,16 +75,28 @@ export default function MessageActions({ text, className, ariaLabel }: Props) {
   }
 
   return (
-    <button
-      ref={btnRef}
-      type="button"
-      className={`copy-btn ${copied ? 'is-copied' : ''} ${className || ''}`.trim()}
-      onClick={handleCopy}
-      aria-label={ariaLabel || (copied ? '已复制' : '复制消息')}
-      title={copied ? '已复制' : '复制消息'}
-    >
-      <span className="copy-btn-icon">{copied ? ICON_CHECK : ICON_COPY}</span>
-      <span className="copy-btn-label">{copied ? '已复制' : '复制'}</span>
-    </button>
+    <div className="message-actions" ref={rootRef} aria-label={isUser ? '用户消息操作' : '助手消息操作'}>
+      <button
+        ref={copyRef}
+        type="button"
+        className={`message-action-btn ${copied ? 'is-copied' : ''}`}
+        onClick={handleCopy}
+        aria-label={copied ? '已复制' : '复制消息'}
+        title={copied ? '已复制' : '复制消息'}
+      >
+        {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+        <span>{copied ? '已复制' : '复制'}</span>
+      </button>
+      {isUser && <>
+        <button type="button" className="message-action-btn" disabled={disabled} onClick={onEdit} aria-label="编辑消息" title="编辑消息">
+          <Pencil size={14} aria-hidden="true" />
+          <span>编辑</span>
+        </button>
+        <button type="button" className="message-action-btn danger" disabled={disabled} onClick={onDelete} aria-label="删除消息" title="删除消息">
+          <Trash2 size={14} aria-hidden="true" />
+          <span>删除</span>
+        </button>
+      </>}
+    </div>
   );
 }

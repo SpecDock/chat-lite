@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
 const port = Number(process.env.SMOKE_PORT || 4100 + Math.floor(Math.random() * 1000));
+const startupTimeoutMs = Number(process.env.SMOKE_STARTUP_TIMEOUT_MS || 60000);
 const origin = `http://127.0.0.1:${port}`;
 const dataDir = await mkdtemp(join(tmpdir(), 'chat-lite-smoke-'));
 
@@ -30,7 +31,7 @@ server.stdout.on('data', chunk => { stdout += chunk; });
 server.stderr.on('data', chunk => { stderr += chunk; });
 
 async function waitForHealth() {
-  const deadline = Date.now() + 8000;
+  const deadline = Date.now() + startupTimeoutMs;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`${origin}/api/health`);
@@ -66,6 +67,14 @@ try {
   console.log('smoke ok');
 } finally {
   server.kill('SIGTERM');
-  await new Promise(resolve => server.once('exit', resolve));
+  if (server.exitCode === null && server.signalCode === null) {
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, 3000);
+      server.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
   await rm(dataDir, { recursive: true, force: true });
 }

@@ -1,7 +1,11 @@
 import { db, now } from '../../core/db.js';
 
-export function findUserAttachmentPath(attachmentId: string, userId: string) {
-  return db.prepare('SELECT id,file_path,mime_type,original_name FROM attachments WHERE id=? AND user_id=?').get(attachmentId, userId) as { id: string; file_path: string; mime_type: string; original_name?: string | null } | undefined;
+export function findUserAttachmentPath(attachmentId: string, userId: string, conversationId: string) {
+  if (!conversationId) return undefined;
+  const sql = `SELECT id,file_path,mime_type,original_name FROM attachments
+    WHERE id=? AND user_id=? AND conversation_id=?`;
+  const params = [attachmentId, userId, conversationId];
+  return db.prepare(sql).get(...params) as { id: string; file_path: string; mime_type: string; original_name?: string | null } | undefined;
 }
 
 export function insertImageGeneration(id: string, userId: string, prompt: string, model: string | null) {

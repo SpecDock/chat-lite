@@ -8,6 +8,15 @@ export type Authed = { userId: string; email: string; sessionId: string };
 export const cookieName = process.env.SESSION_COOKIE_NAME || 'chat_lite_session';
 export const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 5) * 1024 * 1024;
 export const allowedImageMimes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+export const tableUploadMaxBytes = 100 * 1024 * 1024;
+export const allowedTableMimes = new Set([
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/octet-stream',
+]);
 
 export function sha256(value: string) {
   return createHash('sha256').update(value).digest('hex');

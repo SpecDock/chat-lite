@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">chat-lite</string>
+    <string name="blocked_navigation">已阻止外部页面跳转</string>
+    <string name="file_picker_unavailable">系统文件选择器不可用</string>
+</resources>

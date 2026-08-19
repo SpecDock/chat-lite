@@ -1,6 +1,6 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
-import { extname, join, normalize, resolve } from 'node:path';
+import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export type Next = () => Promise<void>;
@@ -179,9 +179,15 @@ const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js
 export async function serveStaticOrSpa(ctx: RequestContext, rootDir: string) {
   if (ctx.method !== 'GET' && ctx.method !== 'HEAD') return jsonError(ctx, 405, statusText[405]);
   const root = resolve(rootDir);
-  const requested = normalize(decodeURIComponent(ctx.path));
+  let requested: string;
+  try {
+    requested = normalize(decodeURIComponent(ctx.path));
+  } catch {
+    return jsonError(ctx, 400, 'Invalid path');
+  }
   let file = resolve(join(root, requested));
-  if (!file.startsWith(root)) return jsonError(ctx, 404, 'Not found');
+  const relativeFile = relative(root, file);
+  if (relativeFile === '..' || relativeFile.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(relativeFile)) return jsonError(ctx, 404, 'Not found');
   let st = await stat(file).catch(() => undefined);
   if (!st?.isFile()) { file = join(root, 'index.html'); st = await stat(file).catch(() => undefined); }
   if (!st?.isFile()) return jsonError(ctx, 404, 'Not found');

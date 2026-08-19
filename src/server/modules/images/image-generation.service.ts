@@ -11,6 +11,7 @@ type GenerateImageInput = {
   prompt: string;
   conversationId?: string;
   sourceAttachmentId?: string;
+  referenceAttachmentIds?: string[];
   signal?: AbortSignal;
 };
 
@@ -103,6 +104,18 @@ function mimeFromUrl(url: string) {
   return 'image/png';
 }
 
+function parseImageApiJson(text: string, res: Response, label: string): any {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    const contentType = res.headers.get('content-type') || 'unknown content-type';
+    const ray = res.headers.get('cf-ray');
+    const summary = text.replace(/\s+/g, ' ').trim().slice(0, 180);
+    throw new Error(`${label}返回非 JSON 响应 HTTP ${res.status} (${contentType})${ray ? `，cf-ray=${ray}` : ''}${summary ? `：${summary}` : ''}`);
+  }
+}
+
 async function postImageGeneration(endpoint: string, apiKey: string, body: Record<string, unknown>, signal?: AbortSignal) {
   const res = await fetch(assertHttpUrl(endpoint, 'IMAGE_API_URL'), {
     method: 'POST',
@@ -114,7 +127,7 @@ async function postImageGeneration(endpoint: string, apiKey: string, body: Recor
     signal
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  const data = parseImageApiJson(text, res, '文生图 API');
   if (!res.ok) throw new Error(data?.error?.message || data?.message || `图片生成失败 HTTP ${res.status}`);
   return data;
 }
@@ -154,14 +167,23 @@ async function callImageApi(prompt: string, signal?: AbortSignal) {
   throw new Error('图片生成 API 未返回 url 或 b64_json');
 }
 
-async function callImageEditApi(prompt: string, source: SourceImage, signal?: AbortSignal) {
+function appendEditImages(form: FormData, sources: SourceImage[]) {
+  const field = sources.length > 1 ? 'image[]' : 'image';
+  for (const source of sources) {
+    form.append(field, new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
+  }
+}
+
+async function callImageEditApi(prompt: string, sources: SourceImage[], signal?: AbortSignal) {
   const endpoint = imageEditApiEndpoint();
   const apiKey = editImageApiKey();
   const model = editImageModel();
   if (!endpoint || !apiKey || !model) throw new Error('图生图 API 未配置：请设置 IMAGE_EDIT_API_URL、IMAGE_EDIT_API_KEY、IMAGE_EDIT_MODEL');
+  if (!sources.length) throw new Error('图生图至少需要一张主图');
 
   if (isMiniMaxImageGenerationEndpoint(endpoint)) {
-    return callMiniMaxImageToImage(endpoint, apiKey, model, prompt, source, signal);
+    if (sources.length > 1) throw new Error('当前 MiniMax 图生图接口未验证多参考图；请改用支持 image[] 的 OpenAI 兼容 /images/edits 接口');
+    return callMiniMaxImageToImage(endpoint, apiKey, model, prompt, sources[0], signal);
   }
 
   const form = new FormData();
@@ -173,7 +195,7 @@ async function callImageEditApi(prompt: string, source: SourceImage, signal?: Ab
   form.append('response_format', editImageResponseFormat());
   const editQuality = imageEditQuality();
   if (editQuality) form.append('quality', editQuality);
-  form.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
+  appendEditImages(form, sources);
 
   let res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
     method: 'POST',
@@ -182,7 +204,7 @@ async function callImageEditApi(prompt: string, source: SourceImage, signal?: Ab
     signal
   });
   let text = await res.text();
-  let data = text ? JSON.parse(text) : {};
+  let data = parseImageApiJson(text, res, '图生图 API');
   if (!res.ok && /response_format|unsupported|invalid|upstream did not return image output/i.test(data?.error?.message || data?.message || '')) {
     const fallbackForm = new FormData();
     fallbackForm.append('model', model);
@@ -190,7 +212,7 @@ async function callImageEditApi(prompt: string, source: SourceImage, signal?: Ab
     fallbackForm.append('n', '1');
     if (editSize) fallbackForm.append('size', editSize);
     if (editQuality) fallbackForm.append('quality', editQuality);
-    fallbackForm.append('image', new Blob([new Uint8Array(source.buffer)], { type: source.mimeType }), source.filename || 'source.png');
+    appendEditImages(fallbackForm, sources);
     res = await fetch(assertHttpUrl(endpoint, 'IMAGE_EDIT_API_URL'), {
       method: 'POST',
       headers: { authorization: `Bearer ${apiKey}` },
@@ -198,7 +220,7 @@ async function callImageEditApi(prompt: string, source: SourceImage, signal?: Ab
       signal
     });
     text = await res.text();
-    data = text ? JSON.parse(text) : {};
+    data = parseImageApiJson(text, res, '图生图 API');
   }
   if (!res.ok) throw new Error(data?.error?.message || data?.message || `图生图失败 HTTP ${res.status}`);
 
@@ -263,7 +285,7 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
     signal
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  const data = parseImageApiJson(text, res, 'MiniMax 图生图 API');
   const baseResp = data?.base_resp;
   if (!res.ok || (baseResp && Number(baseResp.status_code) !== 0)) {
     throw new Error(baseResp?.status_msg || data?.error?.message || data?.message || `图生图失败 HTTP ${res.status}`);
@@ -281,9 +303,10 @@ async function callMiniMaxImageToImageWithSourceMode(endpoint: string, apiKey: s
   throw new Error('MiniMax 图生图 API 未返回 image_urls 或 base64 图片');
 }
 
-async function loadSourceImage(userId: string, attachmentId: string): Promise<SourceImage> {
+async function loadSourceImage(userId: string, attachmentId: string, conversationId?: string): Promise<SourceImage> {
   const normalizedAttachmentId = normalizeAttachmentId(attachmentId);
-  const att = repo.findUserAttachmentPath(normalizedAttachmentId, userId);
+  if (!conversationId) throw Object.assign(new Error('图像操作必须指定会话'), { status: 400 });
+  const att = repo.findUserAttachmentPath(normalizedAttachmentId, userId, conversationId);
   if (!att) throw Object.assign(new Error(`图片不存在：${normalizedAttachmentId || attachmentId}`), { status: 404 });
   return {
     attachmentId: normalizedAttachmentId,
@@ -353,8 +376,11 @@ export async function generateImageBatchForUser(input: {
   return results;
 }
 
-export async function generateImageForUser({ userId, prompt, conversationId, sourceAttachmentId, signal }: GenerateImageInput) {
-  if (conversationId && !userConversationExists(conversationId, userId)) {
+export async function generateImageForUser({ userId, prompt, conversationId, sourceAttachmentId, referenceAttachmentIds, signal }: GenerateImageInput) {
+  if (!conversationId) {
+    throw Object.assign(new Error('图像操作必须指定会话'), { status: 400 });
+  }
+  if (!userConversationExists(conversationId, userId)) {
     throw Object.assign(new Error('会话不存在'), { status: 404 });
   }
 
@@ -363,10 +389,19 @@ export async function generateImageForUser({ userId, prompt, conversationId, sou
   repo.insertImageGeneration(generationId, userId, prompt, model || null);
 
   try {
-    const image = sourceAttachmentId
-      ? await callImageEditApi(prompt, await loadSourceImage(userId, sourceAttachmentId), signal)
-      : await callImageApi(prompt, signal);
-    const attachment = await saveImageBuffer(userId, image, conversationId);
+    let image;
+    if (sourceAttachmentId) {
+      const references = Array.from(new Set((referenceAttachmentIds || []).filter(id => id && id !== sourceAttachmentId)));
+      if (references.length > 3) throw new Error('图像编辑最多支持一张主图和三张参考图');
+      const sources = await Promise.all([
+        loadSourceImage(userId, sourceAttachmentId, conversationId),
+        ...references.map(id => loadSourceImage(userId, id, conversationId))
+      ]);
+      image = await callImageEditApi(prompt, sources, signal);
+    } else {
+      image = await callImageApi(prompt, signal);
+    }
+    const attachment = await saveImageBuffer(userId, image, conversationId, undefined, undefined, 'output');
     repo.completeImageGeneration(generationId, userId, attachment.id);
     recordImageUsage(userId, generationId, model || null);
     return {
