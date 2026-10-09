@@ -60,6 +60,26 @@ CREATE TABLE IF NOT EXISTS conversation_context_states (
 CREATE INDEX IF NOT EXISTS idx_conversation_context_states_user_id
   ON conversation_context_states(user_id);
 
+CREATE TABLE IF NOT EXISTS conversation_context_snapshots (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  covered_message_id TEXT NOT NULL,
+  covered_message_created_at TEXT NOT NULL,
+  context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'current', 'superseded', 'invalid')),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE (conversation_id, user_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_context_snapshots_owner
+  ON conversation_context_snapshots(conversation_id, user_id, covered_message_created_at, covered_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_context_snapshots_current
+  ON conversation_context_snapshots(conversation_id, user_id)
+  WHERE status = 'current';
+
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -166,3 +186,35 @@ CREATE TABLE IF NOT EXISTS image_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_image_usage_user_created ON image_usage(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_image_usage_generation ON image_usage(image_generation_id);
+
+CREATE TABLE IF NOT EXISTS studio_images (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  aspect_ratio TEXT NOT NULL,
+  quality TEXT NOT NULL,
+  style TEXT NOT NULL DEFAULT 'vivid',
+  width INTEGER,
+  height INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+  error TEXT,
+  duration_ms INTEGER,
+  file_path TEXT,
+  mime_type TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_studio_images_user_created ON studio_images(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_studio_images_user_running ON studio_images(user_id) WHERE status = 'running';
+CREATE TABLE IF NOT EXISTS studio_image_references (
+  id TEXT PRIMARY KEY,
+  studio_image_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  FOREIGN KEY (studio_image_id) REFERENCES studio_images(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_studio_image_references_image ON studio_image_references(studio_image_id, sort_order);
+

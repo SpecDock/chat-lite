@@ -9,9 +9,9 @@ const originalDataDir = process.env.DATA_DIR;
 process.env.DATABASE_PATH = join(tempDir, 'cache-usage.db');
 process.env.DATA_DIR = tempDir;
 
-const { runChatModelOnce, streamFinalResponse } = await import('../src/server/modules/chat/engine/agent-loop.ts');
-const { aggregateAgentUsage } = await import('../src/server/modules/chat/engine/tool-def.ts');
-const { db } = await import('../src/server/core/db.ts');
+const { runChatModelOnce, streamFinalResponse } = await import('../src/server/application/chat/engine/agent-loop.ts');
+const { aggregateAgentUsage } = await import('../src/server/application/chat/engine/tool-def.ts');
+const { db } = await import('../src/server/infrastructure/db/db.ts');
 
 function fakeModel(chunks) {
   return {

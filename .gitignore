@@ -8,3 +8,4 @@ data/
 *.db-shm
 *.db-wal
 test/output-*.png
+.slim/deepwork/

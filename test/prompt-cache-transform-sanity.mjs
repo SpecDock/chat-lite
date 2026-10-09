@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import {
+  assistantReasoningReplayKey,
   createPromptCacheFetch,
   transformPromptCacheBody,
-} from '../src/server/modules/chat/engine/prompt-cache.ts';
+} from '../src/server/infrastructure/llm/prompt-cache.ts';
 
 const tools = [
   { type: 'function', function: { name: 'first', parameters: { type: 'object' } } },
@@ -259,5 +260,25 @@ assert.match(capturedWireBody.prompt_cache_key, /^chat-lite-[a-f0-9]{24}$/);
 assert.deepEqual(capturedWireBody.prompt_cache_options, { mode: 'explicit', ttl: '30m' });
 assert.equal(JSON.stringify(capturedWireBody).includes('currentUserMessageIndex'), false, 'wire body has no internal index sentinel');
 assert.equal(JSON.stringify(capturedWireBody).includes('__chat_lite_current_user__'), false, 'wire body has no current-user sentinel');
+
+const rawReplayCalls = [{ id: 'call_1', type: 'function', function: { name: 'first', arguments: '{"q":"raw"}' } }];
+const reasoningReplay = new Map([
+  [assistantReasoningReplayKey('preface', rawReplayCalls), 'think-step'],
+]);
+let replayedRequest;
+const replayFetch = createPromptCacheFetch(async (_input, init) => {
+  replayedRequest = JSON.parse(init.body);
+  return new Response('ok', { status: 200 });
+}, reasoningReplay);
+const replaySource = bodyWith();
+replaySource.messages.push({ role: 'assistant', content: 'preface', tool_calls: rawReplayCalls });
+assert.equal((await replayFetch('https://example.test/v1/chat/completions', {
+  method: 'POST',
+  body: JSON.stringify(replaySource),
+})).status, 200);
+const replayedAssistant = replayedRequest.messages.at(-1);
+assert.equal(replayedAssistant.reasoning_content, 'think-step');
+assert.equal(replayedAssistant.tool_calls[0].function.arguments, '{"q":"raw"}');
+assert.equal(replayedRequest.prompt_cache_key, transformPromptCacheBody(bodyWith()).prompt_cache_key, 'reasoning replay must not change the cache key');
 
 console.info('prompt cache transform sanity passed');

@@ -1,5 +1,5 @@
 import { useCallback, useState, type RefObject } from 'react';
-import { Ellipsis, Search } from 'lucide-react';
+import { Ellipsis, Image as ImageIcon, Search } from 'lucide-react';
 import type { ConversationDTO } from '../../../shared/types';
 import type { ConversationActivity } from './conversationActivity';
 import ConversationActionsMenu, { ConversationSummary } from './ConversationActionsMenu';
@@ -9,6 +9,8 @@ type Props = {
   currentId?: string;
   statuses: Record<string, ConversationActivity>;
   searchTriggerRef: RefObject<HTMLButtonElement | null>;
+  studioOpen: boolean;
+  onOpenStudio: () => void;
   onSearch: () => void;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -23,7 +25,7 @@ type MenuTarget = {
   row: HTMLDivElement;
 };
 
-export default function ConversationList({ conversations, currentId, statuses, searchTriggerRef, onSearch, onSelect, onNew, onPin, onRename, onDelete }: Props) {
+export default function ConversationList({ conversations, currentId, statuses, searchTriggerRef, studioOpen, onOpenStudio, onSearch, onSelect, onNew, onPin, onRename, onDelete }: Props) {
   const [menuTarget, setMenuTarget] = useState<MenuTarget>();
   const [pinningIds, setPinningIds] = useState<Set<string>>(() => new Set());
   const closeMenu = useCallback(() => setMenuTarget(undefined), []);
@@ -45,6 +47,10 @@ export default function ConversationList({ conversations, currentId, statuses, s
     : undefined;
 
   return <aside className="convs"><div className="conv-actions">
+    <button type="button" className={studioOpen ? 'studio-nav active' : 'studio-nav'} aria-pressed={studioOpen} onClick={onOpenStudio}>
+      <ImageIcon size={17} aria-hidden="true" />
+      <span>图片生成</span>
+    </button>
     <button ref={searchTriggerRef} type="button" className="conversation-search-trigger" onClick={onSearch}>
       <Search size={17} aria-hidden="true" />
       <span>搜索消息</span>
@@ -54,7 +60,8 @@ export default function ConversationList({ conversations, currentId, statuses, s
     const activity = statuses[c.id];
     const menuOpen = menuTarget?.conversation.id === c.id;
     const menuId = `conversation-actions-${c.id}`;
-    return <div className={`conv${c.id === currentId ? ' active' : ''}${menuOpen ? ' menu-open' : ''}`} data-status={activity?.status || 'idle'} key={c.id} onClick={() => onSelect(c.id)}>
+    const rowActive = !studioOpen && c.id === currentId;
+    return <div className={`conv${rowActive ? ' active' : ''}${menuOpen ? ' menu-open' : ''}`} data-status={activity?.status || 'idle'} key={c.id} onClick={() => onSelect(c.id)}>
       <ConversationSummary conversation={c} activity={activity} />
       <button
         type="button"

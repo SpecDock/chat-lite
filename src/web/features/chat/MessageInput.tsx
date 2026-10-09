@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { gsap } from 'gsap';
-import { FileText, FolderOpen } from 'lucide-react';
+import { FileText, FolderOpen, X } from 'lucide-react';
 import type { AttachmentDTO } from '../../../shared/types';
 import ImageUploader from './ImageUploader';
 
@@ -13,7 +13,7 @@ function isSupportedAttachment(file: File) {
   return file.type.startsWith('image/') || name.endsWith('.csv') || name.endsWith('.xlsx');
 }
 
-export default function MessageInput({ disabled, sending, refillText, refillKey, pending, onSend, onCancel, onImage, onRemoveImage, conversationId, onWorkspace }: { disabled?: boolean; sending?: boolean; refillText?: string; refillKey?: number; pending: AttachmentDTO[]; onSend: (text: string) => void; onCancel?: () => void; onImage: (file: File) => void | Promise<void>; onRemoveImage: (id: string) => void; conversationId?: string; onWorkspace?: () => void }) {
+export default function MessageInput({ disabled, sending, refillText, refillKey, pending, onSend, onCancel, onImage, onRemoveImage, onPreviewImage, conversationId, onWorkspace }: { disabled?: boolean; sending?: boolean; refillText?: string; refillKey?: number; pending: AttachmentDTO[]; onSend: (text: string) => void; onCancel?: () => void; onImage: (file: File) => void | Promise<void>; onRemoveImage: (id: string) => void; onPreviewImage: (src: string, alt: string) => void; conversationId?: string; onWorkspace?: () => void }) {
   const [text, setText] = useState('');
   const [dragging, setDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -119,8 +119,13 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
   >
     {pending.length > 0 && <div className="pending-images">{pending.map(a => {
       const isImage = a.mime_type.startsWith('image/');
-      return <button className={isImage ? undefined : 'pending-file'} type="button" key={a.id} aria-label={`移除${isImage ? '图片' : '文件'} ${a.original_name}`} onClick={() => onRemoveImage(a.id)}>
-        {isImage ? <img src={a.public_path} alt={a.original_name} /> : <><FileText size={22} aria-hidden="true" /><small>{a.original_name}</small></>}
+      if (isImage) return <div className="attach-thumb" key={a.id}>
+        <img src={a.public_path} alt={a.original_name} draggable={false} onDoubleClick={() => onPreviewImage(a.public_path, a.original_name)} />
+        <button type="button" className="attach-thumb__remove" aria-label={`移除图片 ${a.original_name}`} title="移除" onClick={() => onRemoveImage(a.id)} onDoubleClick={event => event.stopPropagation()}><X size={12} /></button>
+      </div>;
+      return <button className="pending-file" type="button" key={a.id} aria-label={`移除文件 ${a.original_name}`} onClick={() => onRemoveImage(a.id)}>
+        <FileText size={22} aria-hidden="true" />
+        <small>{a.original_name}</small>
         <span>×</span>
       </button>;
     })}</div>}

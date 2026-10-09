@@ -29,7 +29,9 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [avatarMsg, setAvatarMsg] = useState('');
   const [avatarBusy, setAvatarBusy] = useState(false);
-  const [currentPassword, setCurrentPassword] = useState('');
+  const [passwordCode, setPasswordCode] = useState('');
+  const [passwordCooldown, setPasswordCooldown] = useState(0);
+  const [passwordCodeSending, setPasswordCodeSending] = useState(false);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordMsg, setPasswordMsg] = useState('');
@@ -72,6 +74,12 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
     };
   }, [open]);
 
+  useEffect(() => {
+    if (passwordCooldown <= 0) return;
+    const timer = window.setTimeout(() => setPasswordCooldown(value => Math.max(0, value - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [passwordCooldown]);
+
   useGSAP(() => {
     if (!open || !menuRef.current) return;
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -96,7 +104,7 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
     });
   }, { scope: dialogRef, dependencies: [dialog], revertOnUpdate: true });
 
-  const closeDialog = () => { setDialog(null); setAvatarMsg(''); setPasswordMsg(''); setLogoutMsg(''); setLogoutBusy(false); setAvatarFile(null); setCurrentPassword(''); setNewPassword(''); setConfirmPassword(''); };
+  const closeDialog = () => { setDialog(null); setAvatarMsg(''); setPasswordMsg(''); setLogoutMsg(''); setLogoutBusy(false); setAvatarFile(null); setPasswordCode(''); setPasswordCooldown(0); setPasswordCodeSending(false); setNewPassword(''); setConfirmPassword(''); };
   const openDialog = (nextDialog: Exclude<Dialog, null>) => { dialogReturnFocusRef.current = avatarButtonRef.current; setOpen(false); setDialog(nextDialog); };
 
   useEffect(() => {
@@ -154,16 +162,32 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
     }
   }
 
+  async function sendPasswordCode() {
+    if (passwordCodeSending || passwordCooldown > 0) return;
+    setPasswordMsg('');
+    setPasswordCodeSending(true);
+    try {
+      await api.sendPasswordChangeCode();
+      setPasswordCooldown(60);
+      setPasswordMsg('验证码已发送到当前绑定邮箱');
+    } catch (error) {
+      setPasswordMsg(error instanceof Error ? error.message : '验证码发送失败');
+    } finally {
+      setPasswordCodeSending(false);
+    }
+  }
+
   async function submitPassword(e: React.FormEvent) {
     e.preventDefault();
     setPasswordMsg('');
+    if (!/^\d{6}$/.test(passwordCode.trim())) return setPasswordMsg('请输入 6 位邮箱验证码');
     if (passwordMismatch) return setPasswordMsg('两次新密码不一致');
     if (newPassword.length < 8) return setPasswordMsg('新密码至少 8 位');
     setPasswordBusy(true);
     try {
-      await api.changePassword({ currentPassword, newPassword, confirmPassword });
+      await api.changePassword({ code: passwordCode.trim(), newPassword, confirmPassword });
       setPasswordMsg('修改成功');
-      window.setTimeout(closeDialog, 650);
+      window.setTimeout(() => window.location.reload(), 650);
     } catch (error) {
       setPasswordMsg(error instanceof Error ? error.message : '修改失败');
     } finally {
@@ -212,12 +236,13 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
           {avatarMsg && <div className={avatarMsg === '修改成功' ? 'hint' : 'error'}>{avatarMsg}</div>}
           <button disabled={avatarBusy}>{avatarBusy ? '提交中' : '提交'}</button>
         </form> : dialog === 'password' ? <form onSubmit={submitPassword}>
-          <input type="password" placeholder="新密码" value={newPassword} onChange={e => setNewPassword(e.target.value)} />
-          <input type="password" placeholder="确认新密码" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} />
+          <p className="password-email-note">验证码将发送到 <strong>{user.email}</strong></p>
+          <div className="password-code-row"><label className="auth-field"><span>邮箱验证码</span><input inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="6 位验证码" value={passwordCode} onChange={e => setPasswordCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label><button type="button" onClick={() => { void sendPasswordCode(); }} disabled={passwordCodeSending || passwordCooldown > 0}>{passwordCodeSending ? '发送中' : passwordCooldown > 0 ? `${passwordCooldown}s` : '发送验证码'}</button></div>
+          <label className="auth-field"><span>新密码</span><input type="password" autoComplete="new-password" placeholder="密码至少 8 位" value={newPassword} onChange={e => setNewPassword(e.target.value)} /></label>
+          <label className="auth-field"><span>确认新密码</span><input type="password" autoComplete="new-password" placeholder="再次输入新密码" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} /></label>
           {passwordMismatch && <div className="error">两次新密码不一致</div>}
-          <input type="password" placeholder="原始密码" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} />
           {passwordMsg && <div className={passwordMsg === '修改成功' ? 'hint' : 'error'}>{passwordMsg}</div>}
-          <button disabled={passwordBusy || passwordMismatch}>{passwordBusy ? '校验中' : '提交'}</button>
+          <button disabled={passwordBusy || passwordCodeSending || passwordMismatch}>{passwordBusy ? '修改中' : '提交'}</button>
         </form> : dialog === 'logout' ? <div className="logout-confirm">
           <p>确定退出当前账号吗？你的会话工作区和文件会保留。</p>
           {logoutMsg && <div className="error" role="alert">{logoutMsg}</div>}

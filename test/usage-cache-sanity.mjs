@@ -48,8 +48,8 @@ process.env.DATA_DIR = tempDir;
 
 let openedDb;
 try {
-  const dbModule = await import('../src/server/core/db.ts');
-  const service = await import('../src/server/modules/usage/usage.service.ts');
+  const dbModule = await import('../src/server/infrastructure/db/db.ts');
+  const service = await import('../src/server/application/usage/usage.service.ts');
   openedDb = dbModule.db;
 
   assert.equal(openedDb.prepare('PRAGMA foreign_key_list(token_usage)').all().length, 0, 'usage table becomes append-only');

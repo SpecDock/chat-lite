@@ -28,6 +28,7 @@ import {
 import ProfileMenu from '../profile/ProfileMenu';
 import WorkspaceDialog from './WorkspaceDialog';
 import ImageLightbox from '../messages/ImageLightbox';
+import ImageStudioPage from '../studio/ImageStudioPage';
 import { encodeExecutionBlock } from '../../../shared/execution-block';
 
 const EMPTY_CONVERSATION_KEY = '__none__';
@@ -484,6 +485,7 @@ type StreamOptions = {
 export default function ChatPage({ user, initialScroll, onLogout }: { user: UserDTO; initialScroll: 'restore' | 'bottom'; onLogout: () => void }) {
   const storageKey = `chat-lite:last-conversation:${user.id}`;
   const activityStorageKey = `chat-lite:conversation-activity:${user.id}`;
+  const studioStorageKey = `chat-lite:studio-open:${user.id}`;
   const [profile, setProfile] = useState(user);
   const [convs, setConvs] = useState<ConversationDTO[]>([]);
   const [current, setCurrent] = useState<string>();
@@ -506,6 +508,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState('');
   const [imagePreview, setImagePreview] = useState<{ src: string; alt: string }>();
+  const [studioOpen, setStudioOpen] = useState(() => safeGetItem(studioStorageKey) === '1');
   const [scrollIntent, setScrollIntent] = useState<ScrollIntent>(initialScroll);
   const restoredRef = useRef(false);
   const currentRef = useRef<string | undefined>(undefined);
@@ -1248,6 +1251,11 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }, [activities, activityStorageKey]);
 
   useEffect(() => {
+    if (studioOpen) safeSetItem(studioStorageKey, '1');
+    else safeRemoveItem(studioStorageKey);
+  }, [studioOpen, studioStorageKey]);
+
+  useEffect(() => {
     if (!current) return;
     setActivities(currentActivities => clearConversationUnread(currentActivities, current));
   }, [current]);
@@ -1652,7 +1660,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     }
   }
 
+  function openStudio() {
+    setStudioOpen(true);
+    setWorkspaceOpen(false);
+    setDrawerOpen(false);
+  }
+
   function selectConversation(id: string) {
+    setStudioOpen(false);
     searchSelectionRef.current += 1;
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
@@ -1709,6 +1724,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const isSelectionActive = () => searchSelectionRef.current === selectionId;
     const isViewCurrent = () => isSelectionActive() && currentRef.current === conversationId;
     setSearchOpen(false);
+    setStudioOpen(false);
     setDrawerOpen(false);
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
@@ -1777,6 +1793,8 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             currentId={currentConversationId}
             statuses={activities}
             searchTriggerRef={searchTriggerRef}
+            studioOpen={studioOpen}
+            onOpenStudio={openStudio}
             onSearch={() => setSearchOpen(true)}
             onSelect={selectConversation}
             onNew={async () => {
@@ -1794,6 +1812,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           />
         </div>
         <main className="chat">
+          {studioOpen ? <ImageStudioPage /> : <>
           {err && <div className="error app-error">{err}</div>}
           <MessageList
             messages={messages}
@@ -1831,6 +1850,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
               ...cache,
               [currentKey]: (cache[currentKey] || []).filter(attachment => attachment.id !== id)
             }))}
+            onPreviewImage={(src, alt) => setImagePreview({ src, alt })}
             onImage={async file => {
               const uploadKey = currentRef.current || EMPTY_CONVERSATION_KEY;
               try {
@@ -1854,6 +1874,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           onPreview={file => setImagePreview({ src: file.previewUrl || file.url, alt: file.name })}
         />
         {imagePreview && <ImageLightbox src={imagePreview.src} alt={imagePreview.alt} onClose={() => setImagePreview(undefined)} />}
+          </>}
         </main>
       </div>
       <ConversationSearch

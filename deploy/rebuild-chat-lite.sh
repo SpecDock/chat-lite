@@ -17,6 +17,7 @@ fi
 
 SERVICE_NAME="${SERVICE_NAME:-chat-lite}"
 SANDBOX_SERVICE="table-sandbox"
+SERVICES=("$SERVICE_NAME" "$SANDBOX_SERVICE")
 NO_CACHE="${NO_CACHE:-0}"
 STOP_BEFORE_BUILD="${STOP_BEFORE_BUILD:-1}"
 PRUNE_AFTER="${PRUNE_AFTER:-0}"
@@ -37,18 +38,18 @@ echo "Using compose file: $COMPOSE_FILE"
 
 if [ "$STOP_BEFORE_BUILD" = "1" ]; then
   echo "Stopping $SERVICE_NAME and $SANDBOX_SERVICE before build (frees memory for the build step)..."
-  docker compose -f "$COMPOSE_FILE" stop "$SERVICE_NAME" "$SANDBOX_SERVICE" || true
+  docker compose -f "$COMPOSE_FILE" stop "${SERVICES[@]}" || true
 fi
 
-echo "Rebuilding services: $SERVICE_NAME $SANDBOX_SERVICE"
+echo "Rebuilding services: ${SERVICES[*]}"
 if [ "$NO_CACHE" = "1" ]; then
-  docker compose -f "$COMPOSE_FILE" build --no-cache "$SERVICE_NAME" "$SANDBOX_SERVICE"
+  docker compose -f "$COMPOSE_FILE" build --no-cache "${SERVICES[@]}"
 else
-  docker compose -f "$COMPOSE_FILE" build "$SERVICE_NAME" "$SANDBOX_SERVICE"
+  docker compose -f "$COMPOSE_FILE" build "${SERVICES[@]}"
 fi
 
-echo "Recreating services: $SERVICE_NAME $SANDBOX_SERVICE"
-docker compose -f "$COMPOSE_FILE" up -d --force-recreate "$SERVICE_NAME" "$SANDBOX_SERVICE"
+echo "Recreating services: ${SERVICES[*]}"
+docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${SERVICES[@]}"
 
 # 轮询而不是 sleep 3 + 一次性探测：原来在 set -e 下只要启动稍慢就会误报部署失败。
 echo "Waiting for service to become healthy (up to $((HEALTH_RETRIES * 2))s)..."

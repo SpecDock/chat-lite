@@ -8,8 +8,8 @@ import {
   modelMaxAttempts,
   retryDelayMs,
   safeCauseCodes,
-} from '../src/server/modules/chat/engine/model-retry.ts';
-import { runChatModelOnce, streamFinalResponse } from '../src/server/modules/chat/engine/agent-loop.ts';
+} from '../src/server/infrastructure/llm/model-retry.ts';
+import { runChatModelOnce, streamFinalResponse } from '../src/server/application/chat/engine/agent-loop.ts';
 
 function retryable(error) {
   return classifyModelError(error).retryable;

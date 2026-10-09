@@ -7,9 +7,9 @@ const directory = await mkdtemp(join(tmpdir(), 'chat-lite-rag-sanity-'));
 process.env.RAG_DATABASE_PATH = join(directory, 'rag.db');
 process.env.EMBEDDING_DIMENSIONS = '4';
 
-const { closeRagDb, ragDb } = await import('../src/server/modules/rag/rag-db.ts');
-const { deleteMessageChunks, insertChunk, keywordCandidatesForQuery, listAllItems } = await import('../src/server/modules/rag/rag.repo.ts');
-const { jaccard } = await import('../src/server/modules/rag/rag.service.ts');
+const { closeRagDb, ragDb } = await import('../src/server/infrastructure/rag/rag-db.ts');
+const { deleteMessageChunks, insertChunk, keywordCandidatesForQuery, listAllItems } = await import('../src/server/infrastructure/rag/rag.repo.ts');
+const { jaccard } = await import('../src/server/application/rag/rag.service.ts');
 
 try {
   const text = '中文检索 gpt-image-2 错误码 E_IMAGE_429 的处理说明，包含足够长度用于 sanity 验证。';

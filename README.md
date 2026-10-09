@@ -30,25 +30,25 @@ Node.js 24.18.0 + native node:http
   +-- Chat API: 聊天 SSE、取消、编辑、删除、重新生成
   |     +-- 会话上下文、摘要、有效历史、RAG 注入
   |     +-- 手写单智能体 ReAct AgentLoop
-  |           +-- ChatOpenAI.bindTools
+  |           +-- ChatOpenAI.bindTools（固定 tools，不发送 tool_choice）
   |           +-- ToolRegistry
-  |           +-- decision rounds
+  |           +-- append-only 工具循环
   |           +-- ToolMessage / view_image 轨迹
-  |           +-- final response: tool_choice=none
+  |           +-- 无 tool_calls 的一轮正文即最终回答
   +-- Conversation concurrency: 多会话任务、delta buffer、activity
   +-- Message operations: 问答 pair 编辑、删除、附件清理
   +-- Events: 账号范围内的多设备 SSE 事件
   +-- Search: 当前用户的全局消息搜索
   +-- Usage: token、缓存 token、图片 usage、每日统计
   +-- RAG: 独立 rag.db、sqlite-vec、FTS5 trigram、RRF
-  +-- Images: generations / edits / MiniMax MCP 适配
+  +-- Images: OpenAI-compatible generations / edits
   |
   +-- app.db       账号、会话、消息、附件、usage
   +-- rag.db       RAG chunks、向量索引、RAG FTS
   +-- uploads/     本地上传和生成图片
 ```
 
-AgentLoop 是单个主模型驱动的手写 ReAct 循环；工具决策、工具执行和最终回答都在同一个 AgentLoop 中完成。
+AgentLoop 是单个主模型驱动的手写 ReAct 循环。工具选择、工具执行和最终回答都在同一个 append-only 循环里完成，没有单独的最终请求。
 
 ### 技术栈
 
@@ -63,8 +63,8 @@ AgentLoop 是单个主模型驱动的手写 ReAct 循环；工具决策、工具
 | Code blocks | Shiki + `@shikijs/stream` + Oniguruma WASM |
 | RAG | `sqlite-vec` + SQLite FTS5 trigram |
 | Model | `ChatOpenAI` 的 OpenAI-compatible Chat Completions 接口 |
-| Search MCP | MCP stdio client；默认通过 `uvx` 接入 MiniMax MCP |
-| Image API | OpenAI-compatible `/images/generations`、`/images/edits`，以及 MiniMax 分支 |
+| Search | Tavily Search API `/search` |
+| Image API | OpenAI-compatible `/images/generations`、`/images/edits` |
 
 ## AgentLoop
 
@@ -73,41 +73,35 @@ AgentLoop 是单个主模型驱动的手写 ReAct 循环；工具决策、工具
 一次 `/api/chat` 请求的主要流程如下：
 
 1. 创建固定顺序的工具 schema 和 `ToolRegistry`。
-2. 用 `ChatOpenAI.bindTools(tools)` 创建工具决策模型。
-3. 模型执行一个或多个 decision rounds。每轮只输出结构化 tool calls，或输出服务器识别的结束 marker；不会把决策阶段的正文当作用户最终回答。
-4. 每个 tool call 真实执行后，结果作为 `ToolMessage` 追加回消息数组，再进入下一 decision round。彼此独立的调用可以在同一轮并发执行，但最终按模型调用顺序组装结果。
-5. 决策结束后追加服务器的 final runtime control，再用同一组工具绑定 `tool_choice: 'none'` 的模型流式生成最终回答。
+2. 用 `ChatOpenAI.bindTools(tools)` 绑定这一次运行始终使用的同一组工具。请求不移除 tools，也不发送 `tool_choice`。
+3. 模型在同一个循环里回答。返回 tool calls 时按原顺序执行并追加 `ToolMessage`；某一轮没有 tool calls 时，该轮正文就是最终回答并流式输出。
+4. 彼此独立的调用可以在同一轮并发执行，但 `ToolMessage` 按模型调用顺序组装。assistant 消息保留原始 tool call 参数字符串；如果流里带有 DeepSeek `reasoning_content`，也保留在该消息上并在后续请求中回放。
+5. 不追加每轮临时 system control。步数上限打断工具循环时，仍用同一模型和同一组工具再请求一次回答。
 
 模型阶段由 `model-retry.ts` 分类错误并按 `MODEL_MAX_ATTEMPTS` 重试，实际值限制在 1 到 3 次。可重试的连接、超时、部分限时速率错误和服务端错误才会重试；取消、认证/额度错误、普通参数错误不重试。最终回答已经向用户提交部分正文后发生的流中断也不重新发起一条回答。`AbortSignal` 会传递到模型、工具和上游 fetch，取消会停止当前请求和等待中的重试延迟。
 
-工具调用总数、图片调用数、递归步数和相同参数重复调用都有限制。预算拒绝或工具失败的结果仍会回到模型，模型不能把未执行的动作当成成功。
+工具调用总数、递归步数和相同参数重复调用都有限制。预算拒绝或工具失败的结果仍会回到模型，模型不能把未执行的动作当成成功。
 
 ### 当前工具
 
 | Tool | 行为 |
 | --- | --- |
-| `web_search` | 通过 MCP 搜索服务联网搜索；用于实时信息、事实核验、证据不足和专业问题 |
-| `text_to_image` | 不依赖原图生成新的图片成品；会保存为附件并记录 image usage |
-| `image_edit` | 以一张主图和最多三张参考图生成编辑结果；会保存新附件 |
-| `view_image` | 从当前会话的历史图片候选中读取图片本体，供后续识别、搜索或编辑 |
+| `web_search` | 通过 Tavily Search API 联网搜索；用于实时信息、事实核验、证据不足和专业问题 |
+| `view_image` | 从当前会话的历史图片候选中读取图片本体，供后续识别或搜索 |
 
 图片规则：
 
 - 当前轮上传的图片会直接以内联 `data:` 图片内容放进当前 user message，最多接收 4 张；当前轮图片不需要先调用 `view_image`。
-- 历史用户图片和历史生成图片只先作为候选摘要提供给模型。要依据它们的内容进行识别、搜索或编辑，必须先用准确的候选 `attachmentId` 调用 `view_image`；成功后图片本体会在下一 decision round 追加到模型上下文。未知 ID、跨用户或跨会话附件会被拒绝。
-- `image_edit.attachmentId` 是主画布，`referenceAttachmentIds` 最多 3 个。后端按 Image 1、Image 2..4 发送；例如“把图 1 放到图 2 右下角”时，图 2 应是主图，图 1 是参考图。
-- 普通 OpenAI-compatible `/images/edits` 路径使用 multipart；这不是 `IMAGE_EDIT_SOURCE_MODE` 的含义。MiniMax 图生图分支不支持参考图，只接受一张主图。
-- MiniMax 主图来源支持 `base64` 或 signed URL。`IMAGE_EDIT_SOURCE_MODE=signed-url` 时优先发送 signed URL，其他值优先发送 base64；首选方式失败后会尝试另一种方式。signed URL 由服务端生成，仍受会话和用户权限检查。
-- 图片生成和编辑是可能产生供应商费用的外部副作用，只有用户明确要求实际图片成品且要求足够明确时才调用。
+- 历史用户图片和历史生成图片只先作为候选摘要提供给模型。要依据它们的内容进行识别或搜索，必须先用准确的候选 `attachmentId` 调用 `view_image`；成功后图片本体追加到后续模型上下文。未知 ID、跨用户或跨会话附件会被拒绝。
 
 ## Prompt cache 与会话上下文
 
 ### 实际消息顺序
 
-工具 schema 和固定 System/Instruction 是缓存公共前缀的一部分。`SYSTEM_PROMPT_BASE` 与 `AGENT_LOOP_INSTRUCTION` 当前合并为固定 `SystemMessage`；工具由 `ToolRegistry` 以稳定顺序转换为 OpenAI function schema。每次请求的逻辑上下文顺序是：
+工具 schema 和固定系统提示是缓存公共前缀的一部分。`SYSTEM_PROMPT_BASE` 是唯一的固定 `SystemMessage`；工具由 `ToolRegistry` 以稳定顺序转换为 OpenAI function schema，并且每一次模型请求都带上这同一组 tools。每次请求的逻辑上下文顺序是：
 
 ```text
-固定 tools + 固定 System/Instruction
+固定 tools + 固定 System
   -> conversation summary
   -> effective history
   -> current user（文字和本轮图片）
@@ -136,7 +130,7 @@ RAG 明确位于当前 user 之后，不在历史之前。图片候选说明只�
 缓存转换发生在发往 `/chat/completions` 的 provider 请求体上：
 
 1. 第一个 `prompt_cache_breakpoint` 是 provider metadata，标在固定 System/Developer 消息的稳定 text block 上。
-2. 第二个断点从消息数组尾部向前寻找最后一个可缓存 content block。它可能落在当前 user、tool result、`view_image` 图片或最终 runtime control 等块上，不能保证固定在当前 user 末尾。
+2. 第二个断点从消息数组尾部向前寻找最后一个可缓存 content block。它可能落在当前 user、tool result 或 `view_image` 图片等块上，不能保证固定在当前 user 末尾。循环中不再追加临时 system control。
 3. `prompt_cache_key` 只由 model、固定 System 文本和有序 tools schema 组成，不包含 RAG、历史、当前 user 或随机请求 ID。
 4. 断点声明只是请求元数据，不等于 provider 已命中缓存；只有 provider 返回的实际 cached prompt token 才是命中证据。
 5. 如果 provider 明确拒绝显式缓存字段，当前 Agent run 会用未转换的原始请求回退一次，并停止后续显式转换。普通 400、取消、限流或已经开始的流不会因为缓存字段而盲目重试。
@@ -211,7 +205,7 @@ chat-lite/
 │  │  │  │  ├─ chat.ts、chat.service.ts、chat.repo.ts
 │  │  │  │  └─ model.ts
 │  │  │  ├─ conversation-titles/
-│  │  │  ├─ images/                    # generations、edits、MiniMax 适配
+│  │  │  ├─ images/                    # generations、edits
 │  │  │  ├─ uploads/                   # 本地上传、鉴权文件访问
 │  │  │  ├─ rag/                       # rag.db、sqlite-vec、FTS、chunker、backfill
 │  │  │  ├─ search/                    # 全局消息搜索路由和 repository
@@ -317,13 +311,11 @@ VITE_STREAM_MARKDOWN_INTERVAL_MS=50
 ```env
 AGENT_RECURSION_LIMIT=25
 AGENT_MAX_TOOL_CALLS=25
-AGENT_MAX_IMAGE_GENERATION_CALLS=10
-AGENT_MAX_IMAGE_TO_IMAGE_CALLS=1
 ANSWER_HISTORY_LIMIT=6
 MODEL_MAX_ATTEMPTS=2
 ```
 
-它们分别限制决策递归、总工具调用、文生图、图生图、历史尾部语义和每个模型阶段的重试次数。工具预算实际还受图片停止条件和重复调用保护影响。
+它们分别限制决策递归、总工具调用、历史尾部语义和每个模型阶段的重试次数。工具预算实际还受重复调用保护影响。
 
 ### MODEL / TITLE
 
@@ -348,42 +340,28 @@ TITLE_MODEL_TEMPERATURE=0
 ```env
 TEXT_IMAGE_API_URL=https://your-endpoint/v1/images/generations
 TEXT_IMAGE_API_KEY=...
-TEXT_IMAGE_MODEL=your-image-model
-TEXT_IMAGE_MAX_BATCH=10
-TEXT_IMAGE_MAX_PARALLEL=4
-TEXT_IMAGE_RESPONSE_FORMAT=b64_json
-TEXT_IMAGE_SIZE=auto
-TEXT_IMAGE_QUALITY=low
+TEXT_IMAGE_MODEL=gpt-image-2.5-sunburst
 ```
 
-当前运行时控制批量的是 `TEXT_IMAGE_MAX_BATCH` 和 `TEXT_IMAGE_MAX_PARALLEL`。`.env.example` 中的 `TEXT_IMAGE_DEFAULT_BATCH` 目前没有被源码读取，修改它不会改变运行时行为，不应把它当成有效配置。
+图片工作室没有参考图时走文生图。响应格式在代码里固定为 `b64_json`，不读取环境变量。画面比例和画质由请求传入，`auto` 比例不传 `size`。
 
 ### Image edit
 
 ```env
 IMAGE_EDIT_API_URL=https://your-endpoint/v1/images/edits
 IMAGE_EDIT_API_KEY=...
-IMAGE_EDIT_MODEL=your-edit-model
-IMAGE_EDIT_SOURCE_MODE=base64
-IMAGE_EDIT_REFERENCE_TYPE=character
-IMAGE_EDIT_RESPONSE_FORMAT=b64_json
-IMAGE_EDIT_SIZE=auto
-IMAGE_EDIT_QUALITY=low
+IMAGE_EDIT_MODEL=gpt-image-2.5-sunburst
 ```
 
-普通 OpenAI-compatible edit endpoint 使用 multipart，单图字段为 `image`，多图字段为 `image[]`。`IMAGE_EDIT_SOURCE_MODE` 只决定 MiniMax 分支优先把主图作为 base64 还是 signed URL：只有精确值 `signed-url` 才优先 signed URL，其他值优先 base64，失败后交替回退。不要把 `IMAGE_EDIT_SOURCE_MODE=multipart` 理解成唯一或通用的上传模式。MiniMax 分支不接受参考图。
+图片工作室有 1 到 16 张参考图时走图生图。请求为 multipart，单图字段为 `image`，多图字段为 `image[]`。响应格式同样固定为 `b64_json`。
 
-### MiniMax MCP
+### Tavily web search
 
 ```env
-MINIMAX_API_KEY=...
-MINIMAX_API_HOST=https://api.minimaxi.com
-MINIMAX_MCP_COMMAND=uvx
-MINIMAX_MCP_ARGS=minimax-coding-plan-mcp -y
-MINIMAX_MCP_BASE_PATH=./data
+TAVILY_API_KEY=...
 ```
 
-`web_search` 通过 MCP stdio client 使用这些设置。Docker 镜像内置 `uv` 和 `uvx`，宿主机直接运行时需要自行提供 `uvx` 及 MCP 依赖。
+`web_search` 使用 Tavily `POST https://api.tavily.com/search`，通过 Bearer token 认证。生产环境应把 key 放在服务端 `.env`，不要写入前端或测试源码。
 
 ### RAG、embedding 和 chunker
 
@@ -470,7 +448,7 @@ live probe 默认关闭或需要显式环境变量，例如 `RUN_LIVE_PROMPT_CAC
 
 - `Dockerfile` 的构建阶段使用 `node:24.18.0-bookworm-slim`，runner 也固定 Node 24.18.0。
 - deps、build、prod-deps 阶段刻意串成低内存路径；`JOBS=1`、`MAKEFLAGS=-j1`、`GOMAXPROCS=1`、npm 并发限制和 Node heap 限制用于 2 核/2GB 一类服务器。代价是构建更慢。
-- 镜像内置 Python、`uv` 和 `uvx`，供 MiniMax MCP 使用；不依赖容器启动时临时安装 uv。
+- 主服务镜像只包含 Node.js 运行时；CSV/XLSX 分析使用独立的 `table-sandbox` Python 容器。
 - `docker-compose.yml` 把宿主机 `./data` 挂载到容器 `/data`，服务端暴露 `3000`。
 - `docker-compose.prod.yml` 还定义 nginx 和 certbot，并把服务器的 data、nginx 配置、certbot webroot/证书目录挂载进容器。当前工作区可见该文件，但部署服务器上的副本可能缺失或使用未被 Git 跟踪的生产文件。
 

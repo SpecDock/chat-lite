@@ -14,9 +14,9 @@ process.env.RAG_WRITE_ENABLED = 'false';
 process.env.RAG_READ_ENABLED = 'false';
 process.env.RAG_SHADOW_ENABLED = 'false';
 
-const { db } = await import('../src/server/core/db.ts');
-const { Router } = await import('../src/server/core/http.ts');
-const { registerSearchRoutes } = await import('../src/server/modules/search/search.ts');
+const { db } = await import('../src/server/infrastructure/db/db.ts');
+const { Router } = await import('../src/server/interfaces/http/http.ts');
+const { registerSearchRoutes } = await import('../src/server/interfaces/http/search.ts');
 const {
   completeAssistantMessage,
   failAssistantMessage,
@@ -24,8 +24,8 @@ const {
   insertUserMessage,
   interruptAssistantMessage,
   replaceLatestMessagePair
-} = await import('../src/server/modules/chat/chat.repo.ts');
-const { shutdownRag } = await import('../src/server/modules/rag/rag.ts');
+} = await import('../src/server/infrastructure/chat/chat.repo.ts');
+const { shutdownRag } = await import('../src/server/application/rag/rag.ts');
 
 const userId = 'search_user';
 const otherUserId = 'search_other_user';

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-const { selectModelVisibleHistory } = await import('../src/server/modules/chat/message-visibility.ts');
+const { selectModelVisibleHistory } = await import('../src/server/domain/chat/message-visibility.ts');
 const assistant = (content, status = 'completed') => ({ role: 'assistant', content, status });
 const user = (content) => ({ role: 'user', content, status: 'completed' });
 

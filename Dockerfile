@@ -62,14 +62,10 @@ RUN npm prune --omit=dev --no-audit --no-fund \
 ########## 4. runner ##########
 FROM node:24.18.0-bookworm-slim AS runner
 WORKDIR /app
-ENV NODE_ENV=production \
-    UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
+ENV NODE_ENV=production
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-# uv/uvx 是 web_search 依赖的 MiniMax MCP 运行时，不要删
-COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /uvx /usr/local/bin/
-RUN uv --version && uvx --version
 COPY package*.json ./
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=prod-deps /app/dist ./dist

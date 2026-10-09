@@ -9,8 +9,6 @@ services:
       - UPLOAD_DIR=/data/uploads
       - DATABASE_PATH=/data/app.db
       - RAG_DATABASE_PATH=/data/rag.db
-      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - MINIMAX_MCP_COMMAND=uvx
     volumes:
       - /data/chat-lite/chat-lite/data:/data
       - table-sandbox-runtime:/run/table-sandbox
