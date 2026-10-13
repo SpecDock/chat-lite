@@ -10,7 +10,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"chatlite/internal/domain/visibility"
+	"chatlite/config"
 	"chatlite/internal/platform/idgen"
 )
 
@@ -56,41 +56,10 @@ type IndexInput struct {
 	CreatedAt      string
 }
 
-func envBool(name string, fallback bool) bool {
-	raw, ok := os.LookupEnv(name)
-	if !ok {
-		return fallback
-	}
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
-}
-
-func envInt(name string, fallback int) int {
-	n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
-	if err != nil || n < 0 {
-		return fallback
-	}
-	return n
-}
-
-func envFloat(name string, fallback float64) float64 {
-	n, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv(name)), 64)
-	if err != nil {
-		return fallback
-	}
-	return n
-}
-
-func writeEnabled() bool { return envBool("RAG_WRITE_ENABLED", false) }
-func readEnabled() bool  { return envBool("RAG_READ_ENABLED", false) }
+func writeEnabled() bool { return config.Current().RAG.WriteEnabled }
+func readEnabled() bool  { return config.Current().RAG.ReadEnabled }
 func shadowEnabled() bool {
-	return envBool("RAG_SHADOW_ENABLED", false)
+	return config.Current().RAG.ShadowEnabled
 }
 func readActive() bool { return readEnabled() || shadowEnabled() }
 
@@ -124,7 +93,7 @@ func indexOne(ctx context.Context, pool *pgxpool.Pool, input IndexInput) error {
 	if input.Role != "user" && input.Role != "assistant" {
 		return nil
 	}
-	maxChars := envInt("RAG_CONTENT_MAX_CHARS", 1200)
+	maxChars := config.Current().RAG.ContentMaxChars
 	cleaned := CleanForIndexing(input.Content, maxChars)
 	if utf8.RuneCountInString(cleaned) < 8 && len(cleaned) < 8 {
 		return nil
@@ -140,7 +109,7 @@ func indexOne(ctx context.Context, pool *pgxpool.Pool, input IndexInput) error {
 	if createdAt == "" {
 		createdAt = idgen.NowISO()
 	}
-	dims := envInt("EMBEDDING_DIMENSIONS", 1536)
+	dims := config.Current().Embedding.Dimensions
 	type prepared struct {
 		chunk Chunk
 		vec   []float32
@@ -231,7 +200,7 @@ func Retrieve(ctx context.Context, pool *pgxpool.Pool, userID, query, conversati
 	if pool == nil || !readActive() || strings.TrimSpace(query) == "" || conversationID == "" {
 		return nil, nil
 	}
-	topK := envInt("RAG_TOP_K", 3)
+	topK := config.Current().RAG.TopK
 	if topK <= 0 {
 		return nil, nil
 	}
@@ -256,7 +225,7 @@ func Retrieve(ctx context.Context, pool *pgxpool.Pool, userID, query, conversati
 			ORDER BY embedding <=> $1::vector LIMIT $3`, vectorLiteral(embedding), conversationID, overFetch)
 		if err == nil {
 			i := 0
-			maxDistance := envFloat("RAG_MAX_DISTANCE", 0.4)
+			maxDistance := config.Current().RAG.MaxDistance
 			if maxDistance <= 0 {
 				maxDistance = math.Inf(1)
 			}
@@ -413,7 +382,7 @@ func FormatHits(hits []Hit) string {
 	if len(hits) == 0 || !readEnabled() {
 		return ""
 	}
-	limit := envInt("RAG_CONTENT_MAX_CHARS", 1200)
+	limit := config.Current().RAG.ContentMaxChars
 	if limit <= 0 {
 		limit = 1200
 	}
@@ -525,26 +494,25 @@ func jaccard(a, b string) float64 {
 }
 
 func embeddingConfigured() bool {
-	return os.Getenv("EMBEDDING_API_KEY") != "" && (os.Getenv("EMBEDDING_MODEL") != "" || true) && envInt("EMBEDDING_DIMENSIONS", 1536) > 0 && os.Getenv("EMBEDDING_API_KEY") != "" && envModel() != ""
-}
-
-func envModel() string {
-	if v := os.Getenv("EMBEDDING_MODEL"); v != "" {
-		return v
-	}
-	return "text-embedding-3-small"
+	cfg := config.Current().Embedding
+	return cfg.APIKey != "" && cfg.Model != "" && cfg.Dimensions > 0
 }
 
 func embedText(ctx context.Context, text string) ([]float32, error) {
-	if os.Getenv("EMBEDDING_API_KEY") == "" {
+	cfg := config.Current().Embedding
+	if cfg.APIKey == "" {
 		return nil, nil
 	}
-	base := os.Getenv("EMBEDDING_BASE_URL")
+	base := cfg.APIURL
 	if base == "" {
 		base = "https://api.openai.com/v1"
 	}
+	model := cfg.Model
+	if model == "" {
+		model = "text-embedding-3-small"
+	}
 	base = strings.TrimRight(base, "/") + "/embeddings"
-	body, _ := json.Marshal(map[string]any{"model": envModel(), "input": text})
+	body, _ := json.Marshal(map[string]any{"model": model, "input": text})
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, base, strings.NewReader(string(body)))
@@ -552,7 +520,7 @@ func embedText(ctx context.Context, text string) ([]float32, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("EMBEDDING_API_KEY"))
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -574,7 +542,7 @@ func embedText(ctx context.Context, text string) ([]float32, error) {
 	for i, n := range payload.Data[0].Embedding {
 		vec[i] = float32(n)
 	}
-	want := envInt("EMBEDDING_DIMENSIONS", 1536)
+	want := cfg.Dimensions
 	if want > 0 && len(vec) != want {
 		return nil, fmt.Errorf("embedding dim %d", len(vec))
 	}

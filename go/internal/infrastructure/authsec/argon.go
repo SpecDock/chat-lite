@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -20,7 +21,7 @@ const (
 	argonSaltLen = 16
 )
 
-var argonRE = regexp.MustCompile(`^\$argon2id\$v=19\$m=(\d+),t=(\d+),p=(\d+)\$([^$]+)\$([^$]+)$`)
+var argonParamRE = regexp.MustCompile(`^(m|t|p)=(\d+)$`)
 
 func HashPassword(password string) (string, error) {
 	salt := make([]byte, argonSaltLen)
@@ -32,26 +33,44 @@ func HashPassword(password string) (string, error) {
 }
 
 func VerifyPassword(encoded, password string) bool {
-	m := argonRE.FindStringSubmatch(encoded)
-	if m == nil {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
 		return false
 	}
-	memory64, err1 := strconv.ParseUint(m[1], 10, 32)
-	time64, err2 := strconv.ParseUint(m[2], 10, 32)
-	threads64, err3 := strconv.ParseUint(m[3], 10, 8)
-	if err1 != nil || err2 != nil || err3 != nil || threads64 == 0 {
+	var memory64, time64, threads64 uint64
+	seen := map[string]bool{}
+	for _, item := range strings.Split(parts[3], ",") {
+		match := argonParamRE.FindStringSubmatch(item)
+		if match == nil {
+			return false
+		}
+		value, err := strconv.ParseUint(match[2], 10, 32)
+		if err != nil || seen[match[1]] {
+			return false
+		}
+		seen[match[1]] = true
+		switch match[1] {
+		case "m":
+			memory64 = value
+		case "t":
+			time64 = value
+		case "p":
+			threads64 = value
+		}
+	}
+	if !seen["m"] || !seen["t"] || !seen["p"] || threads64 == 0 || time64 == 0 {
 		return false
 	}
-	salt, err := base64.RawStdEncoding.DecodeString(m[4])
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
-		salt, err = base64.StdEncoding.DecodeString(m[4])
+		salt, err = base64.StdEncoding.DecodeString(parts[4])
 		if err != nil {
 			return false
 		}
 	}
-	want, err := base64.RawStdEncoding.DecodeString(m[5])
+	want, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil {
-		want, err = base64.StdEncoding.DecodeString(m[5])
+		want, err = base64.StdEncoding.DecodeString(parts[5])
 		if err != nil {
 			return false
 		}

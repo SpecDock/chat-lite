@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"chatlite/internal/application/rag"
+	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
@@ -198,7 +199,7 @@ func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, file := range files {
-		_ = os.Remove(file.FilePath)
+		_ = storage.Remove(r.Context(), file.FilePath)
 	}
 	_ = os.RemoveAll(paths.ConversationWorkspaceDir(id))
 	rag.DeleteConversation(r.Context(), a.Pool, id)
@@ -280,7 +281,7 @@ func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, file := range files {
-		_ = os.Remove(file.FilePath)
+		_ = storage.Remove(r.Context(), file.FilePath)
 	}
 	if deleted {
 		_ = os.RemoveAll(paths.ConversationWorkspaceDir(conversationID))

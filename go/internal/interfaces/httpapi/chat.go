@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -18,6 +16,8 @@ import (
 	"chatlite/internal/application/rag"
 	"chatlite/internal/domain/visibility"
 	"chatlite/internal/infrastructure/llm"
+	"chatlite/internal/infrastructure/storage"
+	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
@@ -414,20 +414,9 @@ func statusOf(err error) int {
 }
 
 func (a *App) loadHistory(ctx context.Context, conversationID, userID, exclude string) []chat.HistoryItem {
-	limit := 6
-	if raw := os.Getenv("ANSWER_HISTORY_LIMIT"); raw != "" {
-		n := 0
-		ok := true
-		for _, c := range raw {
-			if c < '0' || c > '9' {
-				ok = false
-				break
-			}
-			n = n*10 + int(c-'0')
-		}
-		if ok && n > 0 {
-			limit = n
-		}
+	limit := config.Current().Server.AnswerHistoryLimit
+	if limit <= 0 {
+		limit = 6
 	}
 	rows, err := a.Pool.Query(ctx, `SELECT role, content, status FROM messages WHERE conversation_id=$1 AND user_id=$2 AND id<>$3 AND status IN ('completed','interrupted') ORDER BY created_at DESC, id DESC LIMIT 80`, conversationID, userID, exclude)
 	if err != nil {
@@ -577,10 +566,6 @@ func (a *App) listMessageAttachments(ctx context.Context, messageID, conversatio
 
 func (a *App) cloneAttachments(ctx context.Context, sources []cloneFile, userID, conversationID string) ([]cloneFile, error) {
 	var clones []cloneFile
-	dir := paths.ConversationInputDir(conversationID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
 	for _, source := range sources {
 		id := idgen.NewID("att")
 		ext := filepath.Ext(source.FilePath)
@@ -590,25 +575,17 @@ func (a *App) cloneAttachments(ctx context.Context, sources []cloneFile, userID,
 		if ext == "" {
 			ext = ".img"
 		}
-		path := filepath.Join(dir, id+ext)
-		in, err := os.Open(source.FilePath)
+		body, err := storage.Read(ctx, source.FilePath)
 		if err != nil {
 			return clones, err
 		}
-		out, err := os.Create(path)
-		if err != nil {
-			in.Close()
-			return clones, err
-		}
-		_, err = io.Copy(out, in)
-		in.Close()
-		out.Close()
-		if err != nil {
+		path := storage.ObjectPath(userID, conversationID, "input", id+ext)
+		if err = storage.Put(ctx, path, body, source.Mime); err != nil {
 			return clones, err
 		}
 		_, err = a.Pool.Exec(ctx, `INSERT INTO attachments (id,user_id,conversation_id,original_name,file_path,public_path,mime_type,size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, userID, conversationID, source.Name, path, "/api/files/"+id, source.Mime, source.Size, idgen.NowISO())
 		if err != nil {
-			_ = os.Remove(path)
+			_ = storage.Remove(ctx, path)
 			return clones, err
 		}
 		clones = append(clones, cloneFile{ID: id, FilePath: path})
@@ -623,7 +600,7 @@ func (a *App) discardClones(ctx context.Context, clones []cloneFile, userID stri
 	args := []any{userID}
 	for _, clone := range clones {
 		args = append(args, clone.ID)
-		_ = os.Remove(clone.FilePath)
+		_ = storage.Remove(ctx, clone.FilePath)
 	}
 	_, _ = a.Pool.Exec(ctx, `DELETE FROM attachments WHERE user_id=$1 AND message_id IS NULL AND id IN (`+placeholders(len(clones), 2)+`)`, args...)
 }

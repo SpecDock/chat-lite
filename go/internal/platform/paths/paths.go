@@ -3,6 +3,9 @@ package paths
 import (
 	"os"
 	"path/filepath"
+
+	"chatlite/config"
+	"chatlite/internal/infrastructure/storage"
 	"regexp"
 	"strings"
 )
@@ -10,14 +13,14 @@ import (
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 func DataDir() string {
-	if v := os.Getenv("DATA_DIR"); v != "" {
+	if v := config.Current().Server.DataDir; v != "" {
 		return v
 	}
 	return filepath.Join(".", "data")
 }
 
 func UploadDir() string {
-	if v := os.Getenv("UPLOAD_DIR"); v != "" {
+	if v := config.Current().Server.UploadDir; v != "" {
 		return v
 	}
 	return filepath.Join(DataDir(), "uploads")
@@ -66,6 +69,9 @@ func IsWithinDirectory(root, target string) bool {
 func IsWorkspaceAttachment(filePath, conversationID, bucket string) bool {
 	if !IsSafeWorkspaceID(conversationID) {
 		return false
+	}
+	if storage.IsObjectPath(filePath) {
+		return storage.IsConversationObject(filePath, conversationID, bucket)
 	}
 	dir := ConversationInputDir(conversationID)
 	if bucket == "output" {

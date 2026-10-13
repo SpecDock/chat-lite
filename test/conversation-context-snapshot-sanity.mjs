@@ -19,7 +19,7 @@ process.env.ANSWER_HISTORY_LIMIT = '2';
 // tsx is the same TypeScript runner as `npm run dev:server`.
 register();
 
-const { db } = await import('../src/server/infrastructure/db/db.ts');
+const { db } = await import('../node/infrastructure/db/db.ts');
 const {
   commitContextSnapshot,
   createPendingContextSnapshot,
@@ -31,22 +31,22 @@ const {
   invalidateContextSnapshotsFromCursor,
   parseModelContext,
   serializeModelContext,
-} = await import('../src/server/application/chat/conversation-context-snapshot.service.ts');
-const { prepareConversationContext } = await import('../src/server/application/chat/conversation-context.service.ts');
+} = await import('../node/application/chat/conversation-context-snapshot.service.ts');
+const { prepareConversationContext } = await import('../node/application/chat/conversation-context.service.ts');
 const {
   snapshotMatchesSystemPrompt,
   serializeAgentTranscript,
   supplementalModelMessages,
-} = await import('../src/server/application/chat/conversation-context-snapshot.transcript.ts');
-const { assistantReasoningReplayKey } = await import('../src/server/infrastructure/llm/prompt-cache.ts');
-const { restoreSnapshotMessages, systemPromptForRun } = await import('../src/server/application/chat/engine/agent-loop.ts');
+} = await import('../node/application/chat/conversation-context-snapshot.transcript.ts');
+const { assistantReasoningReplayKey } = await import('../node/infrastructure/llm/prompt-cache.ts');
+const { restoreSnapshotMessages, systemPromptForRun } = await import('../node/application/chat/engine/agent-loop.ts');
 const { convertMessagesToCompletionsMessageParams } = await import('@langchain/openai');
 const {
   appendEditedMessagePair,
   deleteMessagePairData,
   replaceLatestMessagePair,
-} = await import('../src/server/infrastructure/chat/chat.repo.ts');
-const { closeRagDb } = await import('../src/server/infrastructure/rag/rag-db.ts');
+} = await import('../node/infrastructure/chat/chat.repo.ts');
+const { closeRagDb } = await import('../node/infrastructure/rag/rag-db.ts');
 
 const baseTime = Date.parse('2026-09-26T00:00:00.000Z');
 const at = (seconds) => new Date(baseTime + seconds * 1000).toISOString();

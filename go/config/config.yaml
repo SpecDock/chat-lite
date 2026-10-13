@@ -1,0 +1,70 @@
+# 启动时先读仓库根目录的 .env，再把下面的 ${变量} 替换成环境变量。
+# 未知字段会报错。不要把密钥的真实值写进这个文件。
+
+server:
+  port: ${PORT}
+  origin: ${APP_ORIGIN}
+  node_env: ${NODE_ENV}
+  schema_path: schema.sql
+  data_dir: ${DATA_DIR}
+  upload_dir: ${UPLOAD_DIR}
+  session_cookie_name: ${SESSION_COOKIE_NAME}
+  session_ttl_days: ${SESSION_TTL_DAYS}
+  max_upload_mb: ${MAX_UPLOAD_MB}
+  invite_code: ${INVITE_CODE}
+  answer_history_limit: ${ANSWER_HISTORY_LIMIT}
+
+postgres:
+  url: postgres://chatlite:REDACTED@127.0.0.1:5432/chatlite?sslmode=disable
+
+llm:
+  api_url: ${MODEL_BASE_URL}
+  api_key: ${MODEL_API_KEY}
+  model: ${MODEL_NAME}
+  temperature: ${MODEL_TEMPERATURE}
+  max_attempts: ${MODEL_MAX_ATTEMPTS}
+
+embedding:
+  api_url: ${EMBEDDING_BASE_URL}
+  api_key: ${EMBEDDING_API_KEY}
+  model: ${EMBEDDING_MODEL}
+  dimensions: ${EMBEDDING_DIMENSIONS}
+
+tavily:
+  api_key: ${TAVILY_API_KEY}
+
+smtp:
+  host: ${SMTP_HOST}
+  port: ${SMTP_PORT}
+  user: ${SMTP_USER}
+  password: ${SMTP_PASS}
+  from: ${SMTP_FROM}
+
+text_image:
+  api_url: ${TEXT_IMAGE_API_URL}
+  api_key: ${TEXT_IMAGE_API_KEY}
+  model: ${TEXT_IMAGE_MODEL}
+
+image_edit:
+  api_url: ${IMAGE_EDIT_API_URL}
+  api_key: ${IMAGE_EDIT_API_KEY}
+  model: ${IMAGE_EDIT_MODEL}
+
+agent:
+  max_tool_calls: ${AGENT_MAX_TOOL_CALLS}
+  recursion_limit: ${AGENT_RECURSION_LIMIT}
+
+minio:
+  endpoint: 127.0.0.1:9000
+  access_key: root
+  secret_key: REDACTED
+  bucket: chat-lite
+  use_ssl: "false"
+
+rag:
+  write_enabled: ${RAG_WRITE_ENABLED}
+  read_enabled: ${RAG_READ_ENABLED}
+  shadow_enabled: ${RAG_SHADOW_ENABLED}
+  content_max_chars: ${RAG_CONTENT_MAX_CHARS}
+  top_k: ${RAG_TOP_K}
+  max_distance: ${RAG_MAX_DISTANCE}

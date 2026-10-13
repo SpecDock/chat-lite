@@ -5,9 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+
+	"chatlite/config"
 )
 
 func WriteJSON(w http.ResponseWriter, status int, data any) {
@@ -58,7 +59,7 @@ func AsString(v any) string {
 }
 
 func CookieName() string {
-	if name := os.Getenv("SESSION_COOKIE_NAME"); name != "" {
+	if name := config.Current().Server.SessionCookieName; name != "" {
 		return name
 	}
 	return "chat_lite_session"
@@ -109,7 +110,7 @@ func DeleteCookie(w http.ResponseWriter, name, path string) {
 }
 
 func SecureCookie() bool {
-	return os.Getenv("NODE_ENV") == "production"
+	return config.Current().Server.Production
 }
 
 func ClientIP(r *http.Request) string {
@@ -127,7 +128,7 @@ func ClientIP(r *http.Request) string {
 }
 
 func CORS(next http.Handler) http.Handler {
-	origin := os.Getenv("APP_ORIGIN")
+	origin := config.Current().Server.Origin
 	if origin == "" {
 		origin = "http://localhost:5173"
 	}

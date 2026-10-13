@@ -5,7 +5,6 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"chatlite/internal/infrastructure/authsec"
+	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 )
@@ -249,7 +249,7 @@ func assertEmail(email string) error {
 }
 
 func assertInvite(code string) error {
-	invite := osGetenv("INVITE_CODE")
+	invite := strings.TrimSpace(config.Current().Server.InviteCode)
 	if invite == "" || code != invite {
 		return &authError{400, "邀请码无效"}
 	}
@@ -483,6 +483,4 @@ func parseTime(value string) time.Time {
 	return t
 }
 
-func osGetenv(key string) string {
-	return strings.TrimSpace(os.Getenv(key))
-}
+

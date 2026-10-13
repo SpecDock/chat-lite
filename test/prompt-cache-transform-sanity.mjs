@@ -5,7 +5,7 @@ import {
   assistantReasoningReplayKey,
   createPromptCacheFetch,
   transformPromptCacheBody,
-} from '../src/server/infrastructure/llm/prompt-cache.ts';
+} from '../node/infrastructure/llm/prompt-cache.ts';
 
 const tools = [
   { type: 'function', function: { name: 'first', parameters: { type: 'object' } } },
