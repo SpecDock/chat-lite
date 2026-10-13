@@ -1,9 +1,11 @@
 package authsec
 
 import (
-	"os"
+	"strconv"
 	"sync"
 	"time"
+
+	"chatlite/config"
 )
 
 type bucket struct {
@@ -54,47 +56,26 @@ func ReserveEmailCode(email, ip string, window time.Duration) bool {
 }
 
 func SessionTTLDays() int {
-	raw := os.Getenv("SESSION_TTL_DAYS")
-	if raw == "" {
-		return 30
+	if n := config.Current().Server.SessionTTLDays; n > 0 {
+		return n
 	}
-	n := 0
-	for _, c := range raw {
-		if c < '0' || c > '9' {
-			return 30
-		}
-		n = n*10 + int(c-'0')
-	}
-	if n <= 0 {
-		return 30
-	}
-	return n
+	return 30
 }
 
 func MaxUploadBytes() int64 {
-	mb := 5
-	if raw := os.Getenv("MAX_UPLOAD_MB"); raw != "" {
-		n := 0
-		ok := true
-		for _, c := range raw {
-			if c < '0' || c > '9' {
-				ok = false
-				break
-			}
-			n = n*10 + int(c-'0')
-		}
-		if ok && n > 0 {
-			mb = n
-		}
+	mb := config.Current().Server.MaxUploadMB
+	if mb <= 0 {
+		mb = 5
 	}
 	return int64(mb) * 1024 * 1024
 }
 
 func MaxUploadLabel() string {
-	if raw := os.Getenv("MAX_UPLOAD_MB"); raw != "" {
-		return raw + "MB"
+	mb := config.Current().Server.MaxUploadMB
+	if mb <= 0 {
+		mb = 5
 	}
-	return "5MB"
+	return strconv.Itoa(mb) + "MB"
 }
 
 func AllowedImage(mime string) bool {

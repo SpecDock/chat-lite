@@ -17,6 +17,8 @@ import (
 
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
+	"chatlite/internal/infrastructure/storage"
+	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
@@ -193,30 +195,25 @@ func (a *App) saveTable(r *http.Request, userID, conversationID string, file tab
 	if err != nil || info.Size() != file.size || file.size < 1 || file.size > authsec.TableUploadMaxBytes {
 		return uploads.Attachment{}, &uploads.StatusError{400, "上传文件校验失败"}
 	}
-	if err = paths.EnsureConversationWorkspace(conversationID); err != nil {
-		return uploads.Attachment{}, err
-	}
 	id := idgen.NewID("att")
 	ext := ".csv"
 	if strings.HasSuffix(strings.ToLower(file.name), ".xlsx") {
 		ext = ".xlsx"
 	}
-	dest := filepath.Join(paths.ConversationInputDir(conversationID), id+ext)
-	if err = os.Rename(file.temp, dest); err != nil {
-		data, readErr := os.ReadFile(file.temp)
-		if readErr != nil {
-			return uploads.Attachment{}, err
-		}
-		if writeErr := os.WriteFile(dest, data, 0o644); writeErr != nil {
-			return uploads.Attachment{}, writeErr
-		}
-		_ = os.Remove(file.temp)
+	data, err := os.ReadFile(file.temp)
+	if err != nil {
+		return uploads.Attachment{}, err
 	}
+	dest := storage.ObjectPath(userID, conversationID, "input", id+ext)
+	if err = storage.Put(r.Context(), dest, data, file.mime); err != nil {
+		return uploads.Attachment{}, err
+	}
+	_ = os.Remove(file.temp)
 	file.temp = ""
 	created := idgen.NowISO()
 	_, err = a.Pool.Exec(r.Context(), `INSERT INTO attachments (id,user_id,conversation_id,original_name,file_path,public_path,mime_type,size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, userID, conversationID, file.name, dest, "/api/files/"+id, file.mime, file.size, created)
 	if err != nil {
-		_ = os.Remove(dest)
+		_ = storage.Remove(r.Context(), dest)
 		return uploads.Attachment{}, err
 	}
 	return uploads.Attachment{ID: id, OriginalName: file.name, PublicPath: "/api/files/" + id, MimeType: file.mime, Size: file.size, CreatedAt: created}, nil
@@ -238,11 +235,6 @@ func (a *App) file(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 404, "文件不存在")
 		return
 	}
-	buf, err := os.ReadFile(path)
-	if err != nil {
-		httpx.Error(w, 404, "文件不存在")
-		return
-	}
 	label := "download"
 	if name != nil && *name != "" {
 		label = *name
@@ -251,11 +243,7 @@ func (a *App) file(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("download") == "1" {
 		disposition = "attachment; filename*=UTF-8''" + urlQuery(label)
 	}
-	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", disposition)
-	w.Header().Set("Cache-Control", "private, max-age=3600")
-	w.WriteHeader(200)
-	_, _ = w.Write(buf)
+	streamStored(w, r, path, mimeType, disposition)
 }
 
 func (a *App) workspace(w http.ResponseWriter, r *http.Request) {
@@ -317,6 +305,26 @@ func (a *App) workspace(w http.ResponseWriter, r *http.Request) {
 			item := map[string]any{"name": att.name, "mimeType": att.mime, "size": att.size, "createdAt": att.created, "bucket": bucket, "attachmentId": att.id, "url": url, "downloadUrl": url + "?download=1"}
 			if att.name == "" {
 				item["name"] = entry.Name()
+			}
+			if strings.HasPrefix(att.mime, "image/") {
+				item["previewUrl"] = url
+			}
+			files = append(files, item)
+		}
+		seen := map[string]bool{}
+		for _, item := range files {
+			if id, ok := item["attachmentId"].(string); ok {
+				seen[id] = true
+			}
+		}
+		for _, att := range byPath {
+			if seen[att.id] || !storage.IsConversationObject(att.path, id, bucket) {
+				continue
+			}
+			url := "/api/files/" + urlQuery(att.id)
+			item := map[string]any{"name": att.name, "mimeType": att.mime, "size": att.size, "createdAt": att.created, "bucket": bucket, "attachmentId": att.id, "url": url, "downloadUrl": url + "?download=1"}
+			if att.name == "" {
+				item["name"] = att.id
 			}
 			if strings.HasPrefix(att.mime, "image/") {
 				item["previewUrl"] = url
@@ -491,9 +499,9 @@ func (a *App) generateImage(w http.ResponseWriter, r *http.Request) {
 	}
 	source := strings.TrimSpace(firstString(body["sourceAttachmentId"], body["attachmentId"]))
 	genID := idgen.NewID("img")
-	model := os.Getenv("TEXT_IMAGE_MODEL")
+	model := config.Current().TextImage.Model
 	if source != "" {
-		model = os.Getenv("IMAGE_EDIT_MODEL")
+		model = config.Current().ImageEdit.Model
 	}
 	_, _ = a.Pool.Exec(r.Context(), `INSERT INTO image_generations (id,user_id,prompt,model,status,created_at) VALUES ($1,$2,$3,$4,'running',$5)`, genID, user.UserID, prompt, model, idgen.NowISO())
 	var image uploads.FileBytes
@@ -520,9 +528,10 @@ func (a *App) generateImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func textImage(ctx context.Context, prompt string) (uploads.FileBytes, error) {
-	endpoint := strings.TrimRight(os.Getenv("TEXT_IMAGE_API_URL"), "/")
-	key := os.Getenv("TEXT_IMAGE_API_KEY")
-	model := os.Getenv("TEXT_IMAGE_MODEL")
+	imageCfg := config.Current().TextImage
+	endpoint := strings.TrimRight(imageCfg.APIURL, "/")
+	key := imageCfg.APIKey
+	model := imageCfg.Model
 	if endpoint == "" || key == "" || model == "" {
 		return uploads.FileBytes{}, errString("文生图 API 未配置：请设置 TEXT_IMAGE_API_URL、TEXT_IMAGE_API_KEY、TEXT_IMAGE_MODEL")
 	}
@@ -551,9 +560,10 @@ func textImage(ctx context.Context, prompt string) (uploads.FileBytes, error) {
 }
 
 func (a *App) editImage(ctx context.Context, userID, conversationID, prompt, attachmentID string) (uploads.FileBytes, error) {
-	endpoint := strings.TrimRight(os.Getenv("IMAGE_EDIT_API_URL"), "/")
-	key := os.Getenv("IMAGE_EDIT_API_KEY")
-	model := os.Getenv("IMAGE_EDIT_MODEL")
+	editCfg := config.Current().ImageEdit
+	endpoint := strings.TrimRight(editCfg.APIURL, "/")
+	key := editCfg.APIKey
+	model := editCfg.Model
 	if endpoint == "" || key == "" || model == "" {
 		return uploads.FileBytes{}, errString("图生图 API 未配置：请设置 IMAGE_EDIT_API_URL、IMAGE_EDIT_API_KEY、IMAGE_EDIT_MODEL")
 	}
@@ -567,7 +577,7 @@ func (a *App) editImage(ctx context.Context, userID, conversationID, prompt, att
 	if err := a.Pool.QueryRow(ctx, `SELECT file_path, mime_type, original_name FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, normalizeID(attachmentID), userID, conversationID).Scan(&path, &mime, &name); err != nil {
 		return uploads.FileBytes{}, errString("图片不存在：" + attachmentID)
 	}
-	buf, err := os.ReadFile(path)
+	buf, err := storage.Read(ctx, path)
 	if err != nil {
 		return uploads.FileBytes{}, err
 	}

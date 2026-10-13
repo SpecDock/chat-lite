@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const source = readFileSync(new URL('../src/server/application/chat/engine/agent-loop.ts', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../node/application/chat/engine/agent-loop.ts', import.meta.url), 'utf8');
 
 function extractTemplate(name, nextBoundary) {
   const pattern = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\s*' + nextBoundary);

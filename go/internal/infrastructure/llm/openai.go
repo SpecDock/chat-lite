@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
+
+	"chatlite/config"
 	"time"
 )
 
@@ -38,52 +38,32 @@ type Delta struct {
 }
 
 func APIKey() string {
-	if v := os.Getenv("MODEL_API_KEY"); v != "" {
-		return v
-	}
-	return os.Getenv("OPENAI_API_KEY")
+	return config.Current().LLM.APIKey
 }
 
 func BaseURL() string {
-	if v := os.Getenv("MODEL_BASE_URL"); v != "" {
-		return strings.TrimRight(v, "/")
-	}
-	if v := os.Getenv("OPENAI_BASE_URL"); v != "" {
-		return strings.TrimRight(v, "/")
+	if v := strings.TrimRight(config.Current().LLM.APIURL, "/"); v != "" {
+		return v
 	}
 	return "https://api.openai.com/v1"
 }
 
 func ModelName() string {
-	if v := os.Getenv("MODEL_NAME"); v != "" {
-		return v
-	}
-	if v := os.Getenv("OPENAI_MODEL"); v != "" {
+	if v := config.Current().LLM.Model; v != "" {
 		return v
 	}
 	return "gpt-4o-mini"
 }
 
 func Temperature() float64 {
-	raw := os.Getenv("MODEL_TEMPERATURE")
-	if raw == "" {
+	if config.Current().LLM.Temperature == 0 {
 		return 0.3
 	}
-	n, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0.3
-	}
-	return n
+	return config.Current().LLM.Temperature
 }
 
 func MaxAttempts() int {
-	raw := strings.TrimSpace(os.Getenv("MODEL_MAX_ATTEMPTS"))
-	n := 2
-	if raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil {
-			n = parsed
-		}
-	}
+	n := config.Current().LLM.MaxAttempts
 	if n < 1 {
 		n = 1
 	}

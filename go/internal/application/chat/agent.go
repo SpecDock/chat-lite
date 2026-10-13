@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +21,8 @@ import (
 	"chatlite/internal/domain/visibility"
 	"chatlite/internal/infrastructure/llm"
 	"chatlite/internal/infrastructure/sandbox"
+	"chatlite/internal/infrastructure/storage"
+	"chatlite/config"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
 )
@@ -91,8 +95,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 	messages = append(messages, map[string]any{"role": "user", "content": candidatePrompt(candidates)})
 	replay := map[string]string{}
 	tools := openAITools()
-	budgetsTotal := envInt("AGENT_MAX_TOOL_CALLS", 20)
-	recursionLimit := envInt("AGENT_RECURSION_LIMIT", 12)
+	budgetsTotal := config.Current().Agent.MaxToolCalls
+	recursionLimit := config.Current().Agent.RecursionLimit
 	counts := map[string]int{}
 	var recent []sig
 	answered := false
@@ -292,7 +296,7 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, name string,
 			counts[name]--
 			return "无法查看该图片：图片不存在、无权访问或不属于当前会话。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
-		buf, err := os.ReadFile(filePath)
+		buf, err := storage.Read(ctx, filePath)
 		if err != nil {
 			counts["total"]--
 			counts[name]--
@@ -318,7 +322,7 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, name string,
 }
 
 func webSearch(ctx context.Context, query string) (string, error) {
-	key := strings.TrimSpace(os.Getenv("TAVILY_API_KEY"))
+	key := strings.TrimSpace(config.Current().Tavily.APIKey)
 	if key == "" {
 		return "", fmt.Errorf("web_search 未配置：请设置 TAVILY_API_KEY")
 	}
@@ -380,12 +384,35 @@ func analyzeTable(ctx context.Context, pool *pgxpool.Pool, in Input, attachmentI
 	if err != nil || !paths.IsWorkspaceAttachment(filePath, in.ConversationID, "input") || !isTableName(name) {
 		return "表格附件不存在、类型不支持或不属于当前会话", nil, nil
 	}
-	code, usage, err := requestPython(ctx, name, mime, size, instruction)
+	if runtime.GOOS != "linux" {
+		return "", nil, fmt.Errorf("表格沙箱只在 Linux Docker 运行环境中可用")
+	}
+	jobID := idgen.NewID("job")
+	virtualName := safeTableName(name)
+	virtualPath := "input/" + virtualName
+	jobRoot := filepath.Join(sandbox.JobsDir, jobID)
+	inputPath := filepath.Join(jobRoot, "input", virtualName)
+	if err = os.MkdirAll(filepath.Dir(inputPath), 0o755); err != nil {
+		return "", nil, err
+	}
+	defer os.RemoveAll(jobRoot)
+	if err = os.Chmod(jobRoot, 0o1777); err != nil {
+		return "", nil, err
+	}
+	if err = storage.Materialize(ctx, filePath, inputPath); err != nil {
+		return "", nil, err
+	}
+	if err = os.Chmod(inputPath, 0o444); err != nil {
+		return "", nil, err
+	}
+	if err = os.Chmod(filepath.Dir(inputPath), 0o555); err != nil {
+		return "", nil, err
+	}
+	code, usage, err := requestPython(ctx, name, mime, size, instruction, virtualPath)
 	eventsUsage := usage
 	if err != nil {
 		return "", nil, err
 	}
-	jobID := idgen.NewID("job")
 	result, err := sandbox.Run(ctx, jobID, code)
 	if err != nil {
 		return err.Error(), nil, nil
@@ -410,8 +437,25 @@ func analyzeTable(ctx context.Context, pool *pgxpool.Pool, in Input, attachmentI
 	return "表格分析未通过。状态 " + result.Status + "。输出：\n" + output, nil, nil
 }
 
-func requestPython(ctx context.Context, name, mime string, size int64, instruction string) (string, *llm.Usage, error) {
-	prompt := fmt.Sprintf("任务：%s\n\n输入文件元数据：\n- 文件名：%s\n- MIME：%s\n- 字节数：%d\n\n只生成一个 Python 脚本。脚本必须从输入文件读取，不能访问网络。将结果打印到 stdout。必须通过 write_python 输出。", instruction, name, mime, size)
+func safeTableName(value string) string {
+	name := filepath.Base(strings.ReplaceAll(value, "\\", "/"))
+	name = strings.Map(func(r rune) rune {
+		if r == 0 || r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(name))
+	if len([]rune(name)) > 180 {
+		name = string([]rune(name)[:180])
+	}
+	if name == "" || name == "." || name == "/" {
+		return "table.csv"
+	}
+	return name
+}
+
+func requestPython(ctx context.Context, name, mime string, size int64, instruction, virtualPath string) (string, *llm.Usage, error) {
+	prompt := fmt.Sprintf("任务：%s\n\n输入文件元数据：\n- 文件名：%s\n- MIME：%s\n- 字节数：%d\n- 虚拟路径：%s\n\n只生成一个 Python 脚本。脚本必须从 %s 读取文件，不能访问网络、环境变量、绝对路径或其它文件。将结果打印到 stdout。必须通过 write_python 输出。", instruction, name, mime, size, virtualPath, virtualPath)
 	body := map[string]any{
 		"model": llm.ModelName(), "temperature": 0, "stream": false,
 		"messages": []any{
@@ -467,7 +511,7 @@ func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 		if !strings.HasPrefix(mime, "image/") {
 			continue
 		}
-		buf, err := os.ReadFile(filePath)
+		buf, err := storage.Read(ctx, filePath)
 		if err != nil {
 			continue
 		}
@@ -611,21 +655,6 @@ func normalizeAttachmentID(value string) string {
 		return m[1]
 	}
 	return value
-}
-
-func envInt(name string, fallback int) int {
-	raw := os.Getenv(name)
-	if raw == "" {
-		return fallback
-	}
-	n := 0
-	for _, c := range raw {
-		if c < '0' || c > '9' {
-			return fallback
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
 }
 
 type PartialError struct {

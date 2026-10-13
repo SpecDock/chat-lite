@@ -41,12 +41,14 @@ if [ "$STOP_BEFORE_BUILD" = "1" ]; then
   docker compose -f "$COMPOSE_FILE" stop "${SERVICES[@]}" || true
 fi
 
-echo "Rebuilding services: ${SERVICES[*]}"
-if [ "$NO_CACHE" = "1" ]; then
-  docker compose -f "$COMPOSE_FILE" build --no-cache "${SERVICES[@]}"
-else
-  docker compose -f "$COMPOSE_FILE" build "${SERVICES[@]}"
-fi
+echo "Rebuilding services one at a time: ${SERVICES[*]}"
+for service in "${SERVICES[@]}"; do
+  if [ "$NO_CACHE" = "1" ]; then
+    docker compose -f "$COMPOSE_FILE" build --no-cache "$service"
+  else
+    docker compose -f "$COMPOSE_FILE" build "$service"
+  fi
+done
 
 echo "Recreating services: ${SERVICES[*]}"
 docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${SERVICES[@]}"
@@ -55,11 +57,7 @@ docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${SERVICES[@]}"
 echo "Waiting for service to become healthy (up to $((HEALTH_RETRIES * 2))s)..."
 healthy=0
 for _ in $(seq 1 "$HEALTH_RETRIES"); do
-  if docker compose -f "$COMPOSE_FILE" exec -T "$SERVICE_NAME" node -e "
-fetch('http://127.0.0.1:3000/api/health')
-  .then(r => process.exit(r.ok ? 0 : 1))
-  .catch(() => process.exit(1));
-" >/dev/null 2>&1; then
+  if docker compose -f "$COMPOSE_FILE" exec -T "$SERVICE_NAME" wget -q -O /dev/null http://127.0.0.1:3000/api/health; then
     healthy=1
     break
   fi

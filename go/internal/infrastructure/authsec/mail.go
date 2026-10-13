@@ -6,24 +6,24 @@ import (
 	"log"
 	"net"
 	"net/smtp"
-	"os"
 	"strconv"
+
+	"chatlite/config"
 	"strings"
 )
 
 func SendEmailCode(email, code, purpose string) error {
-	host := os.Getenv("SMTP_HOST")
-	user := os.Getenv("SMTP_USER")
-	pass := os.Getenv("SMTP_PASS")
-	from := os.Getenv("SMTP_FROM")
+	smtpCfg := config.Current().SMTP
+	host := smtpCfg.Host
+	user := smtpCfg.User
+	pass := smtpCfg.Password
+	from := smtpCfg.From
 	if from == "" {
 		from = "Chat Lite <no-reply@example.com>"
 	}
-	port := 587
-	if raw := os.Getenv("SMTP_PORT"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			port = n
-		}
+	port := smtpCfg.Port
+	if port == 0 {
+		port = 587
 	}
 	subject, text := emailContent(purpose, code)
 	if host == "" || user == "" || pass == "" {
@@ -31,7 +31,7 @@ func SendEmailCode(email, code, purpose string) error {
 		return nil
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	serverName := os.Getenv("SMTP_TLS_SERVERNAME")
+	serverName := config.Current().SMTP.TLSServerName
 	if serverName == "" {
 		serverName = host
 	}

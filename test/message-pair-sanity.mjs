@@ -16,7 +16,7 @@ process.env.RAG_READ_ENABLED = 'false';
 process.env.RAG_SHADOW_ENABLED = 'false';
 process.env.EMBEDDING_DIMENSIONS = '4';
 
-const { db } = await import('../src/server/infrastructure/db/db.ts');
+const { db } = await import('../node/infrastructure/db/db.ts');
 const {
   appendEditedMessagePair,
   conversationExists,
@@ -25,7 +25,7 @@ const {
   listMessageAttachments,
   listMessages,
   replaceLatestMessagePair
-} = await import('../src/server/infrastructure/chat/chat.repo.ts');
+} = await import('../node/infrastructure/chat/chat.repo.ts');
 const {
   attachmentIdsFromContent,
   cloneUserAttachments,
@@ -33,11 +33,11 @@ const {
   removeAttachmentFiles,
   stripUserImageContent,
   userMessageContent
-} = await import('../src/server/application/chat/chat.service.ts');
-const { insertChunk, listAllItemsByMessage } = await import('../src/server/infrastructure/rag/rag.repo.ts');
-const { purgeOrphanedRagChunks } = await import('../src/server/application/rag/rag.service.ts');
-const { ragDb } = await import('../src/server/infrastructure/rag/rag-db.ts');
-const { shutdownRag } = await import('../src/server/application/rag/rag.ts');
+} = await import('../node/application/chat/chat.service.ts');
+const { insertChunk, listAllItemsByMessage } = await import('../node/infrastructure/rag/rag.repo.ts');
+const { purgeOrphanedRagChunks } = await import('../node/application/rag/rag.service.ts');
+const { ragDb } = await import('../node/infrastructure/rag/rag-db.ts');
+const { shutdownRag } = await import('../node/application/rag/rag.ts');
 
 const userId = 'user_pair_test';
 const conversationId = 'conv_pair_test';
@@ -267,8 +267,8 @@ try {
     BEFORE UPDATE OF title ON conversations
     WHEN NEW.id='${prepareConversationId}'
     BEGIN SELECT RAISE(ABORT, 'forced title failure'); END`);
-  const { Router } = await import('../src/server/interfaces/http/http.ts');
-  const { registerChatRoutes } = await import('../src/server/interfaces/http/chat.ts');
+  const { Router } = await import('../node/interfaces/http/http.ts');
+  const { registerChatRoutes } = await import('../node/interfaces/http/chat.ts');
   const router = new Router();
   registerChatRoutes(router);
   const server = createServer((req, res) => { void router.handle(req, res); });

@@ -2,7 +2,7 @@ package uploads
 
 import (
 	"context"
-	"os"
+
 	"path/filepath"
 	"strings"
 
@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"chatlite/internal/infrastructure/authsec"
+	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/idgen"
-	"chatlite/internal/platform/paths"
 )
 
 type FileBytes struct {
@@ -55,24 +55,12 @@ func SaveImageBuffer(ctx context.Context, pool *pgxpool.Pool, userID string, fil
 		}
 	}
 	id := idgen.NewID("att")
-	var dir string
-	if conversationID != "" {
-		if err := paths.EnsureConversationWorkspace(conversationID); err != nil {
-			return Attachment{}, err
-		}
-		if bucket == "output" {
-			dir = paths.ConversationOutputDir(conversationID)
-		} else {
-			dir = paths.ConversationInputDir(conversationID)
-		}
-	} else {
-		dir = filepath.Join(paths.UploadDir(), userID)
+	storeBucket := "input"
+	if bucket == "output" {
+		storeBucket = "output"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return Attachment{}, err
-	}
-	filePath := filepath.Join(dir, id+ext)
-	if err := os.WriteFile(filePath, file.Buffer, 0o644); err != nil {
+	filePath := storage.ObjectPath(userID, conversationID, storeBucket, id+ext)
+	if err := storage.Put(ctx, filePath, file.Buffer, file.MimeType); err != nil {
 		return Attachment{}, err
 	}
 	publicPath := "/api/files/" + id
@@ -84,7 +72,7 @@ func SaveImageBuffer(ctx context.Context, pool *pgxpool.Pool, userID string, fil
 	_, err := pool.Exec(ctx, `INSERT INTO attachments (id,user_id,conversation_id,original_name,file_path,public_path,mime_type,size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		id, userID, conv, file.Filename, filePath, publicPath, file.MimeType, len(file.Buffer), createdAt)
 	if err != nil {
-		_ = os.Remove(filePath)
+		_ = storage.Remove(ctx, filePath)
 		return Attachment{}, err
 	}
 	return Attachment{ID: id, OriginalName: file.Filename, PublicPath: publicPath, MimeType: file.MimeType, Size: int64(len(file.Buffer)), CreatedAt: createdAt}, nil

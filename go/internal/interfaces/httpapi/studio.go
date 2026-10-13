@@ -9,8 +9,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,9 +17,10 @@ import (
 
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
+	"chatlite/internal/infrastructure/storage"
+	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
-	"chatlite/internal/platform/paths"
 )
 
 var studioAspects = map[string]string{
@@ -101,10 +101,8 @@ func (a *App) studioCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		refID := idgen.NewID("sref")
-		dir := filepath.Join(paths.DataDir(), "studio", user.UserID, "refs")
-		_ = os.MkdirAll(dir, 0o755)
-		path := filepath.Join(dir, refID+measured.ext)
-		if err = os.WriteFile(path, image.Buffer, 0o644); err != nil {
+		path := storage.ObjectPath(user.UserID, "", "studio", refID+measured.ext)
+		if err = storage.Put(r.Context(), path, image.Buffer, measured.mime); err != nil {
 			httpx.Error(w, 500, "图片生成失败")
 			return
 		}
@@ -137,10 +135,8 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1, duration_ms=$2 WHERE id=$3 AND user_id=$4`, "无法读取生成图片尺寸", int(time.Since(started).Milliseconds()), id, userID)
 		return
 	}
-	dir := filepath.Join(paths.DataDir(), "studio", userID)
-	_ = os.MkdirAll(dir, 0o755)
-	path := filepath.Join(dir, id+measured.ext)
-	if err = os.WriteFile(path, image.Buffer, 0o644); err != nil {
+	path := storage.ObjectPath(userID, "", "studio", id+measured.ext)
+	if err = storage.Put(ctx, path, image.Buffer, measured.mime); err != nil {
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1 WHERE id=$2`, trimErr(err), id)
 		return
 	}
@@ -163,9 +159,10 @@ func (a *App) editImageBytes(ctx context.Context, prompt string, images []upload
 }
 
 func editImageRaw(ctx context.Context, prompt string, image uploads.FileBytes) (uploads.FileBytes, error) {
-	endpoint := strings.TrimRight(os.Getenv("IMAGE_EDIT_API_URL"), "/")
-	key := os.Getenv("IMAGE_EDIT_API_KEY")
-	model := os.Getenv("IMAGE_EDIT_MODEL")
+	editCfg := config.Current().ImageEdit
+	endpoint := strings.TrimRight(editCfg.APIURL, "/")
+	key := editCfg.APIKey
+	model := editCfg.Model
 	if endpoint == "" || key == "" || model == "" {
 		return uploads.FileBytes{}, errString("图生图 API 未配置：请设置 IMAGE_EDIT_API_URL、IMAGE_EDIT_API_KEY、IMAGE_EDIT_MODEL")
 	}
@@ -274,10 +271,10 @@ func (a *App) studioDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if filePath != nil {
-		_ = os.Remove(*filePath)
+		_ = storage.Remove(r.Context(), *filePath)
 	}
 	for _, path := range refs {
-		_ = os.Remove(path)
+		_ = storage.Remove(r.Context(), path)
 	}
 	httpx.WriteJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -290,7 +287,7 @@ func (a *App) studioReference(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 404, "文件不存在")
 		return
 	}
-	servePath(w, path, mimeType)
+	streamStored(w, r, path, mimeType, "inline")
 }
 
 func (a *App) studioFile(w http.ResponseWriter, r *http.Request) {
@@ -306,20 +303,22 @@ func (a *App) studioFile(w http.ResponseWriter, r *http.Request) {
 	if mimeType != nil {
 		mt = *mimeType
 	}
-	servePath(w, *path, mt)
+	streamStored(w, r, *path, mt, "inline")
 }
 
-func servePath(w http.ResponseWriter, path, mimeType string) {
-	buf, err := os.ReadFile(path)
+func streamStored(w http.ResponseWriter, r *http.Request, path, mimeType, disposition string) {
+	body, size, err := storage.Open(r.Context(), path)
 	if err != nil {
 		httpx.Error(w, 404, "文件不存在")
 		return
 	}
+	defer body.Close()
 	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("Content-Disposition", disposition)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.WriteHeader(200)
-	_, _ = w.Write(buf)
+	_, _ = io.Copy(w, body)
 }
 
 type studioReq struct {
