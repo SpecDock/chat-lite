@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -177,8 +178,9 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		assistantPersisted = true
 	}
-	history := a.loadHistory(ctx, conversationID, user.UserID, userMessageID)
-	summary := a.loadSummary(ctx, conversationID, user.UserID)
+	prepared := chat.PrepareContext(ctx, a.Pool, user.UserID, conversationID, userMessageID, editMode == "")
+	history := prepared.History
+	summary := prepared.Summary
 	if editMode == "" {
 		firstTurn = len(history) == 0 && strings.TrimSpace(summary) == ""
 		if !created && firstTurn {
@@ -233,7 +235,16 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		executionInserted = true
 		finalStart = len(stored)
 	}
-	err := chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), AttachmentIDs: attachmentIDs, History: history}, func(event chat.Event) {
+	var saved []any
+	if prepared.NeedsSummary {
+		appendThink("正在生成摘要")
+		if prepared.RunSummary(runCtx, a.Pool, user.UserID, conversationID) {
+			appendThink("摘要生成完成")
+			history = prepared.History
+			summary = prepared.Summary
+		}
+	}
+	err := chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), AttachmentIDs: attachmentIDs, History: history, Prior: chat.LoadSnapshot(ctx, a.Pool, conversationID, user.UserID), Saved: &saved}, func(event chat.Event) {
 		switch event.Type {
 		case "think":
 			appendThink(event.Text)
@@ -278,6 +289,12 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			completed = "（助手未返回内容）"
 		}
 		_ = a.finishMessage(ctx, assistantID, user.UserID, completed, "completed")
+		a.saveContextSnapshot(conversationID, user.UserID, assistantID, saved)
+		if firstTurn {
+			chat.ScheduleTitle(a.Pool, user.UserID, conversationID, userInput, completed, func() {
+				emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "title_updated"})
+			})
+		}
 		rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: assistantID, Role: "assistant", Content: completed, Status: "completed"})
 		a.recordUsage(ctx, user.UserID, conversationID, assistantID, userInput, history, completed, captured)
 		a.touchConversation(context.Background(), conversationID, user.UserID)
@@ -444,6 +461,20 @@ func (a *App) loadHistory(ctx context.Context, conversationID, userID, exclude s
 		newest[i], newest[j] = newest[j], newest[i]
 	}
 	return newest
+}
+
+func (a *App) saveContextSnapshot(conversationID, userID, messageID string, messages []any) {
+	if len(messages) == 0 {
+		return
+	}
+	var created string
+	_ = a.Pool.QueryRow(context.Background(), `SELECT created_at FROM messages WHERE id=$1 AND user_id=$2`, messageID, userID).Scan(&created)
+	if created == "" {
+		created = idgen.NowISO()
+	}
+	if err := chat.SaveSnapshot(context.Background(), a.Pool, conversationID, userID, messageID, created, messages); err != nil {
+		log.Printf("[context-snapshot] conversation=%s message=%s save_failed err=%v", conversationID, messageID, err)
+	}
 }
 
 func (a *App) loadSummary(ctx context.Context, conversationID, userID string) string {
@@ -643,6 +674,9 @@ func (a *App) replaceLatest(ctx context.Context, conversationID, userID string, 
 		}
 	}
 	if _, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=$1 WHERE id=$2 AND user_id=$3`, idgen.NowISO(), conversationID, userID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='invalid' WHERE conversation_id=$1 AND user_id=$2 AND status IN ('current','pending')`, conversationID, userID); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
