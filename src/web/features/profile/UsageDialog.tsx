@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { UsageDTO } from '../../../shared/types';
+import type { UsageDTO } from '../../shared/types';
 import { api } from '../../shared/api/client';
 
 gsap.registerPlugin(useGSAP);

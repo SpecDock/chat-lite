@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { gsap } from 'gsap';
-import { FileText, FolderOpen, X } from 'lucide-react';
-import type { AttachmentDTO } from '../../../shared/types';
+import { FolderOpen, X } from 'lucide-react';
+import { FileTypeIcon } from '../messages/fileTypeIcon';
+import type { AttachmentDTO } from '../../shared/types';
 import ImageUploader from './ImageUploader';
 
 function reducedMotion() {
@@ -120,11 +121,11 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
     {pending.length > 0 && <div className="pending-images">{pending.map(a => {
       const isImage = a.mime_type.startsWith('image/');
       if (isImage) return <div className="attach-thumb" key={a.id}>
-        <img src={a.public_path} alt={a.original_name} draggable={false} onDoubleClick={() => onPreviewImage(a.public_path, a.original_name)} />
+        <img src={a.public_path} alt={a.original_name} draggable={false} onClick={() => onPreviewImage(a.public_path, a.original_name)} onDoubleClick={() => onPreviewImage(a.public_path, a.original_name)} />
         <button type="button" className="attach-thumb__remove" aria-label={`移除图片 ${a.original_name}`} title="移除" onClick={() => onRemoveImage(a.id)} onDoubleClick={event => event.stopPropagation()}><X size={12} /></button>
       </div>;
       return <button className="pending-file" type="button" key={a.id} aria-label={`移除文件 ${a.original_name}`} onClick={() => onRemoveImage(a.id)}>
-        <FileText size={22} aria-hidden="true" />
+        <FileTypeIcon name={a.original_name} size={28} />
         <small>{a.original_name}</small>
         <span>×</span>
       </button>;

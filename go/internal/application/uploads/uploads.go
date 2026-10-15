@@ -2,7 +2,7 @@ package uploads
 
 import (
 	"context"
-
+	"errors"
 	"path/filepath"
 	"strings"
 
@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"chatlite/internal/infrastructure/authsec"
+	"chatlite/internal/application/storagequota"
 	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/idgen"
 )
@@ -60,6 +61,14 @@ func SaveImageBuffer(ctx context.Context, pool *pgxpool.Pool, userID string, fil
 		storeBucket = "output"
 	}
 	filePath := storage.ObjectPath(userID, conversationID, storeBucket, id+ext)
+	if conversationID != "" {
+		if err := storagequota.Ensure(ctx, pool, userID, int64(len(file.Buffer))); err != nil {
+			if errors.Is(err, storagequota.ErrFull) {
+				return Attachment{}, &StatusError{Status: 413, Message: "储存已满"}
+			}
+			return Attachment{}, err
+		}
+	}
 	if err := storage.Put(ctx, filePath, file.Buffer, file.MimeType); err != nil {
 		return Attachment{}, err
 	}

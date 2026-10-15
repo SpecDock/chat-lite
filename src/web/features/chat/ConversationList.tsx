@@ -1,6 +1,6 @@
 import { useCallback, useState, type RefObject } from 'react';
 import { Ellipsis, Image as ImageIcon, Search } from 'lucide-react';
-import type { ConversationDTO } from '../../../shared/types';
+import type { ConversationDTO } from '../../shared/types';
 import type { ConversationActivity } from './conversationActivity';
 import ConversationActionsMenu, { ConversationSummary } from './ConversationActionsMenu';
 

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"encoding/json"
 	"io"
 	"mime"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/storage"
@@ -39,6 +41,7 @@ func (a *App) registerWorkspace(mux *http.ServeMux) {
 
 func (a *App) registerUsage(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/usage", a.withAuth(a.usage))
+	mux.HandleFunc("GET /api/cloud-files", a.withAuth(a.cloudFiles))
 }
 
 func (a *App) registerImages(mux *http.ServeMux) {
@@ -205,6 +208,12 @@ func (a *App) saveTable(r *http.Request, userID, conversationID string, file tab
 		return uploads.Attachment{}, err
 	}
 	dest := storage.ObjectPath(userID, conversationID, "input", id+ext)
+	if err = storagequota.Ensure(r.Context(), a.Pool, userID, file.size); err != nil {
+		if errors.Is(err, storagequota.ErrFull) {
+			return uploads.Attachment{}, &uploads.StatusError{413, "储存已满"}
+		}
+		return uploads.Attachment{}, err
+	}
 	if err = storage.Put(r.Context(), dest, data, file.mime); err != nil {
 		return uploads.Attachment{}, err
 	}
@@ -244,6 +253,72 @@ func (a *App) file(w http.ResponseWriter, r *http.Request) {
 		disposition = "attachment; filename*=UTF-8''" + urlQuery(label)
 	}
 	streamStored(w, r, path, mimeType, disposition)
+}
+
+func (a *App) cloudFiles(w http.ResponseWriter, r *http.Request) {
+	user := authFrom(r)
+	used, err := storagequota.Used(r.Context(), a.Pool, user.UserID)
+	if err != nil {
+		httpx.Error(w, 500, "服务器错误")
+		return
+	}
+	type item struct {
+		id, name, mime, created, kind, url string
+		size                               int64
+		preview                            bool
+	}
+	var items []item
+	rows, err := a.Pool.Query(r.Context(), `SELECT id, COALESCE(original_name, id), mime_type, size, created_at, file_path FROM attachments WHERE user_id=$1 AND conversation_id IS NOT NULL ORDER BY created_at DESC`, user.UserID)
+	if err != nil {
+		httpx.Error(w, 500, "服务器错误")
+		return
+	}
+	for rows.Next() {
+		var it item
+		var path string
+		if err = rows.Scan(&it.id, &it.name, &it.mime, &it.size, &it.created, &path); err != nil {
+			rows.Close()
+			httpx.Error(w, 500, "服务器错误")
+			return
+		}
+		it.kind = "input"
+		if strings.Contains(path, "/output/") {
+			it.kind = "output"
+		}
+		it.url = "/api/files/" + it.id
+		it.preview = strings.HasPrefix(it.mime, "image/")
+		items = append(items, it)
+	}
+	rows.Close()
+	studioRows, err := a.Pool.Query(r.Context(), `SELECT id, mime_type, file_path, created_at FROM studio_images WHERE user_id=$1 AND status='succeeded' AND file_path IS NOT NULL ORDER BY created_at DESC`, user.UserID)
+	if err != nil {
+		httpx.Error(w, 500, "服务器错误")
+		return
+	}
+	for studioRows.Next() {
+		var it item
+		var path string
+		if err = studioRows.Scan(&it.id, &it.mime, &path, &it.created); err != nil {
+			studioRows.Close()
+			httpx.Error(w, 500, "服务器错误")
+			return
+		}
+		it.name = "生成图片"
+		it.kind = "studio"
+		it.url = "/api/studio/images/" + it.id + "/file"
+		it.preview = true
+		it.size, _ = storage.Size(r.Context(), path)
+		items = append(items, it)
+	}
+	studioRows.Close()
+	files := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		files = append(files, map[string]any{
+			"id": it.id, "name": it.name, "mimeType": it.mime, "size": it.size, "createdAt": it.created,
+			"kind": it.kind, "url": it.url, "downloadUrl": it.url + "?download=1", "preview": it.preview,
+		})
+	}
+	httpx.WriteJSON(w, 200, map[string]any{"used": used, "limit": storagequota.Limit, "files": files})
 }
 
 func (a *App) workspace(w http.ResponseWriter, r *http.Request) {

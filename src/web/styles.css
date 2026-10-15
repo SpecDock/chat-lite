@@ -2088,6 +2088,20 @@ input:focus, textarea:focus {
   white-space: nowrap;
 }
 .execution-block__body { border-top: 1px solid rgba(31, 111, 95, 0.18); padding: 9px; }
+.execution-attempt + .execution-attempt { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(31, 111, 95, 0.14); }
+.execution-attempt__label { margin-bottom: 6px; color: #5d6b66; font-size: 12px; }
+.cloud-files { display: grid; gap: 12px; }
+.cloud-files__meter { display: grid; gap: 6px; }
+.cloud-files__meter-bar { height: 8px; border-radius: 999px; background: var(--surface-soft); overflow: hidden; }
+.cloud-files__meter-bar span { display: block; height: 100%; background: var(--primary-active); }
+.cloud-files__meter small { color: var(--muted); font-size: 12px; }
+.cloud-files__list { display: grid; gap: 6px; max-height: min(52vh, 420px); overflow: auto; }
+.cloud-files__row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.cloud-files__main { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; }
+.cloud-files__main span { min-width: 0; display: grid; }
+.cloud-files__main strong, .cloud-files__main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-files__main small { color: var(--muted); font-size: 11px; }
+.cloud-files__empty { margin: 0; color: var(--muted); }
 .execution-block .streaming-code-block { margin: 0; }
 .execution-output { margin-top: 9px; border-top: 1px solid rgba(31, 111, 95, 0.18); }
 .execution-output__heading { padding: 9px 4px 6px; color: #1f6f5f; font-size: 11px; font-weight: 650; }
@@ -2201,7 +2215,26 @@ input:focus, textarea:focus {
   color: var(--body-strong);
   text-align: left;
 }
-.pending-images .pending-file svg { flex: 0 0 auto; color: var(--primary-active); }
+.pending-images .pending-file .file-type-icon { flex: 0 0 auto; }
+.message-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(100%, 240px);
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: #fff;
+  color: var(--body-strong);
+  text-decoration: none;
+}
+.message-file span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .pending-images .pending-file small {
   min-width: 0;
   overflow: hidden;
@@ -2211,17 +2244,20 @@ input:focus, textarea:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.pending-images span {
+.pending-images .pending-file > span:not(.file-type-icon-wrap) {
   position: absolute;
   top: 4px;
   right: 4px;
   width: 18px;
   height: 18px;
+  display: grid;
+  place-items: center;
   border-radius: 999px;
   background: rgba(24, 23, 21, 0.78);
   color: var(--on-dark);
   font-size: 12px;
-  line-height: 18px;
+  line-height: 1;
+  text-align: center;
 }
 
 .input {

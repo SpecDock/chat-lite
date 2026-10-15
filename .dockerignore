@@ -5,6 +5,9 @@
 dist
 dist-server
 data
+switch_db
+switch_data
+安卓
 
 # .git 实测 6.6MB，且任何一次 commit 都会击穿 build 层缓存，
 # 逼着重跑峰值 565MB 的 vite build。
@@ -25,5 +28,4 @@ deploy
 .env
 .env.*
 *.log
-
-# 注意：scripts/ 不能整体排除 —— build:server 结尾要调 scripts/copy-schema.mjs
+scripts

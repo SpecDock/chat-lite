@@ -3,19 +3,21 @@ import { createPortal } from 'react-dom';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
 import { LogOut, X } from 'lucide-react';
-import type { UserDTO } from '../../../shared/types';
+import type { UserDTO } from '../../shared/types';
 import { api } from '../../shared/api/client';
 import UsageDialog, { type UsageKind } from './UsageDialog';
+import CloudFilesDialog from './CloudFilesDialog';
 
 gsap.registerPlugin(useGSAP);
 
-type Dialog = 'avatar' | 'password' | 'logout' | UsageKind | null;
+type Dialog = 'avatar' | 'password' | 'logout' | 'files' | UsageKind | null;
 
 const dialogTitles: Record<Exclude<Dialog, null>, string> = {
   avatar: '更改头像',
   password: '更改密码',
   token: 'Token统计',
   image: '生图统计',
+  files: '云文件',
   logout: '退出登录'
 };
 
@@ -213,6 +215,7 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
       <button type="button" role="menuitem" onClick={() => openDialog('password')}>更改密码</button>
       <button type="button" role="menuitem" onClick={() => openDialog('token')}>token消耗</button>
       <button type="button" role="menuitem" onClick={() => openDialog('image')}>生图消耗</button>
+      <button type="button" role="menuitem" onClick={() => openDialog('files')}>云文件</button>
       <button type="button" role="menuitem" onClick={() => openDialog('logout')}><LogOut size={16} aria-hidden="true" />退出</button>
     </div>}
     {dialog && createPortal(<div className="modal-backdrop" onPointerDown={event => { if (event.target === event.currentTarget && !(dialog === 'logout' && logoutBusy)) closeDialog(); }}>
@@ -247,7 +250,7 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
           <p>确定退出当前账号吗？你的会话工作区和文件会保留。</p>
           {logoutMsg && <div className="error" role="alert">{logoutMsg}</div>}
           <div className="logout-confirm__actions"><button type="button" className="secondary" onClick={closeDialog} disabled={logoutBusy}>取消</button><button type="button" className="danger-button" onClick={() => { void submitLogout(); }} disabled={logoutBusy}>{logoutBusy ? '退出中' : '确认退出'}</button></div>
-        </div> : <UsageDialog kind={dialog} />}
+        </div> : dialog === 'files' ? <CloudFilesDialog /> : <UsageDialog kind={dialog === 'token' ? 'token' : 'image'} />}
       </section>
     </div>, document.body)}
   </div>;

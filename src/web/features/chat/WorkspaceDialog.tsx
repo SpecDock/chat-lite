@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Download, File, FolderOpen, Image as ImageIcon, RefreshCw, X } from 'lucide-react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { WorkspaceFileDTO, WorkspaceFilesDTO } from '../../../shared/types';
+import type { WorkspaceFileDTO, WorkspaceFilesDTO } from '../../shared/types';
 
 gsap.registerPlugin(useGSAP);
 

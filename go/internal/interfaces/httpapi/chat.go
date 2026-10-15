@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"chatlite/internal/application/chat"
+	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/rag"
 	"chatlite/internal/domain/visibility"
 	"chatlite/internal/infrastructure/llm"
@@ -238,6 +239,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			appendThink(event.Text)
 		case "delta":
 			placeExecution(true)
+			closeThink()
 			full += event.Text
 			stored += event.Text
 			writeSSE(w, flusher, "delta", map[string]any{"text": event.Text})
@@ -251,6 +253,8 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 				}
 				stored = stored[:executionAt] + execution + bodyText
 				finalStart = executionAt + len(execution)
+			} else {
+				placeExecution(true)
 			}
 			writeSSE(w, flusher, "execution", map[string]any{"language": event.Language, "code": event.Code, "output": event.Output})
 		case "usage":
@@ -580,6 +584,12 @@ func (a *App) cloneAttachments(ctx context.Context, sources []cloneFile, userID,
 			return clones, err
 		}
 		path := storage.ObjectPath(userID, conversationID, "input", id+ext)
+		if err = storagequota.Ensure(ctx, a.Pool, userID, int64(len(body))); err != nil {
+			if errors.Is(err, storagequota.ErrFull) {
+				return clones, fmt.Errorf("储存已满")
+			}
+			return clones, err
+		}
 		if err = storage.Put(ctx, path, body, source.Mime); err != nil {
 			return clones, err
 		}

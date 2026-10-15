@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
-import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessageResultDTO, UserDTO, WorkspaceFilesDTO } from '../../../shared/types';
+import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessageResultDTO, UserDTO, WorkspaceFilesDTO } from '../../shared/types';
 import { api, streamChat, type ChatStreamData } from '../../shared/api/client';
 import ConversationList from './ConversationList';
 import ConversationSearch from './ConversationSearch';
@@ -29,7 +29,7 @@ import ProfileMenu from '../profile/ProfileMenu';
 import WorkspaceDialog from './WorkspaceDialog';
 import ImageLightbox from '../messages/ImageLightbox';
 import ImageStudioPage from '../studio/ImageStudioPage';
-import { encodeExecutionBlock } from '../../../shared/execution-block';
+import { encodeExecutionBlock } from '../../shared/execution-block';
 
 const EMPTY_CONVERSATION_KEY = '__none__';
 const TEMPORARY_CONVERSATION_PREFIX = '__temporary__:';
@@ -1378,11 +1378,28 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
           code: data.code,
           output: data.output || '',
         });
-        const prefix = thinkStarted && !thinkClosed ? '</think>\n\n' : '';
-        thinkClosed = thinkStarted || thinkClosed;
-        updateMessages(targetKey, currentMessages => currentMessages.map(message => message.id === assistantMessageId
-          ? { ...message, content: `${message.content}${prefix}${execution}\n\n` }
-          : message));
+        if (thinkStarted) thinkClosed = true;
+        updateMessages(targetKey, currentMessages => currentMessages.map(message => {
+          if (message.id !== assistantMessageId) return message;
+          let content = message.content;
+          const openThink = content.lastIndexOf('<think>');
+          const closeThink = content.lastIndexOf('</think>');
+          if (thinkStarted && openThink > closeThink) content += '</think>\n\n';
+          const block = `${execution}\n\n`;
+          const thinkEnd = content.indexOf('</think>');
+          if (thinkEnd >= 0) {
+            const afterThink = thinkEnd + '</think>'.length;
+            const rest = content.slice(afterThink);
+            const existing = rest.match(/^(?:\s*<chat-lite-execution v="1">[\s\S]*?<\/chat-lite-execution>\s*)*/);
+            const used = existing ? existing[0].length : 0;
+            const head = content.slice(0, afterThink + used).replace(/\s*$/, '\n\n');
+            const tail = content.slice(afterThink + used).replace(/^\s*/, '');
+            content = `${head}${block}${tail}`;
+          } else {
+            content = `${block}${content}`;
+          }
+          return { ...message, content };
+        }));
       }
       if (event === 'done') {
         terminalEvent = true;

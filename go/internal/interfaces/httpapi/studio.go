@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"encoding/json"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/storage"
@@ -102,6 +104,15 @@ func (a *App) studioCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		refID := idgen.NewID("sref")
 		path := storage.ObjectPath(user.UserID, "", "studio", refID+measured.ext)
+		if err = storagequota.Ensure(r.Context(), a.Pool, user.UserID, int64(len(image.Buffer))); err != nil {
+			_, _ = a.Pool.Exec(r.Context(), `DELETE FROM studio_images WHERE id=$1 AND user_id=$2`, id, user.UserID)
+			if errors.Is(err, storagequota.ErrFull) {
+				httpx.Error(w, 413, "储存已满")
+				return
+			}
+			httpx.Error(w, 500, "图片生成失败")
+			return
+		}
 		if err = storage.Put(r.Context(), path, image.Buffer, measured.mime); err != nil {
 			httpx.Error(w, 500, "图片生成失败")
 			return
@@ -136,6 +147,14 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 		return
 	}
 	path := storage.ObjectPath(userID, "", "studio", id+measured.ext)
+	if err = storagequota.Ensure(ctx, a.Pool, userID, int64(len(image.Buffer))); err != nil {
+		message := trimErr(err)
+		if errors.Is(err, storagequota.ErrFull) {
+			message = "储存已满"
+		}
+		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1, duration_ms=$2 WHERE id=$3 AND user_id=$4 AND status='running'`, message, int(time.Since(started).Milliseconds()), id, userID)
+		return
+	}
 	if err = storage.Put(ctx, path, image.Buffer, measured.mime); err != nil {
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1 WHERE id=$2`, trimErr(err), id)
 		return

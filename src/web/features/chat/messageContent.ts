@@ -1,4 +1,4 @@
-import type { MessageDTO } from '../../../shared/types';
+import type { MessageDTO } from '../../shared/types';
 
 export type MessageImage = {
   alt: string;

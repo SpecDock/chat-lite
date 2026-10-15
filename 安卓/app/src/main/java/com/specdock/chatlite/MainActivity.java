@@ -1,6 +1,7 @@
 package com.specdock.chatlite;
 
 import android.app.Activity;
+import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.Intent;
 import android.graphics.Color;
@@ -9,6 +10,7 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.view.DisplayCutout;
 import android.view.View;
 import android.view.Window;
@@ -16,6 +18,7 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.URLUtil;
 import android.webkit.MimeTypeMap;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
@@ -165,6 +168,27 @@ public class MainActivity extends Activity {
 
         webView.setWebViewClient(new FixedDomainWebViewClient());
         webView.setWebChromeClient(new ChatWebChromeClient());
+        webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+            if (!isAllowedMainFrameUrl(url)) {
+                return;
+            }
+            String fileName = URLUtil.guessFileName(url, contentDisposition, mimeType);
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (cookie != null) {
+                request.addRequestHeader("Cookie", cookie);
+            }
+            request.addRequestHeader("User-Agent", userAgent);
+            request.setMimeType(mimeType);
+            request.setTitle(fileName);
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+            DownloadManager manager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            manager.enqueue(request);
+        });
         if (BuildConfig.DEBUG) {
             WebView.setWebContentsDebuggingEnabled(true);
         }

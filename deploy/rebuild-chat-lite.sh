@@ -41,17 +41,72 @@ if [ "$STOP_BEFORE_BUILD" = "1" ]; then
   docker compose -f "$COMPOSE_FILE" stop "${SERVICES[@]}" || true
 fi
 
-echo "Rebuilding services one at a time: ${SERVICES[*]}"
-for service in "${SERVICES[@]}"; do
-  if [ "$NO_CACHE" = "1" ]; then
-    docker compose -f "$COMPOSE_FILE" build --no-cache "$service"
-  else
-    docker compose -f "$COMPOSE_FILE" build "$service"
-  fi
-done
+avail_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+node_mb=512
+if [ "$avail_kb" -gt 0 ]; then
+  node_mb=$((avail_kb / 1024 - 450))
+fi
+if [ "$node_mb" -gt 768 ]; then node_mb=768; fi
+if [ "$node_mb" -lt 384 ]; then node_mb=384; fi
+echo "MemAvailable ${avail_kb} kB; Node heap capped at ${node_mb} MB"
+
+cache=()
+if [ "$NO_CACHE" = "1" ]; then
+  cache=(--no-cache)
+fi
+vite_ms="${VITE_STREAM_MARKDOWN_INTERVAL_MS:-50}"
+
+mirror_prefix="docker.m.daocloud.io/library"
+official_prefix="docker.io/library"
+
+build_web() {
+  local prefix="$1"
+  echo "Building frontend with $prefix"
+  docker build "${cache[@]}" --target web \
+    --build-arg "NODE_IMAGE=${prefix}/node:24.18.0-bookworm-slim" \
+    --build-arg "GO_IMAGE=${prefix}/golang:1.26-bookworm" \
+    --build-arg "DEBIAN_IMAGE=${prefix}/debian:bookworm-slim" \
+    --build-arg "NODE_HEAP_MB=${node_mb}" \
+    --build-arg "VITE_STREAM_MARKDOWN_INTERVAL_MS=${vite_ms}" \
+    -f Dockerfile . || return 1
+}
+
+build_app() {
+  local prefix="$1"
+  echo "Building $SERVICE_NAME with $prefix"
+  docker compose -f "$COMPOSE_FILE" build \
+    --build-arg "NODE_IMAGE=${prefix}/node:24.18.0-bookworm-slim" \
+    --build-arg "GO_IMAGE=${prefix}/golang:1.26-bookworm" \
+    --build-arg "DEBIAN_IMAGE=${prefix}/debian:bookworm-slim" \
+    --build-arg "NODE_HEAP_MB=${node_mb}" \
+    --build-arg "VITE_STREAM_MARKDOWN_INTERVAL_MS=${vite_ms}" \
+    "$SERVICE_NAME" || return 1
+}
+
+build_sandbox() {
+  local prefix="$1"
+  echo "Building $SANDBOX_SERVICE with $prefix"
+  docker compose -f "$COMPOSE_FILE" build "${cache[@]}" \
+    --build-arg "PYTHON_IMAGE=${prefix}/python:3.12-slim" \
+    "$SANDBOX_SERVICE" || return 1
+}
+
+# if 里面的函数失败不会触发 set -e，所以每一步都显式返回。
+if ! build_web "$mirror_prefix"; then
+  echo "Frontend mirror failed. Falling back to Docker Hub..."
+  build_web "$official_prefix"
+fi
+if ! build_app "$mirror_prefix"; then
+  echo "Go image mirror failed. Falling back to Docker Hub..."
+  build_app "$official_prefix"
+fi
+if ! build_sandbox "$mirror_prefix"; then
+  echo "Sandbox mirror failed. Falling back to Docker Hub..."
+  build_sandbox "$official_prefix"
+fi
 
 echo "Recreating services: ${SERVICES[*]}"
-docker compose -f "$COMPOSE_FILE" up -d --force-recreate "${SERVICES[@]}"
+docker compose -f "$COMPOSE_FILE" up -d --no-build --force-recreate "${SERVICES[@]}"
 
 # 轮询而不是 sleep 3 + 一次性探测：原来在 set -e 下只要启动稍慢就会误报部署失败。
 echo "Waiting for service to become healthy (up to $((HEALTH_RETRIES * 2))s)..."

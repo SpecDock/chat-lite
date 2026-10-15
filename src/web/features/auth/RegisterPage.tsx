@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { UserDTO } from '../../../shared/types';
+import type { UserDTO } from '../../shared/types';
 import { api } from '../../shared/api/client';
 
 export default function RegisterPage({ onRegistered, onLogin }: { onRegistered: (user: UserDTO) => void; onLogin: () => void }) {

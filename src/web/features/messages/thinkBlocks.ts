@@ -1,8 +1,8 @@
-import { decodeExecutionBlock, type ExecutionBlock } from '../../../shared/execution-block';
+import { decodeExecutionBlock, type ExecutionBlock } from '../../shared/execution-block';
 
 export type ThinkBlocks = {
   thinking: string;
-  execution: ExecutionBlock | null;
+  executions: ExecutionBlock[];
   answer: string;
   sawThinkTag: boolean;
   sawExecutionBlock: boolean;
@@ -11,11 +11,11 @@ export type ThinkBlocks = {
 export function splitThinkBlocks(content: string): ThinkBlocks {
   const executionTag = /<chat-lite-execution v="1">[\s\S]*?<\/chat-lite-execution>/g;
   let sawExecutionBlock = false;
-  let execution: ExecutionBlock | null = null;
+  const executions: ExecutionBlock[] = [];
   const withoutExecution = String(content || '').replace(executionTag, tag => {
     sawExecutionBlock = true;
     const decoded = decodeExecutionBlock(tag);
-    if (decoded) execution = decoded;
+    if (decoded) executions.push(decoded);
     return '';
   }).replace(/<chat-lite-execution v="1">[\s\S]*$/, () => {
     sawExecutionBlock = true;
@@ -43,13 +43,13 @@ export function splitThinkBlocks(content: string): ThinkBlocks {
       cursor = withoutExecution.length;
       break;
     }
-    thinking.push(content.slice(bodyStart, end));
+    thinking.push(withoutExecution.slice(bodyStart, end));
     cursor = end + closeTag.length;
   }
 
   return {
     thinking: thinking.map(part => part.trim()).filter(Boolean).join('\n\n'),
-    execution,
+    executions,
     answer: answer.join(''),
     sawThinkTag,
     sawExecutionBlock,
