@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/internal/application/chat"
 	"chatlite/internal/application/rag"
 	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/httpx"
@@ -294,6 +295,11 @@ func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {
 		if pair.IsFirst && next != nil {
 			nextInput := stripUserImageContent(next.User.Content)
 			_ = a.updateAutoTitle(r.Context(), conversationID, user.UserID, safeTitle(nextInput))
+			if next.Assistant != nil {
+				chat.ScheduleTitle(a.Pool, user.UserID, conversationID, nextInput, next.Assistant.Content, func() {
+					emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "title_updated"})
+				})
+			}
 		}
 	}
 	assistantID := any(nil)
