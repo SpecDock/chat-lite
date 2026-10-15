@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { UserDTO } from '../../shared/types';
+import type { UserDTO } from '../shared/types';
 import { api } from '../shared/api/client';
 import LoginPage from '../features/auth/LoginPage';
 import RegisterPage from '../features/auth/RegisterPage';

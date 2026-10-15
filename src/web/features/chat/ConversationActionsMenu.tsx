@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Ellipsis, Pencil, Pin, PinOff, Trash2 } from 'lucide-react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { ConversationDTO } from '../../../shared/types';
+import type { ConversationDTO } from '../../shared/types';
 import type { ConversationActivity } from './conversationActivity';
 
 gsap.registerPlugin(useGSAP);

@@ -152,7 +152,19 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("模型调用失败 HTTP %d", e.Status)
+	msg := fmt.Sprintf("模型调用失败 HTTP %d", e.Status)
+	body := strings.TrimSpace(strings.ReplaceAll(e.Body, "\n", " "))
+	if body == "" {
+		return msg
+	}
+	if len([]rune(body)) > 500 {
+		body = string([]rune(body)[:500])
+	}
+	return msg + "：" + body
+}
+
+func UsageFromCompletion(out map[string]any) *Usage {
+	return usageFrom(out)
 }
 
 func cloneMap(body map[string]any) map[string]any {

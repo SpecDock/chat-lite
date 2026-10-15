@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { MessageDTO } from '../../../shared/types';
+import type { MessageDTO } from '../../shared/types';
 import MarkdownMessage from '../messages/MarkdownMessage';
 import InlineMessageEditor from './InlineMessageEditor';
 import MessageActions from './MessageActions';

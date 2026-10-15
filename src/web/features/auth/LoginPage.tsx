@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../shared/api/client';
-import type { UserDTO } from '../../../shared/types';
+import type { UserDTO } from '../../shared/types';
 
 export default function LoginPage({ onLogin, onRegister }: { onLogin: (u: UserDTO) => void; onRegister: () => void }) {
   const [mode, setMode] = useState<'login' | 'reset'>('login');

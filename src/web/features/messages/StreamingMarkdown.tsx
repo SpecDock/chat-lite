@@ -5,6 +5,7 @@ import taskLists from 'markdown-it-task-lists';
 import StreamingCodeBlock from './StreamingCodeBlock';
 import { parseStreamingMarkdown } from './streamingMarkdownParser';
 import { appendReferenceDefinitions, collectMarkdownReferenceDefinitions } from './markdownReferences';
+import { fileTypeIconHtml, isPreviewImage } from './fileTypeIcon';
 
 const md = new MarkdownIt({
   html: false,
@@ -14,6 +15,19 @@ const md = new MarkdownIt({
 });
 
 md.use(taskLists, { enabled: false, label: true, labelAfter: true });
+
+const defaultImage = md.renderer.rules.image?.bind(md.renderer.rules);
+md.renderer.rules.image = (tokens, idx, options, env, self) => {
+  const token = tokens[idx];
+  const src = token.attrGet('src') || '';
+  const alt = token.content || '文件';
+  if (isPreviewImage(alt) && isPreviewImage(src)) {
+    return defaultImage ? defaultImage(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options);
+  }
+  const name = alt.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] || char);
+  const href = `${src}${src.includes('?') ? '&' : '?'}download=1`.replace(/"/g, '%22');
+  return `<a class="message-file" href="${href}" download>${fileTypeIconHtml(alt, 28)}<span>${name}</span></a>`;
+};
 
 class MarkdownRenderBoundary extends Component<{ fallback: string; children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -40,7 +54,8 @@ function renderMarkdown(content: string) {
   const html = md.render(content);
   return DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
-    ADD_ATTR: ['target', 'rel', 'class', 'disabled', 'checked'],
+    ADD_TAGS: ['svg', 'path', 'text'],
+    ADD_ATTR: ['target', 'rel', 'class', 'disabled', 'checked', 'viewBox', 'fill', 'fill-opacity', 'stroke', 'stroke-width', 'd', 'xmlns', 'x', 'y', 'text-anchor', 'font-size', 'font-family'],
   });
 }
 

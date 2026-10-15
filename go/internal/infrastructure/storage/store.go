@@ -90,6 +90,28 @@ func Open(ctx context.Context, stored string) (io.ReadCloser, int64, error) {
 	return obj, info.Size, nil
 }
 
+func Size(ctx context.Context, stored string) (int64, error) {
+	if stored == "" {
+		return 0, nil
+	}
+	if !IsObjectPath(stored) {
+		info, err := os.Stat(stored)
+		if err != nil {
+			return 0, err
+		}
+		return info.Size(), nil
+	}
+	client, bucket, key, err := open(stored)
+	if err != nil {
+		return 0, err
+	}
+	info, err := client.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return info.Size, nil
+}
+
 func Remove(ctx context.Context, stored string) error {
 	if stored == "" {
 		return nil

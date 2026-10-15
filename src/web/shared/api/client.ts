@@ -1,4 +1,4 @@
-import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO, WorkspaceFilesDTO } from '../../../shared/types';
+import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO, WorkspaceFilesDTO } from '../types';
 
 async function parse<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}));
@@ -55,6 +55,7 @@ export const api = {
   searchMessages: (q: string, offset: number, signal?: AbortSignal) => fetch(buildSearchMessagesUrl(q, offset), { credentials: 'include', signal }).then(r => parse<SearchMessagesResponseDTO>(r)),
   upload: (file: File, conversationId?: string) => { const fd = new FormData(); fd.append('file', file); if (conversationId) fd.append('conversationId', conversationId); return fetch('/api/upload', { method: 'POST', credentials: 'include', body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
   usage: () => fetch('/api/usage', { credentials: 'include' }).then(r => parse<UsageDTO>(r)),
+  cloudFiles: () => fetch('/api/cloud-files', { credentials: 'include' }).then(r => parse<{ used: number; limit: number; files: { id: string; name: string; mimeType: string; size: number; createdAt: string; kind: string; url: string; downloadUrl: string; preview: boolean }[] }>(r)),
   listStudioImages: () => fetch('/api/studio/images', { credentials: 'include' }).then(parseStudio),
   createStudioImage: (input: { prompt: string; aspectRatio: string; quality: string; style: string; images: File[] }) => {
     const body = new FormData();

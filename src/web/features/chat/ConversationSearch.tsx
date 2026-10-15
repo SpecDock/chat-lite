@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Search, X } from 'lucide-react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { SearchMessageResultDTO } from '../../../shared/types';
+import type { SearchMessageResultDTO } from '../../shared/types';
 import { api } from '../../shared/api/client';
 
 const SEARCH_DEBOUNCE_MS = 250;

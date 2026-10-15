@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Copy, Pencil, Trash2 } from 'lucide-react';
+import { Check, Copy, Pencil } from 'lucide-react';
 import { gsap } from 'gsap';
 
 type Props = {
@@ -14,7 +14,7 @@ function reducedMotion() {
   return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-export default function MessageActions({ text, isUser, disabled, onEdit, onDelete }: Props) {
+export default function MessageActions({ text, isUser, disabled, onEdit }: Props) {
   const [copied, setCopied] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const copyRef = useRef<HTMLButtonElement | null>(null);
@@ -92,10 +92,7 @@ export default function MessageActions({ text, isUser, disabled, onEdit, onDelet
           <Pencil size={14} aria-hidden="true" />
           <span>编辑</span>
         </button>
-        <button type="button" className="message-action-btn danger" disabled={disabled} onClick={onDelete} aria-label="删除消息" title="删除消息">
-          <Trash2 size={14} aria-hidden="true" />
-          <span>删除</span>
-        </button>
+
       </>}
     </div>
   );

@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Trash2, TriangleAlert, X } from 'lucide-react';
 import { gsap } from 'gsap';
 import { useGSAP } from '@gsap/react';
-import type { ConversationDTO } from '../../../shared/types';
+import type { ConversationDTO } from '../../shared/types';
 
 gsap.registerPlugin(useGSAP);
 
