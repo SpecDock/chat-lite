@@ -12,6 +12,7 @@ import {
   STUDIO_REFERENCE_LIMIT,
   STUDIO_STYLES,
   aspectLabel,
+  formatCreatedAt,
   formatDuration,
   formatPixels,
   normalizeStudioImage,
@@ -278,6 +279,7 @@ function StudioDetail({ item, zoomOpen, deleting, cooldownLeft, error, onClose, 
           <div><dt>像素宽×高</dt><dd>{formatPixels(item.width, item.height)}</dd></div>
           <div><dt>提示词</dt><dd>{item.prompt || '—'}</dd></div>
           <div><dt>生成耗时</dt><dd>{formatDuration(item.durationMs)}</dd></div>
+          <div><dt>日期</dt><dd>{formatCreatedAt(item.createdAt)}</dd></div>
           <div><dt>响应或错误原因</dt><dd>{studioResultText(item)}</dd></div>
         </dl>
         {item.references.length > 0 && <div className="studio-detail__refs">

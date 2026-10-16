@@ -22,7 +22,7 @@ function studioErrorMessage(data: unknown, status: number) {
 
 async function parseStudio(res: Response): Promise<unknown> {
   const data: unknown = await res.json().catch(() => ({}));
-  if (res.status === 409) throw new StudioApiError('当前已有 4 张图片正在生成，请等完成后再试。', 409);
+  if (res.status === 409) throw new StudioApiError('当前已有 6 张图片正在生成，请等完成后再试。', 409);
   if (!res.ok) throw new StudioApiError(studioErrorMessage(data, res.status), res.status);
   return data;
 }
