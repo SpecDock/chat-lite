@@ -163,21 +163,17 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 }
 
 func (a *App) editStudio(ctx context.Context, prompt, aspect, quality, style string, images []uploads.FileBytes) (uploads.FileBytes, error) {
-	size := studioAspects[aspect]
-	_ = size
-	_ = quality
-	_ = style
-	return a.editImageBytes(ctx, prompt, images)
+	return editImageRaw(ctx, prompt, studioAspects[aspect], quality, style, images)
 }
 
 func (a *App) editImageBytes(ctx context.Context, prompt string, images []uploads.FileBytes) (uploads.FileBytes, error) {
 	if len(images) == 0 {
 		return uploads.FileBytes{}, errString("图生图至少需要一张主图")
 	}
-	return editImageRaw(ctx, prompt, images[0])
+	return editImageRaw(ctx, prompt, "", "", "", images)
 }
 
-func editImageRaw(ctx context.Context, prompt string, image uploads.FileBytes) (uploads.FileBytes, error) {
+func editImageRaw(ctx context.Context, prompt, size, quality, style string, images []uploads.FileBytes) (uploads.FileBytes, error) {
 	editCfg := config.Current().ImageEdit
 	endpoint := strings.TrimRight(editCfg.APIURL, "/")
 	key := editCfg.APIKey
@@ -194,9 +190,25 @@ func editImageRaw(ctx context.Context, prompt string, image uploads.FileBytes) (
 	boundary := "----chatlite-studio"
 	body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" + model + "\r\n")
 	body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n" + prompt + "\r\n")
-	body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"image\"; filename=\"" + image.Filename + "\"\r\nContent-Type: " + image.MimeType + "\r\n\r\n")
-	body.Write(image.Buffer)
-	body.WriteString("\r\n--" + boundary + "--\r\n")
+	if size != "" {
+		body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n" + size + "\r\n")
+	}
+	if quality != "" && quality != "auto" {
+		body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"quality\"\r\n\r\n" + quality + "\r\n")
+	}
+	if style != "" {
+		body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"style\"\r\n\r\n" + style + "\r\n")
+	}
+	field := "image"
+	if len(images) > 1 {
+		field = "image[]"
+	}
+	for _, image := range images {
+		body.WriteString("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + field + "\"; filename=\"" + image.Filename + "\"\r\nContent-Type: " + image.MimeType + "\r\n\r\n")
+		body.Write(image.Buffer)
+		body.WriteString("\r\n")
+	}
+	body.WriteString("--" + boundary + "--\r\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body.String()))
 	if err != nil {
 		return uploads.FileBytes{}, err
