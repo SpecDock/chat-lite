@@ -84,47 +84,79 @@ func (a *App) studioCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var running int
 	_ = a.Pool.QueryRow(r.Context(), `SELECT COUNT(*) FROM studio_images WHERE user_id=$1 AND status='running'`, user.UserID).Scan(&running)
-	if running >= 4 {
-		httpx.Error(w, 409, "当前已有 4 张图片正在生成，请等完成后再试。")
+	if running >= 6 {
+		httpx.Error(w, 409, "当前已有 6 张图片正在生成，请等完成后再试。")
 		return
 	}
 	id := idgen.NewID("simg")
 	created := idgen.NowISO()
+	log.Printf("[studio] start id=%s user=%s refs=%d aspect=%s quality=%s style=%s", id, user.UserID, len(req.images), req.aspect, req.quality, req.style)
 	if _, err = a.Pool.Exec(r.Context(), `INSERT INTO studio_images (id,user_id,prompt,aspect_ratio,quality,style,status,created_at) VALUES ($1,$2,$3,$4,$5,$6,'running',$7)`, id, user.UserID, prompt, req.aspect, req.quality, req.style, created); err != nil {
+		log.Printf("[studio] fail id=%s stage=insert err=%s", id, trimErr(err))
 		httpx.Error(w, 500, "图片生成失败")
 		return
 	}
 	var refs []map[string]any
+	var storedRefs []string
 	for i, image := range req.images {
 		measured := readImage(image.Buffer)
 		if measured == nil {
-			_, _ = a.Pool.Exec(r.Context(), `DELETE FROM studio_images WHERE id=$1 AND user_id=$2`, id, user.UserID)
+			a.discardStudio(r.Context(), id, user.UserID, storedRefs)
+			log.Printf("[studio] fail id=%s stage=reference index=%d err=unsupported image", id, i)
 			httpx.Error(w, 400, "参考图仅支持 jpeg/png/webp 图片")
 			return
 		}
 		refID := idgen.NewID("sref")
-		path := storage.ObjectPath(user.UserID, "", "studio", refID+measured.ext)
+		path := storage.ObjectPath(user.UserID, "", "studio", id+"_"+refID+measured.ext)
 		if err = storagequota.Ensure(r.Context(), a.Pool, user.UserID, int64(len(image.Buffer))); err != nil {
-			_, _ = a.Pool.Exec(r.Context(), `DELETE FROM studio_images WHERE id=$1 AND user_id=$2`, id, user.UserID)
+			a.discardStudio(r.Context(), id, user.UserID, storedRefs)
 			if errors.Is(err, storagequota.ErrFull) {
+				log.Printf("[studio] fail id=%s stage=reference-quota index=%d", id, i)
 				httpx.Error(w, 413, "储存已满")
 				return
 			}
+			log.Printf("[studio] fail id=%s stage=reference-quota index=%d err=%s", id, i, trimErr(err))
 			httpx.Error(w, 500, "图片生成失败")
 			return
 		}
-		if err = storage.Put(r.Context(), path, image.Buffer, measured.mime); err != nil {
+		if err = storage.Put(r.Context(), path, append([]byte(nil), image.Buffer...), measured.mime); err != nil {
+			a.discardStudio(r.Context(), id, user.UserID, storedRefs)
+			log.Printf("[studio] fail id=%s stage=reference-put index=%d bytes=%d err=%s", id, i, len(image.Buffer), trimErr(err))
 			httpx.Error(w, 500, "图片生成失败")
 			return
 		}
-		_, _ = a.Pool.Exec(r.Context(), `INSERT INTO studio_image_references (id,studio_image_id,user_id,file_path,mime_type,sort_order) VALUES ($1,$2,$3,$4,$5,$6)`, refID, id, user.UserID, path, measured.mime, i)
+		storedRefs = append(storedRefs, path)
+		if _, err = a.Pool.Exec(r.Context(), `INSERT INTO studio_image_references (id,studio_image_id,user_id,file_path,mime_type,sort_order) VALUES ($1,$2,$3,$4,$5,$6)`, refID, id, user.UserID, path, measured.mime, i); err != nil {
+			a.discardStudio(r.Context(), id, user.UserID, storedRefs)
+			log.Printf("[studio] fail id=%s stage=reference-bind index=%d err=%s", id, i, trimErr(err))
+			httpx.Error(w, 500, "图片生成失败")
+			return
+		}
+		log.Printf("[studio] reference id=%s index=%d ref=%s bytes=%d", id, i, refID, len(image.Buffer))
 		refs = append(refs, map[string]any{"id": refID, "url": "/api/studio/images/" + id + "/references/" + refID})
 	}
 	if refs == nil {
 		refs = []map[string]any{}
 	}
-	go a.runStudio(id, user.UserID, prompt, req.aspect, req.quality, req.style, req.images)
+	log.Printf("[studio] accepted id=%s refs=%d", id, len(refs))
+	go a.runStudio(id, user.UserID, prompt, req.aspect, req.quality, req.style, cloneStudioImages(req.images))
 	httpx.WriteJSON(w, 200, map[string]any{"image": studioDTO(id, user.UserID, prompt, req.aspect, req.quality, req.style, nil, nil, "running", nil, nil, nil, created, refs)})
+}
+
+func (a *App) discardStudio(ctx context.Context, id, userID string, paths []string) {
+	_, _ = a.Pool.Exec(ctx, `DELETE FROM studio_images WHERE id=$1 AND user_id=$2`, id, userID)
+	for _, path := range paths {
+		_ = storage.Remove(ctx, path)
+	}
+}
+
+func cloneStudioImages(images []uploads.FileBytes) []uploads.FileBytes {
+	out := make([]uploads.FileBytes, len(images))
+	for i, image := range images {
+		out[i] = image
+		out[i].Buffer = append([]byte(nil), image.Buffer...)
+	}
+	return out
 }
 
 func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, images []uploads.FileBytes) {
@@ -132,17 +164,21 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 	ctx := context.Background()
 	var image uploads.FileBytes
 	var err error
+	mode := "text"
 	if len(images) > 0 {
+		mode = "edit"
 		image, err = a.editStudio(ctx, prompt, aspect, quality, style, images)
 	} else {
 		image, err = textImage(ctx, prompt)
 	}
 	if err != nil {
+		log.Printf("[studio] fail id=%s stage=upstream mode=%s elapsedMs=%d err=%s", id, mode, time.Since(started).Milliseconds(), trimErr(err))
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1, duration_ms=$2 WHERE id=$3 AND user_id=$4 AND status='running'`, trimErr(err), int(time.Since(started).Milliseconds()), id, userID)
 		return
 	}
 	measured := readImage(image.Buffer)
 	if measured == nil {
+		log.Printf("[studio] fail id=%s stage=result-decode elapsedMs=%d", id, time.Since(started).Milliseconds())
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1, duration_ms=$2 WHERE id=$3 AND user_id=$4`, "无法读取生成图片尺寸", int(time.Since(started).Milliseconds()), id, userID)
 		return
 	}
@@ -152,14 +188,26 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 		if errors.Is(err, storagequota.ErrFull) {
 			message = "储存已满"
 		}
+		log.Printf("[studio] fail id=%s stage=result-quota elapsedMs=%d err=%s", id, time.Since(started).Milliseconds(), message)
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1, duration_ms=$2 WHERE id=$3 AND user_id=$4 AND status='running'`, message, int(time.Since(started).Milliseconds()), id, userID)
 		return
 	}
 	if err = storage.Put(ctx, path, image.Buffer, measured.mime); err != nil {
+		log.Printf("[studio] fail id=%s stage=result-put elapsedMs=%d err=%s", id, time.Since(started).Milliseconds(), trimErr(err))
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1 WHERE id=$2`, trimErr(err), id)
 		return
 	}
-	_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='succeeded', width=$1, height=$2, duration_ms=$3, file_path=$4, mime_type=$5 WHERE id=$6 AND user_id=$7 AND status='running'`, measured.width, measured.height, int(time.Since(started).Milliseconds()), path, measured.mime, id, userID)
+	tag, err := a.Pool.Exec(ctx, `UPDATE studio_images SET status='succeeded', width=$1, height=$2, duration_ms=$3, file_path=$4, mime_type=$5 WHERE id=$6 AND user_id=$7 AND status='running'`, measured.width, measured.height, int(time.Since(started).Milliseconds()), path, measured.mime, id, userID)
+	if err != nil || tag.RowsAffected() == 0 {
+		log.Printf("[studio] fail id=%s stage=complete elapsedMs=%d err=%v", id, time.Since(started).Milliseconds(), err)
+		return
+	}
+	log.Printf("[studio] done id=%s mode=%s bytes=%d width=%d height=%d elapsedMs=%d", id, mode, len(image.Buffer), measured.width, measured.height, time.Since(started).Milliseconds())
+	model := config.Current().TextImage.Model
+	if len(images) > 0 {
+		model = config.Current().ImageEdit.Model
+	}
+	_, _ = a.Pool.Exec(ctx, `INSERT INTO image_usage (user_id,image_generation_id,model,cost_units,created_at) VALUES ($1,$2,$3,1,$4)`, userID, id, model, idgen.NowISO())
 }
 
 func (a *App) editStudio(ctx context.Context, prompt, aspect, quality, style string, images []uploads.FileBytes) (uploads.FileBytes, error) {

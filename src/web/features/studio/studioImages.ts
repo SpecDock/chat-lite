@@ -23,7 +23,7 @@ export type StudioImage = {
 export const STUDIO_ASPECTS = ['auto', '1:1', '3:2', '2:3', '4:3', '3:4', '16:9', '9:16', '21:9'] as const;
 export const STUDIO_QUALITIES = ['low', 'standard', 'high'] as const;
 export const STUDIO_STYLES = ['vivid', 'natural'] as const;
-export const STUDIO_BUSY_MESSAGE = '当前已有 4 张图片正在生成，请等完成后再试。';
+export const STUDIO_BUSY_MESSAGE = '当前已有 6 张图片正在生成，请等完成后再试。';
 export const STUDIO_REFERENCE_LIMIT = 16;
 
 const QUALITY_LABELS: Record<string, string> = {
@@ -60,6 +60,14 @@ export function studioFileUrl(id: string) {
 export function formatPixels(width: number | null, height: number | null) {
   if (width === null || height === null) return '—';
   return `${width}×${height}`;
+}
+
+export function formatCreatedAt(value: string) {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return '—';
+  const date = new Date(time);
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}年${pad(date.getMonth() + 1)}月${pad(date.getDate())}日 ${pad(date.getHours())}时${pad(date.getMinutes())}分${pad(date.getSeconds())}秒`;
 }
 
 export function formatDuration(durationMs: number | null) {

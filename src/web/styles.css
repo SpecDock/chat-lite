@@ -2810,7 +2810,7 @@ input:focus, textarea:focus {
   padding: 16px 14px 20px;
 }
 
-.studio-board,
+.studio-board { width: 100%; }
 .studio-bar { width: min(860px, 100%); margin-inline: auto; }
 
 .studio-composer {
@@ -2935,16 +2935,16 @@ input:focus, textarea:focus {
 }
 
 .studio-gallery {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr));
+  align-items: start;
   gap: 16px;
 }
 
 .studio-card {
   position: relative;
-  width: min(300px, 100%);
-  max-width: 100%;
+  width: auto;
+  max-width: none;
   min-width: 0;
 }
 
