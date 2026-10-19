@@ -18,7 +18,7 @@ import (
 const (
 	sqliteAppSQL = `file:D:/chat-lite/data/app.db?mode=ro`
 	sqliteRagSQL = `file:D:/chat-lite/data/rag.db?mode=ro`
-	postgresSQL  = `postgres://chatlite:REDACTED@127.0.0.1:5432/chatlite?sslmode=disable`
+	postgresSQL  = `postgres://chatlite:chatlite@127.0.0.1:5432/chatlite?sslmode=disable`
 	schemaPath   = `schema.sql`
 	// one 只迁 1 个用户及其关联行；all 迁全部。
 	migrateMode = "one"

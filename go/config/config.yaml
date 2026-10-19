@@ -15,7 +15,7 @@ server:
   answer_history_limit: ${ANSWER_HISTORY_LIMIT}
 
 postgres:
-  url: postgres://chatlite:REDACTED@127.0.0.1:5432/chatlite?sslmode=disable
+  url: ${POSTGRES_URL}
 
 llm:
   api_url: ${MODEL_BASE_URL}
@@ -55,9 +55,9 @@ agent:
   recursion_limit: ${AGENT_RECURSION_LIMIT}
 
 minio:
-  endpoint: 127.0.0.1:9000
-  access_key: root
-  secret_key: REDACTED
+  endpoint: ${MINIO_ENDPOINT}
+  access_key: ${MINIO_ACCESS_KEY}
+  secret_key: ${MINIO_SECRET_KEY}
   bucket: chat-lite
   use_ssl: "false"
 
