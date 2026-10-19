@@ -3,6 +3,7 @@ export type StudioImageStatus = 'running' | 'succeeded' | 'failed';
 export type StudioReference = {
   id: string;
   url: string;
+  thumbUrl: string;
 };
 
 export type StudioImage = {
@@ -57,6 +58,10 @@ export function studioFileUrl(id: string) {
   return `/api/studio/images/${encodeURIComponent(id)}/file`;
 }
 
+export function studioThumbUrl(id: string) {
+  return `/api/studio/images/${encodeURIComponent(id)}/thumb`;
+}
+
 export function formatPixels(width: number | null, height: number | null) {
   if (width === null || height === null) return '—';
   return `${width}×${height}`;
@@ -100,7 +105,8 @@ function studioReferences(value: unknown): StudioReference[] {
     const record = item as Record<string, unknown>;
     const id = typeof record.id === 'string' ? record.id : '';
     const url = typeof record.url === 'string' ? record.url : '';
-    return id && url ? [{ id, url }] : [];
+    const thumbUrl = typeof record.thumbUrl === 'string' ? record.thumbUrl : typeof record.thumb_url === 'string' ? record.thumb_url : '';
+    return id && url ? [{ id, url, thumbUrl }] : [];
   });
 }
 

@@ -3,8 +3,8 @@ package httpapi
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"mime"
@@ -16,11 +16,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/config"
 	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/storage"
-	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 )
@@ -43,7 +43,9 @@ func (a *App) registerStudio(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/studio/images", a.withAuth(a.studioCreate))
 	mux.HandleFunc("GET /api/studio/images", a.withAuth(a.studioList))
 	mux.HandleFunc("DELETE /api/studio/images/{id}", a.withAuth(a.studioDelete))
+	mux.HandleFunc("GET /api/studio/images/{id}/references/{refId}/thumb", a.withAuth(a.studioReferenceThumb))
 	mux.HandleFunc("GET /api/studio/images/{id}/references/{refId}", a.withAuth(a.studioReference))
+	mux.HandleFunc("GET /api/studio/images/{id}/thumb", a.withAuth(a.studioThumb))
 	mux.HandleFunc("GET /api/studio/images/{id}/file", a.withAuth(a.studioFile))
 }
 
@@ -126,14 +128,18 @@ func (a *App) studioCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		storedRefs = append(storedRefs, path)
-		if _, err = a.Pool.Exec(r.Context(), `INSERT INTO studio_image_references (id,studio_image_id,user_id,file_path,mime_type,sort_order) VALUES ($1,$2,$3,$4,$5,$6)`, refID, id, user.UserID, path, measured.mime, i); err != nil {
+		thumbPath, thumbSize := a.saveThumb(r.Context(), user.UserID, id+"_"+refID+"_thumb.jpg", image.Buffer)
+		if thumbPath != "" {
+			storedRefs = append(storedRefs, thumbPath)
+		}
+		if _, err = a.Pool.Exec(r.Context(), `INSERT INTO studio_image_references (id,studio_image_id,user_id,file_path,mime_type,file_size,thumbnail_path,thumbnail_size,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, refID, id, user.UserID, path, measured.mime, len(image.Buffer), nullIfEmpty(thumbPath), thumbSize, i); err != nil {
 			a.discardStudio(r.Context(), id, user.UserID, storedRefs)
 			log.Printf("[studio] fail id=%s stage=reference-bind index=%d err=%s", id, i, trimErr(err))
 			httpx.Error(w, 500, "图片生成失败")
 			return
 		}
-		log.Printf("[studio] reference id=%s index=%d ref=%s bytes=%d", id, i, refID, len(image.Buffer))
-		refs = append(refs, map[string]any{"id": refID, "url": "/api/studio/images/" + id + "/references/" + refID})
+		log.Printf("[studio] reference id=%s index=%d ref=%s bytes=%d thumb=%d", id, i, refID, len(image.Buffer), thumbSize)
+		refs = append(refs, map[string]any{"id": refID, "url": "/api/studio/images/" + id + "/references/" + refID, "thumbUrl": "/api/studio/images/" + id + "/references/" + refID + "/thumb"})
 	}
 	if refs == nil {
 		refs = []map[string]any{}
@@ -197,7 +203,8 @@ func (a *App) runStudio(id, userID, prompt, aspect, quality, style string, image
 		_, _ = a.Pool.Exec(ctx, `UPDATE studio_images SET status='failed', error=$1 WHERE id=$2`, trimErr(err), id)
 		return
 	}
-	tag, err := a.Pool.Exec(ctx, `UPDATE studio_images SET status='succeeded', width=$1, height=$2, duration_ms=$3, file_path=$4, mime_type=$5 WHERE id=$6 AND user_id=$7 AND status='running'`, measured.width, measured.height, int(time.Since(started).Milliseconds()), path, measured.mime, id, userID)
+	thumbPath, thumbSize := a.saveThumb(ctx, userID, id+"_thumb.jpg", image.Buffer)
+	tag, err := a.Pool.Exec(ctx, `UPDATE studio_images SET status='succeeded', width=$1, height=$2, duration_ms=$3, file_path=$4, mime_type=$5, file_size=$6, thumbnail_path=$7, thumbnail_size=$8 WHERE id=$9 AND user_id=$10 AND status='running'`, measured.width, measured.height, int(time.Since(started).Milliseconds()), path, measured.mime, len(image.Buffer), nullIfEmpty(thumbPath), thumbSize, id, userID)
 	if err != nil || tag.RowsAffected() == 0 {
 		log.Printf("[studio] fail id=%s stage=complete elapsedMs=%d err=%v", id, time.Since(started).Milliseconds(), err)
 		return
@@ -291,7 +298,7 @@ func (a *App) studioList(w http.ResponseWriter, r *http.Request) {
 		for rrows.Next() {
 			var id, imageID string
 			if err := rrows.Scan(&id, &imageID); err == nil {
-				refs[imageID] = append(refs[imageID], map[string]any{"id": id, "url": "/api/studio/images/" + imageID + "/references/" + id})
+				refs[imageID] = append(refs[imageID], map[string]any{"id": id, "url": "/api/studio/images/" + imageID + "/references/" + id, "thumbUrl": "/api/studio/images/" + imageID + "/references/" + id + "/thumb"})
 			}
 		}
 		rrows.Close()
@@ -324,8 +331,8 @@ func studioDTO(id, userID, prompt, aspect, quality, style string, width, height 
 func (a *App) studioDelete(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	id := r.PathValue("id")
-	var filePath *string
-	err := a.Pool.QueryRow(r.Context(), `SELECT file_path FROM studio_images WHERE id=$1 AND user_id=$2`, id, user.UserID).Scan(&filePath)
+	var filePath, thumbPath *string
+	err := a.Pool.QueryRow(r.Context(), `SELECT file_path, thumbnail_path FROM studio_images WHERE id=$1 AND user_id=$2`, id, user.UserID).Scan(&filePath, &thumbPath)
 	if err == pgx.ErrNoRows {
 		httpx.Error(w, 404, "记录不存在")
 		return
@@ -334,13 +341,18 @@ func (a *App) studioDelete(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 500, "删除失败")
 		return
 	}
-	rows, _ := a.Pool.Query(r.Context(), `SELECT file_path FROM studio_image_references WHERE studio_image_id=$1 AND user_id=$2`, id, user.UserID)
+	rows, _ := a.Pool.Query(r.Context(), `SELECT file_path, thumbnail_path FROM studio_image_references WHERE studio_image_id=$1 AND user_id=$2`, id, user.UserID)
 	var refs []string
 	if rows != nil {
 		for rows.Next() {
-			var path string
-			if rows.Scan(&path) == nil {
-				refs = append(refs, path)
+			var path, refThumb *string
+			if rows.Scan(&path, &refThumb) == nil {
+				if path != nil {
+					refs = append(refs, *path)
+				}
+				if refThumb != nil {
+					refs = append(refs, *refThumb)
+				}
 			}
 		}
 		rows.Close()
@@ -351,6 +363,9 @@ func (a *App) studioDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if filePath != nil {
 		_ = storage.Remove(r.Context(), *filePath)
+	}
+	if thumbPath != nil {
+		_ = storage.Remove(r.Context(), *thumbPath)
 	}
 	for _, path := range refs {
 		_ = storage.Remove(r.Context(), path)

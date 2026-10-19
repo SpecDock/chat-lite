@@ -31,11 +31,11 @@ func (a *App) profileAvatar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, status, err.Error())
 		return
 	}
-	if len(file.Buffer) > 2*1024*1024 {
-		httpx.Error(w, 400, "头像不能超过 2MB")
+	if int64(len(file.Buffer)) > authsec.MaxUploadBytes() {
+		httpx.Error(w, 400, "图片不能超过 "+authsec.MaxUploadLabel())
 		return
 	}
-	att, err := uploads.SaveImageBuffer(r.Context(), a.Pool, user.UserID, file, "", 2*1024*1024, "2MB", "input")
+	att, err := uploads.SaveImageBuffer(r.Context(), a.Pool, user.UserID, file, "", authsec.MaxUploadBytes(), authsec.MaxUploadLabel(), "input")
 	if err != nil {
 		status := 400
 		msg := err.Error()
@@ -62,7 +62,7 @@ func readAvatar(r *http.Request) (uploads.FileBytes, error) {
 	if err != nil {
 		return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "请使用 multipart/form-data 上传"}
 	}
-	mr := multipart.NewReader(http.MaxBytesReader(nil, r.Body, 2*1024*1024+4096), params["boundary"])
+	mr := multipart.NewReader(http.MaxBytesReader(nil, r.Body, authsec.MaxUploadBytes()+4096), params["boundary"])
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -70,19 +70,19 @@ func readAvatar(r *http.Request) (uploads.FileBytes, error) {
 		}
 		if err != nil {
 			if strings.Contains(err.Error(), "request body too large") || strings.Contains(strings.ToLower(err.Error()), "too large") {
-				return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "头像不能超过 2MB"}
+				return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "图片不能超过 " + authsec.MaxUploadLabel()}
 			}
 			return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "头像上传失败"}
 		}
 		if part.FormName() != "avatar" {
 			continue
 		}
-		buf, err := io.ReadAll(io.LimitReader(part, 2*1024*1024+1))
+		buf, err := io.ReadAll(io.LimitReader(part, authsec.MaxUploadBytes()+1))
 		if err != nil {
 			return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "头像上传失败"}
 		}
-		if int64(len(buf)) > 2*1024*1024 {
-			return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "头像不能超过 2MB"}
+		if int64(len(buf)) > authsec.MaxUploadBytes() {
+			return uploads.FileBytes{}, &uploads.StatusError{Status: 400, Message: "图片不能超过 " + authsec.MaxUploadLabel()}
 		}
 		name := part.FileName()
 		if name == "" {

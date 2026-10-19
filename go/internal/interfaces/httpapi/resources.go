@@ -3,8 +3,8 @@ package httpapi
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -16,11 +16,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/config"
 	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/uploads"
 	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/storage"
-	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
@@ -290,15 +290,14 @@ func (a *App) cloudFiles(w http.ResponseWriter, r *http.Request) {
 		items = append(items, it)
 	}
 	rows.Close()
-	studioRows, err := a.Pool.Query(r.Context(), `SELECT id, mime_type, file_path, created_at FROM studio_images WHERE user_id=$1 AND status='succeeded' AND file_path IS NOT NULL ORDER BY created_at DESC`, user.UserID)
+	studioRows, err := a.Pool.Query(r.Context(), `SELECT id, mime_type, COALESCE(file_size,0), created_at FROM studio_images WHERE user_id=$1 AND status='succeeded' AND file_path IS NOT NULL ORDER BY created_at DESC`, user.UserID)
 	if err != nil {
 		httpx.Error(w, 500, "服务器错误")
 		return
 	}
 	for studioRows.Next() {
 		var it item
-		var path string
-		if err = studioRows.Scan(&it.id, &it.mime, &path, &it.created); err != nil {
+		if err = studioRows.Scan(&it.id, &it.mime, &it.size, &it.created); err != nil {
 			studioRows.Close()
 			httpx.Error(w, 500, "服务器错误")
 			return
@@ -307,7 +306,6 @@ func (a *App) cloudFiles(w http.ResponseWriter, r *http.Request) {
 		it.kind = "studio"
 		it.url = "/api/studio/images/" + it.id + "/file"
 		it.preview = true
-		it.size, _ = storage.Size(r.Context(), path)
 		items = append(items, it)
 	}
 	studioRows.Close()
