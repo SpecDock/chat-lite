@@ -1359,11 +1359,12 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       const targetKey = options.getTargetKey();
       if (event === 'think') {
         const reopenThink = thinkStarted && thinkClosed;
+        const firstThink = !thinkStarted;
         thinkStarted = true;
         if (reopenThink) thinkClosed = false;
         updateMessages(targetKey, currentMessages => currentMessages.map(message => {
           if (message.id !== assistantMessageId) return message;
-          const prefix = !message.content || reopenThink ? '<think>\n' : '';
+          const prefix = firstThink || reopenThink ? '<think>\n' : '';
           return { ...message, content: `${message.content}${prefix}${data.text || ''}\n` };
         }));
       }
