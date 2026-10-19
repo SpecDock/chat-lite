@@ -127,10 +127,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			return abortErr()
 		}
 		round = step + 1
-		delta, err := streamTurn(ctx, messages, tools, replay, in.ConversationID, "decision", round)
+		delta, err := streamTurn(ctx, messages, tools, replay, in.ConversationID, "decision", round, func(chunk string) {
+			emit(Event{Type: "delta", Text: chunk})
+		})
 		if err != nil {
 			if delta.Text != "" {
-				emit(Event{Type: "delta", Text: delta.Text})
 				return &PartialError{Text: delta.Text, Err: err}
 			}
 			return err
@@ -155,9 +156,6 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		messages = append(messages, assistant)
 		if len(delta.ToolCalls) == 0 {
 			streamed = delta.Text
-			if streamed != "" {
-				emit(Event{Type: "delta", Text: streamed})
-			}
 			answered = true
 			break
 		}
@@ -188,9 +186,14 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 	if !answered {
 		emit(Event{Type: "think", Text: fmt.Sprintf("已达最大工具步数 %d，正在根据已有结果回答。", recursionLimit)})
 		finalBody := map[string]any{"model": llm.ModelName(), "temperature": llm.Temperature(), "stream": true, "messages": messages}
-		delta, err := streamTurn(ctx, messages, nil, replay, in.ConversationID, "final", round+1)
+		delta, err := streamTurn(ctx, messages, nil, replay, in.ConversationID, "final", round+1, func(chunk string) {
+			emit(Event{Type: "delta", Text: chunk})
+		})
 		_ = finalBody
 		if err != nil {
+			if delta.Text != "" {
+				return &PartialError{Text: delta.Text, Err: err}
+			}
 			return err
 		}
 		if delta.Usage != nil {
@@ -199,8 +202,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		text := delta.Text
 		if strings.TrimSpace(text) == "" {
 			text = "主模型未返回正文，请尝试重新提问或调整描述。"
+			emit(Event{Type: "delta", Text: text})
 		}
-		emit(Event{Type: "delta", Text: text})
 		streamed = text
 		assistant := map[string]any{"role": "assistant", "content": text}
 		if delta.ReasoningContent != "" {
@@ -219,7 +222,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 	return nil
 }
 
-func streamTurn(ctx context.Context, messages []any, tools []any, replay map[string]string, conversationID, phase string, step int) (llm.Delta, error) {
+func streamTurn(ctx context.Context, messages []any, tools []any, replay map[string]string, conversationID, phase string, step int, onText func(string)) (llm.Delta, error) {
 	body := map[string]any{"model": llm.ModelName(), "temperature": llm.Temperature(), "stream": true, "stream_options": map[string]any{"include_usage": true}, "messages": messages}
 	if len(tools) > 0 {
 		body["tools"] = tools
@@ -238,7 +241,7 @@ func streamTurn(ctx context.Context, messages []any, tools []any, replay map[str
 			}
 			continue
 		}
-		deltas, err := llm.ReadDeltas(reader)
+		deltas, err := llm.ReadDeltas(reader, onText)
 		closeFn()
 		if err != nil && len(deltas) == 0 {
 			last = err

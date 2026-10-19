@@ -200,7 +200,7 @@ func replayKey(content, toolCalls any) string {
 	return string(raw)
 }
 
-func ReadDeltas(reader *bufio.Reader) ([]Delta, error) {
+func ReadDeltas(reader *bufio.Reader, onText func(string)) ([]Delta, error) {
 	var calls = map[int]*ToolCall{}
 	var order []int
 	var text strings.Builder
@@ -231,6 +231,9 @@ func ReadDeltas(reader *bufio.Reader) ([]Delta, error) {
 						if delta != nil {
 							if content, _ := delta["content"].(string); content != "" {
 								text.WriteString(content)
+								if onText != nil {
+									onText(content)
+								}
 							}
 							if rc, _ := delta["reasoning_content"].(string); rc != "" {
 								reasoning.WriteString(rc)
