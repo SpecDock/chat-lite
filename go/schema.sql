@@ -172,6 +172,9 @@ CREATE TABLE IF NOT EXISTS studio_images (
   duration_ms INTEGER,
   file_path TEXT,
   mime_type TEXT,
+  file_size BIGINT,
+  thumbnail_path TEXT,
+  thumbnail_size BIGINT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_studio_images_user_created ON studio_images(user_id, created_at DESC);
@@ -183,8 +186,17 @@ CREATE TABLE IF NOT EXISTS studio_image_references (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   file_path TEXT NOT NULL,
   mime_type TEXT NOT NULL,
+  file_size BIGINT,
+  thumbnail_path TEXT,
+  thumbnail_size BIGINT,
   sort_order INTEGER NOT NULL
 );
+ALTER TABLE studio_images ADD COLUMN IF NOT EXISTS file_size BIGINT;
+ALTER TABLE studio_images ADD COLUMN IF NOT EXISTS thumbnail_path TEXT;
+ALTER TABLE studio_images ADD COLUMN IF NOT EXISTS thumbnail_size BIGINT;
+ALTER TABLE studio_image_references ADD COLUMN IF NOT EXISTS file_size BIGINT;
+ALTER TABLE studio_image_references ADD COLUMN IF NOT EXISTS thumbnail_path TEXT;
+ALTER TABLE studio_image_references ADD COLUMN IF NOT EXISTS thumbnail_size BIGINT;
 CREATE INDEX IF NOT EXISTS idx_studio_image_references_image ON studio_image_references(studio_image_id, sort_order);
 
 CREATE TABLE IF NOT EXISTS rag_items (

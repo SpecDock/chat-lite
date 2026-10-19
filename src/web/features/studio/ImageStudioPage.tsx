@@ -20,6 +20,7 @@ import {
   styleLabel,
   sortStudioImages,
   studioFileUrl,
+  studioThumbUrl,
   studioResultText,
   studioStatusLabel,
   type StudioImage,
@@ -159,7 +160,7 @@ function StudioLoader() {
   </div>;
 }
 
-function StudioFrame({ item, onZoom }: { item: StudioImage; onZoom?: () => void }) {
+function StudioFrame({ item, onZoom, full }: { item: StudioImage; onZoom?: () => void; full?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const initialStatus = useRef(item.status);
   const [attempt, setAttempt] = useState(0);
@@ -188,12 +189,13 @@ function StudioFrame({ item, onZoom }: { item: StudioImage; onZoom?: () => void 
   if (item.status === 'running') body = <StudioLoader />;
   else if (item.status === 'failed' || broken) body = <p className="studio-frame__note">{broken ? '图片读取失败' : '生成失败'}</p>;
   else if (item.status === 'succeeded') {
+    const fullUrl = studioFileUrl(item.id);
     const image = <img
-      src={attempt ? `${studioFileUrl(item.id)}?retry=${attempt}` : studioFileUrl(item.id)}
+      src={full || attempt > 0 ? fullUrl : studioThumbUrl(item.id)}
       alt={item.prompt || '生成的图片'}
       draggable={false}
       onError={() => {
-        if (attempt < 1) setAttempt(1);
+        if (!full && attempt < 1) setAttempt(1);
         else setBroken(true);
       }}
     />;
@@ -268,7 +270,7 @@ function StudioDetail({ item, zoomOpen, deleting, cooldownLeft, error, onClose, 
           </div>
         </div>
         <div className="studio-detail__frame">
-          <StudioFrame item={item} onZoom={item.status === 'succeeded' ? onZoom : undefined} />
+          <StudioFrame item={item} full onZoom={item.status === 'succeeded' ? onZoom : undefined} />
         </div>
         <div className="studio-detail__meta">
         {error && <p className="error">{error}</p>}
@@ -290,7 +292,7 @@ function StudioDetail({ item, zoomOpen, deleting, cooldownLeft, error, onClose, 
             aria-label={`查看参考图 ${index + 1}`}
             onDoubleClick={() => onPreview(reference.url)}
           >
-            <img src={reference.url} alt="" draggable={false} />
+            <img src={reference.thumbUrl || reference.url} alt="" draggable={false} onError={event => { event.currentTarget.src = reference.url; }} />
           </button>)}
         </div>}
         </div>

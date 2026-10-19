@@ -150,7 +150,7 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
     setAvatarMsg('');
     if (!avatarFile) return setAvatarMsg('请选择头像图片');
     if (!avatarFile.type.startsWith('image/')) return setAvatarMsg('仅支持图片文件');
-    if (avatarFile.size > 2 * 1024 * 1024) return setAvatarMsg('头像不能超过 2MB');
+    if (avatarFile.size > 5 * 1024 * 1024) return setAvatarMsg('图片不能超过 5MB');
     setAvatarBusy(true);
     try {
       const result = await api.updateAvatar(avatarFile);
@@ -233,7 +233,7 @@ export default function ProfileMenu({ user, onUserChange, onLogout }: { user: Us
         </header>
         {dialog === 'avatar' ? <form onSubmit={submitAvatar}>
           <label className="avatar-drop">
-            {avatarFile ? <span>{avatarFile.name}</span> : <span>选择 2MB 以下图片</span>}
+            {avatarFile ? <span>{avatarFile.name}</span> : <span>选择图片，不能超过 5MB</span>}
             <input type="file" accept="image/jpeg,image/png,image/webp" onChange={e => setAvatarFile(e.target.files?.[0] || null)} />
           </label>
           {avatarMsg && <div className={avatarMsg === '修改成功' ? 'hint' : 'error'}>{avatarMsg}</div>}

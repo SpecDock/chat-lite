@@ -6,6 +6,14 @@ import ImageLightbox from '../messages/ImageLightbox';
 
 type CloudFile = { id: string; name: string; mimeType: string; size: number; createdAt: string; kind: string; url: string; downloadUrl: string; preview: boolean };
 
+function formatCloudDate(value: string) {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return '';
+  const date = new Date(time);
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}年${pad(date.getMonth() + 1)}月${pad(date.getDate())}日`;
+}
+
 function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
@@ -44,7 +52,7 @@ export default function CloudFilesDialog() {
       {files.length === 0 && !error ? <p className="cloud-files__empty">还没有文件</p> : files.map(file => <div className="cloud-files__row" key={`${file.kind}:${file.id}`}>
         <button type="button" className="cloud-files__main" disabled={!file.preview} onClick={() => file.preview && setPreview({ src: file.url, alt: file.name })}>
           <FileTypeIcon name={file.preview ? file.name + '.png' : file.name} size={28} />
-          <span><strong>{file.name}</strong><small>{formatBytes(file.size)}</small></span>
+          <span><strong>{file.name}</strong><small>{formatBytes(file.size)}{formatCloudDate(file.createdAt) ? ` · ${formatCloudDate(file.createdAt)}` : ''}</small></span>
         </button>
         <a className="icon-button" href={file.downloadUrl} download aria-label={`下载 ${file.name}`} title="下载"><Download size={16} /></a>
       </div>)}
