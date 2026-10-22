@@ -11,7 +11,7 @@ function reducedMotion() {
 
 function isSupportedAttachment(file: File) {
   const name = file.name.toLowerCase();
-  return file.type.startsWith('image/') || name.endsWith('.csv') || name.endsWith('.xlsx');
+  return file.type.startsWith('image/') || name.endsWith('.csv') || name.endsWith('.xlsx') || name.endsWith('.pdf');
 }
 
 export default function MessageInput({ disabled, sending, refillText, refillKey, pending, onSend, onCancel, onImage, onRemoveImage, onPreviewImage, conversationId, onWorkspace }: { disabled?: boolean; sending?: boolean; refillText?: string; refillKey?: number; pending: AttachmentDTO[]; onSend: (text: string) => void; onCancel?: () => void; onImage: (file: File) => void | Promise<void>; onRemoveImage: (id: string) => void; onPreviewImage: (src: string, alt: string) => void; conversationId?: string; onWorkspace?: () => void }) {

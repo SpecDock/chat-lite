@@ -54,6 +54,27 @@ type IndexInput struct {
 	Content        string
 	Status         string
 	CreatedAt      string
+	MaxChars       int
+}
+
+func IndexNow(ctx context.Context, pool *pgxpool.Pool, input IndexInput) error {
+	if pool == nil || !Available() {
+		return nil
+	}
+	status := input.Status
+	if status == "" {
+		status = "completed"
+	}
+	if !visibility.IsModelVisible(input.Role, input.Content, status) {
+		_, _ = DeleteMessage(ctx, pool, input.UserID, input.MessageID)
+		return nil
+	}
+	if !writeEnabled() {
+		return nil
+	}
+	input.Content = visibility.StripThinkBlocks(input.Content)
+	input.Status = status
+	return indexOne(ctx, pool, input)
 }
 
 func writeEnabled() bool { return config.Current().RAG.WriteEnabled }
@@ -93,7 +114,10 @@ func indexOne(ctx context.Context, pool *pgxpool.Pool, input IndexInput) error {
 	if input.Role != "user" && input.Role != "assistant" {
 		return nil
 	}
-	maxChars := config.Current().RAG.ContentMaxChars
+	maxChars := input.MaxChars
+	if maxChars <= 0 {
+		maxChars = config.Current().RAG.ContentMaxChars
+	}
 	cleaned := CleanForIndexing(input.Content, maxChars)
 	if utf8.RuneCountInString(cleaned) < 8 && len(cleaned) < 8 {
 		return nil

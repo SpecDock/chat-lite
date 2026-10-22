@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS conversation_context_snapshots (
   context_json JSONB NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('pending', 'current', 'superseded', 'invalid')),
   created_at TEXT NOT NULL,
+  source_version INTEGER,
   UNIQUE (conversation_id, user_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_context_snapshots_owner
@@ -74,6 +75,12 @@ CREATE INDEX IF NOT EXISTS idx_conversation_context_snapshots_owner
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_context_snapshots_current
   ON conversation_context_snapshots(conversation_id, user_id)
   WHERE status = 'current';
+ALTER TABLE conversation_context_snapshots
+  ADD COLUMN IF NOT EXISTS source_version INTEGER;
+
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_status TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_chars INTEGER;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_inline TEXT;
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,

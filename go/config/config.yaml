@@ -17,6 +17,15 @@ server:
 postgres:
   url: ${POSTGRES_URL}
 
+redis:
+  addr: ${REDIS_ADDR}
+  password: ${REDIS_PASSWORD}
+  db: ${REDIS_DB}
+
+kafka:
+  brokers: ${KAFKA_BROKERS}
+  topic: chatlite-context
+
 llm:
   api_url: ${MODEL_BASE_URL}
   api_key: ${MODEL_API_KEY}

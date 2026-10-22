@@ -49,6 +49,7 @@ export const api = {
   pinConversation: (id: string, pinned: boolean) => fetch(`/api/conversations/${id}`, { method: 'PATCH', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pinned }) }).then(r => parse<{ conversation: ConversationDTO }>(r)),
   renameConversation: (id: string, title: string) => fetch(`/api/conversations/${id}`, { method: 'PATCH', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title }) }).then(r => parse<{ conversation: ConversationDTO }>(r)),
   deleteConversation: (id: string) => fetch(`/api/conversations/${id}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
+  stopGeneration: (id: string) => fetch(`/api/conversations/${id}/stop`, { method: 'POST', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
   deleteMessage: (conversationId: string, userMessageId: string) => fetch(`/api/conversations/${conversationId}/messages/${userMessageId}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean; conversationDeleted: boolean }>(r)),
   messages: (id: string) => fetch(`/api/conversations/${id}/messages`, { credentials: 'include' }).then(r => parse<{ messages: MessageDTO[] }>(r)),
   workspace: (id: string) => fetch(`/api/conversations/${id}/workspace`, { credentials: 'include' }).then(r => parse<{ workspace: WorkspaceFilesDTO }>(r)),

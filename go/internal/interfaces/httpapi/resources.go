@@ -76,6 +76,18 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, 200, map[string]any{"attachment": att})
 		return
 	}
+	if file.pdf != nil {
+		att, err := a.savePDF(r, user.UserID, conversationID, *file.pdf)
+		if file.pdf.temp != "" {
+			_ = os.Remove(file.pdf.temp)
+		}
+		if err != nil {
+			httpx.Error(w, statusOfUpload(err), err.Error())
+			return
+		}
+		httpx.WriteJSON(w, 200, map[string]any{"attachment": att})
+		return
+	}
 	if file.table != nil {
 		att, err := a.saveTable(r, user.UserID, conversationID, *file.table)
 		if file.table.temp != "" {
@@ -88,12 +100,13 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, 200, map[string]any{"attachment": att})
 		return
 	}
-	httpx.Error(w, 400, "请上传图片或 CSV/XLSX 文件")
+	httpx.Error(w, 400, "请上传图片、CSV/XLSX 或 PDF 文件")
 }
 
 type parsedUpload struct {
 	image *uploads.FileBytes
 	table *tableUpload
+	pdf   *tableUpload
 }
 type tableUpload struct {
 	temp, name, mime string
@@ -139,9 +152,20 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 			parsed.image = &uploads.FileBytes{Buffer: buf, Filename: name, MimeType: mimeType}
 			continue
 		}
+		if authsec.AllowedPDF(name, mimeType) {
+			temp, n, err := writeLimitedTemp(userID, part, authsec.PDFUploadMaxBytes)
+			if err != nil {
+				return parsedUpload{}, fields, err
+			}
+			if n > authsec.PDFUploadMaxBytes {
+				return parsedUpload{}, fields, &uploads.StatusError{413, "PDF 不能超过 32MB"}
+			}
+			parsed.pdf = &tableUpload{temp: temp, name: name, mime: "application/pdf", size: n}
+			continue
+		}
 		if !isTableName(name, mimeType) {
 			_, _ = io.Copy(io.Discard, part)
-			return parsedUpload{}, fields, &uploads.StatusError{400, "仅支持 jpeg/png/webp 图片或 CSV/XLSX 文件"}
+			return parsedUpload{}, fields, &uploads.StatusError{400, "仅支持 jpeg/png/webp 图片、CSV/XLSX 或 PDF 文件"}
 		}
 		dir := filepath.Join(paths.UploadDir(), userID)
 		_ = os.MkdirAll(dir, 0o755)
@@ -159,6 +183,64 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 		parsed.table = &tableUpload{temp: temp, name: name, mime: mimeType, size: n}
 	}
 	return parsed, fields, nil
+}
+
+func writeLimitedTemp(userID string, part io.Reader, limit int64) (string, int64, error) {
+	dir := filepath.Join(paths.UploadDir(), userID)
+	_ = os.MkdirAll(dir, 0o755)
+	temp := filepath.Join(dir, "."+idgen.NewID("upload")+".part")
+	out, err := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", 0, err
+	}
+	n, err := io.Copy(out, io.LimitReader(part, limit+1))
+	out.Close()
+	if err != nil || n > limit {
+		_ = os.Remove(temp)
+		if err == nil {
+			return "", n, nil
+		}
+		return "", 0, err
+	}
+	return temp, n, nil
+}
+
+func (a *App) savePDF(r *http.Request, userID, conversationID string, file tableUpload) (uploads.Attachment, error) {
+	exists, err := uploads.UserConversationExists(r.Context(), a.Pool, conversationID, userID)
+	if err != nil {
+		return uploads.Attachment{}, err
+	}
+	if conversationID == "" || !exists {
+		return uploads.Attachment{}, &uploads.StatusError{404, "会话不存在"}
+	}
+	info, err := os.Stat(file.temp)
+	if err != nil || info.Size() != file.size || file.size < 1 || file.size > authsec.PDFUploadMaxBytes {
+		return uploads.Attachment{}, &uploads.StatusError{400, "上传文件校验失败"}
+	}
+	id := idgen.NewID("att")
+	data, err := os.ReadFile(file.temp)
+	if err != nil {
+		return uploads.Attachment{}, err
+	}
+	dest := storage.ObjectPath(userID, conversationID, "input", id+".pdf")
+	if err = storagequota.Ensure(r.Context(), a.Pool, userID, file.size); err != nil {
+		if errors.Is(err, storagequota.ErrFull) {
+			return uploads.Attachment{}, &uploads.StatusError{413, "储存已满"}
+		}
+		return uploads.Attachment{}, err
+	}
+	if err = storage.Put(r.Context(), dest, data, "application/pdf"); err != nil {
+		return uploads.Attachment{}, err
+	}
+	_ = os.Remove(file.temp)
+	file.temp = ""
+	created := idgen.NowISO()
+	_, err = a.Pool.Exec(r.Context(), `INSERT INTO attachments (id,user_id,conversation_id,original_name,file_path,public_path,mime_type,size,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, userID, conversationID, file.name, dest, "/api/files/"+id, "application/pdf", file.size, created)
+	if err != nil {
+		_ = storage.Remove(r.Context(), dest)
+		return uploads.Attachment{}, err
+	}
+	return uploads.Attachment{ID: id, OriginalName: file.name, PublicPath: "/api/files/" + id, MimeType: "application/pdf", Size: file.size, CreatedAt: created}, nil
 }
 
 func isTableName(name, mimeType string) bool {

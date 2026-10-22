@@ -59,6 +59,9 @@ func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, at
 	if err != nil {
 		return "", errScratch("附件不存在或不属于当前会话")
 	}
+	if strings.HasSuffix(strings.ToLower(name), ".pdf") {
+		return "", errScratch("PDF 由服务端解析，不能放进工作区")
+	}
 	safe := safeTableName(name)
 	if safe == "" || safe == "." {
 		safe = attachmentID
@@ -118,15 +121,15 @@ func (s *scratch) edit(rel, oldText, newText string) (string, error) {
 }
 
 func fileCatalog(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch) string {
-	rows, err := pool.Query(ctx, `SELECT id, COALESCE(original_name, id), file_path FROM attachments WHERE user_id=$1 AND conversation_id=$2 ORDER BY created_at DESC LIMIT 40`, in.UserID, in.ConversationID)
+	rows, err := pool.Query(ctx, `SELECT id, COALESCE(original_name, id), file_path, COALESCE(pdf_status,'') FROM attachments WHERE user_id=$1 AND conversation_id=$2 ORDER BY created_at DESC LIMIT 40`, in.UserID, in.ConversationID)
 	if err != nil {
 		return ""
 	}
 	defer rows.Close()
 	var lines []string
 	for rows.Next() {
-		var id, name, path string
-		if err = rows.Scan(&id, &name, &path); err != nil {
+		var id, name, path, pdfStatus string
+		if err = rows.Scan(&id, &name, &path, &pdfStatus); err != nil {
 			return ""
 		}
 		bucket := "input"
@@ -134,6 +137,18 @@ func fileCatalog(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 			bucket = "output"
 		}
 		where := "需要 download_file"
+		if strings.HasSuffix(strings.ToLower(name), ".pdf") {
+			switch pdfStatus {
+			case "indexed":
+				where = "已解析，不要下载"
+			case "too_short":
+				where = "文本过少，未入库，不要下载"
+			case "failed":
+				where = "解析失败，不要下载"
+			default:
+				where = "尚未解析，不要下载"
+			}
+		}
 		if work != nil {
 			if _, err := os.Stat(filepath.Join(work.root, "input", safeTableName(name))); err == nil {
 				where = "已在 input/" + safeTableName(name)

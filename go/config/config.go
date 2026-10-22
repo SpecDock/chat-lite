@@ -11,6 +11,8 @@ import (
 type File struct {
 	Server    Server    `yaml:"server"`
 	Postgres  Postgres  `yaml:"postgres"`
+	Redis     Redis     `yaml:"redis"`
+	Kafka     Kafka     `yaml:"kafka"`
 	LLM       LLM       `yaml:"llm"`
 	Embedding Embedding `yaml:"embedding"`
 	Tavily    Tavily    `yaml:"tavily"`
@@ -39,6 +41,37 @@ type Server struct {
 
 type Postgres struct {
 	URL string `yaml:"url"`
+}
+
+type Redis struct {
+	Addr     string `yaml:"addr"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
+}
+
+type Kafka struct {
+	Brokers string `yaml:"brokers"`
+	Topic   string `yaml:"topic"`
+}
+
+func (k Kafka) BrokerList() []string {
+	parts := strings.Split(k.Brokers, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func (k Kafka) TopicName() string {
+	topic := strings.TrimSpace(k.Topic)
+	if topic == "" {
+		return "chatlite-context"
+	}
+	return topic
 }
 
 type LLM struct {
@@ -127,6 +160,9 @@ func Load() (File, error) {
 	}
 	if loaded.LLM.MaxAttempts > 3 {
 		loaded.LLM.MaxAttempts = 3
+	}
+	if strings.TrimSpace(loaded.Kafka.Topic) == "" {
+		loaded.Kafka.Topic = "chatlite-context"
 	}
 	current = loaded
 	return loaded, nil

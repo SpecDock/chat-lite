@@ -17,9 +17,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"chatlite/config"
+	"chatlite/internal/infrastructure/contextkafka"
+	"chatlite/internal/infrastructure/contextstore"
 	"chatlite/internal/infrastructure/postgres"
 	"chatlite/internal/interfaces/httpapi"
-	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 )
 
@@ -40,6 +42,24 @@ func main() {
 		if err := postgres.ApplySchema(ctx, pool, cfg.Server.SchemaPath); err != nil {
 			log.Fatal(err)
 		}
+	}
+	if len(cfg.Kafka.BrokerList()) > 0 && strings.TrimSpace(cfg.Redis.Addr) != "" {
+		if pool == nil {
+			log.Fatal("kafka 已配置但 postgres 未配置")
+		}
+		store, err := contextstore.Open(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+		if err != nil {
+			log.Fatal(err)
+		}
+		runtime, err := contextkafka.Start(cfg.Kafka.BrokerList(), cfg.Kafka.TopicName(), store, pool)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer func() {
+			if err := runtime.Close(); err != nil {
+				log.Printf("[context-kafka] close_failed err=%v", err)
+			}
+		}()
 	}
 
 	mux := http.NewServeMux()

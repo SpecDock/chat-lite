@@ -10,19 +10,29 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"chatlite/config"
 	"chatlite/internal/application/chat"
-	"chatlite/internal/application/storagequota"
 	"chatlite/internal/application/rag"
+	"chatlite/internal/application/storagequota"
 	"chatlite/internal/domain/visibility"
+	"chatlite/internal/infrastructure/contextkafka"
+	"chatlite/internal/infrastructure/contextstore"
 	"chatlite/internal/infrastructure/llm"
 	"chatlite/internal/infrastructure/storage"
-	"chatlite/config"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
+)
+
+var (
+	contextStoreOnce sync.Once
+	contextStoreVal  *contextstore.Store
+	contextStoreErr  error
 )
 
 func (a *App) registerChat(mux *http.ServeMux) {
@@ -42,6 +52,12 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	var firstTurn bool
 	ctx := r.Context()
 	var assistantPersisted bool
+	var releaseContext func()
+	defer func() {
+		if releaseContext != nil {
+			releaseContext()
+		}
+	}()
 	if editID != "" {
 		if conversationID == "" {
 			httpx.Error(w, 400, "编辑消息必须指定会话")
@@ -60,6 +76,11 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, 409, "会话正在生成回复")
 			return
 		}
+		release, ok := a.beginContextLock(w, conversationID)
+		if !ok {
+			return
+		}
+		releaseContext = release
 		pair, err := a.getMessagePair(ctx, conversationID, user.UserID, editID)
 		if err != nil {
 			httpx.Error(w, 500, "服务器错误")
@@ -153,6 +174,11 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		release, ok := a.beginContextLock(w, conversationID)
+		if !ok {
+			return
+		}
+		releaseContext = release
 		if len(attachmentIDs) > 0 {
 			count, err := a.countValidAttachments(ctx, attachmentIDs, user.UserID, conversationID)
 			if err != nil {
@@ -160,7 +186,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if count != len(attachmentIDs) {
-				httpx.Error(w, 400, "包含无效图片或表格附件")
+				httpx.Error(w, 400, "包含无效图片、表格或 PDF 附件")
 				return
 			}
 		}
@@ -187,7 +213,10 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			_ = a.updateAutoTitle(ctx, conversationID, user.UserID, safeTitle(userInput))
 		}
 	}
-	rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: userMessageID, Role: "user", Content: a.userMessageContent(ctx, userInput, attachmentIDs), Status: "completed"})
+	hasPDF := a.turnHasPDF(ctx, attachmentIDs)
+	if !hasPDF {
+		rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: userMessageID, Role: "user", Content: a.userMessageContent(ctx, userInput, attachmentIDs), Status: "completed"})
+	}
 	emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": map[bool]string{true: "user_message_edited", false: "user_message"}[editMode != ""]})
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -199,12 +228,21 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		meta["mode"] = editMode
 	}
 	writeSSE(w, flusher, "meta", meta)
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	runCtx, gen, endRun := beginGeneration(conversationID, assistantID, user.UserID)
+	defer endRun()
+	clientGone := make(chan struct{})
 	go func() {
 		<-r.Context().Done()
-		cancel()
+		close(clientGone)
 	}()
+	writeLive := func(event string, data any) {
+		select {
+		case <-clientGone:
+			return
+		default:
+			writeSSE(w, flusher, event, data)
+		}
+	}
 	var full, stored, execution string
 	var thinkStarted, thinkClosed, executionInserted bool
 	var executionAt, finalStart int
@@ -216,7 +254,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			stored += "<think>\n"
 		}
 		stored += text + "\n"
-		writeSSE(w, flusher, "think", map[string]any{"text": text})
+		writeLive("think", map[string]any{"text": text})
 	}
 	closeThink := func() {
 		if !thinkStarted || thinkClosed {
@@ -236,6 +274,11 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		finalStart = len(stored)
 	}
 	var saved []any
+	appendThink("正在思考")
+	if hasPDF {
+		extra := a.parseTurnPDFs(ctx, user.UserID, conversationID, attachmentIDs, appendThink)
+		a.indexTurnWithPDF(ctx, user.UserID, conversationID, userMessageID, userInput, attachmentIDs, extra)
+	}
 	if prepared.NeedsSummary {
 		appendThink("正在生成摘要")
 		if prepared.RunSummary(runCtx, a.Pool, user.UserID, conversationID) {
@@ -244,39 +287,45 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			summary = prepared.Summary
 		}
 	}
-	err := chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), AttachmentIDs: attachmentIDs, History: history, Prior: chat.LoadSnapshot(ctx, a.Pool, conversationID, user.UserID), Saved: &saved}, func(event chat.Event) {
-		switch event.Type {
-		case "think":
-			appendThink(event.Text)
-		case "delta":
-			placeExecution(true)
-			closeThink()
-			full += event.Text
-			stored += event.Text
-			writeSSE(w, flusher, "delta", map[string]any{"text": event.Text})
-		case "execution":
-			block := encodeExecution(event.Language, event.Code, event.Output)
-			execution += block + "\n\n"
-			if executionInserted {
-				bodyText := ""
-				if finalStart <= len(stored) {
-					bodyText = stored[finalStart:]
-				}
-				stored = stored[:executionAt] + execution + bodyText
-				finalStart = executionAt + len(execution)
-			} else {
+	prior, persist, loadErr := a.loadPrior(ctx, conversationID, user.UserID, assistantID)
+	var err error
+	if loadErr != nil {
+		err = loadErr
+	} else {
+		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist}, func(event chat.Event) {
+			switch event.Type {
+			case "think":
+				appendThink(event.Text)
+			case "delta":
 				placeExecution(true)
+				closeThink()
+				full += event.Text
+				stored += event.Text
+				writeLive("delta", map[string]any{"text": event.Text})
+			case "execution":
+				block := encodeExecution(event.Language, event.Code, event.Output)
+				execution += block + "\n\n"
+				if executionInserted {
+					bodyText := ""
+					if finalStart <= len(stored) {
+						bodyText = stored[finalStart:]
+					}
+					stored = stored[:executionAt] + execution + bodyText
+					finalStart = executionAt + len(execution)
+				} else {
+					placeExecution(true)
+				}
+				writeLive("execution", map[string]any{"language": event.Language, "code": event.Code, "output": event.Output})
+			case "usage":
+				captured = mergeUsage(captured, event.Usage)
 			}
-			writeSSE(w, flusher, "execution", map[string]any{"language": event.Language, "code": event.Code, "output": event.Output})
-		case "usage":
-			captured = mergeUsage(captured, event.Usage)
-		}
-	})
+		})
+	}
 	if err == nil && strings.TrimSpace(full) == "" && !strings.Contains(stored, "](/api/files/att_") {
 		appendThink("主模型未返回正文，请尝试重新提问或调整描述。")
 		full = "主模型未返回正文，请尝试重新提问或调整描述。"
 	}
-	if err == nil {
+	if err == nil && runCtx.Err() == nil {
 		placeExecution(false)
 		if thinkStarted && !thinkClosed {
 			stored += "</think>"
@@ -288,23 +337,49 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		if completed == "" {
 			completed = "（助手未返回内容）"
 		}
-		_ = a.finishMessage(ctx, assistantID, user.UserID, completed, "completed")
-		a.saveContextSnapshot(conversationID, user.UserID, assistantID, saved)
-		if firstTurn {
-			chat.ScheduleTitle(a.Pool, user.UserID, conversationID, userInput, completed, func() {
-				emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "title_updated"})
-			})
+		wrote := gen.commit(func() {
+			_ = a.finishMessage(context.Background(), assistantID, user.UserID, completed, "completed")
+			if !kafkaEnabled() {
+				a.saveContextSnapshot(conversationID, user.UserID, assistantID, saved)
+			}
+			if firstTurn {
+				chat.ScheduleTitle(a.Pool, user.UserID, conversationID, userInput, completed, func() {
+					emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "title_updated"})
+				})
+			}
+			rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: assistantID, Role: "assistant", Content: completed, Status: "completed"})
+			a.recordUsage(context.Background(), user.UserID, conversationID, assistantID, userInput, history, completed, captured)
+			a.touchConversation(context.Background(), conversationID, user.UserID)
+		})
+		if wrote {
+			emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_completed"})
+			emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "updated"})
+			writeLive("done", map[string]any{"ok": true})
+			return
 		}
-		rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: assistantID, Role: "assistant", Content: completed, Status: "completed"})
-		a.recordUsage(ctx, user.UserID, conversationID, assistantID, userInput, history, completed, captured)
-		a.touchConversation(context.Background(), conversationID, user.UserID)
-		emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_completed"})
-		emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "updated"})
-		writeSSE(w, flusher, "done", map[string]any{"ok": true})
-		return
 	}
 	var partial *chat.PartialError
-	aborted := errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "请求已取消") || r.Context().Err() != nil
+	cancelled := runCtx.Err() != nil || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "请求已取消")
+	if cancelled {
+		a.recordUsage(context.Background(), user.UserID, conversationID, assistantID, userInput, history, "已取消", captured)
+		if !kafkaEnabled() {
+			a.saveCancelledContext(conversationID, user.UserID, assistantID)
+		}
+		text := stored
+		if text == "" {
+			text = full
+		}
+		if text == "" {
+			text = "已取消"
+		}
+		_ = a.finishMessage(context.Background(), assistantID, user.UserID, text, "interrupted")
+		a.touchConversation(context.Background(), conversationID, user.UserID)
+		emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_interrupted"})
+		emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "updated"})
+		writeLive("cancelled", map[string]any{"ok": true})
+		return
+	}
+	aborted := false
 	if errors.As(err, &partial) && strings.TrimSpace(full+partial.Text) != "" {
 		placeExecution(false)
 		if thinkStarted && !thinkClosed {
@@ -314,14 +389,14 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		notice := "\n\n> 回答生成过程中连接中断，已保留当前内容。你可以让我继续。"
 		full += notice
 		stored += notice
-		writeSSE(w, flusher, "delta", map[string]any{"text": notice})
+		writeLive("delta", map[string]any{"text": notice})
 		_ = a.finishMessage(context.Background(), assistantID, user.UserID, stored, "interrupted")
 		rag.IndexChatMessage(a.Pool, rag.IndexInput{UserID: user.UserID, ConversationID: conversationID, MessageID: assistantID, Role: "assistant", Content: stored, Status: "interrupted"})
 		a.recordUsage(context.Background(), user.UserID, conversationID, assistantID, userInput, history, stored, captured)
 		a.touchConversation(context.Background(), conversationID, user.UserID)
 		emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_interrupted"})
 		emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "updated"})
-		writeSSE(w, flusher, "cancelled", map[string]any{"ok": true, "reason": "model_interrupted"})
+		writeLive("cancelled", map[string]any{"ok": true, "reason": "model_interrupted"})
 		return
 	}
 	if aborted {
@@ -342,7 +417,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		a.touchConversation(context.Background(), conversationID, user.UserID)
 		emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_interrupted"})
 		emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "updated"})
-		writeSSE(w, flusher, "cancelled", map[string]any{"ok": true})
+		writeLive("cancelled", map[string]any{"ok": true})
 		return
 	}
 	msg := userFacing(err)
@@ -463,6 +538,192 @@ func (a *App) loadHistory(ctx context.Context, conversationID, userID, exclude s
 	return newest
 }
 
+func openContextStore() (*contextstore.Store, bool, error) {
+	cfg := config.Current().Redis
+	if strings.TrimSpace(cfg.Addr) == "" {
+		return nil, false, nil
+	}
+	contextStoreOnce.Do(func() {
+		store, err := contextstore.Open(cfg.Addr, cfg.Password, cfg.DB)
+		if err != nil {
+			contextStoreErr = err
+			return
+		}
+		contextStoreVal = store
+	})
+	if contextStoreErr != nil {
+		return nil, true, contextStoreErr
+	}
+	if contextStoreVal == nil {
+		return nil, true, errors.New("contextstore: redis 未初始化")
+	}
+	return contextStoreVal, true, nil
+}
+
+func (a *App) beginContextLock(w http.ResponseWriter, conversationID string) (func(), bool) {
+	release, err := holdContextLock(conversationID)
+	if err != nil {
+		if errors.Is(err, contextstore.ErrSessionBusy) {
+			httpx.Error(w, 409, "会话正在生成")
+			return nil, false
+		}
+		log.Printf("[context-lock] conversation=%s err=%v", conversationID, err)
+		httpx.Error(w, 500, "服务器错误")
+		return nil, false
+	}
+	return release, true
+}
+
+func holdContextLock(conversationID string) (func(), error) {
+	store, enabled, err := openContextStore()
+	if !enabled {
+		return func() {}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	token, err := store.Lock(context.Background(), conversationID)
+	if err != nil {
+		return nil, err
+	}
+	renewCtx, stopRenew := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				if renewErr := store.Renew(context.Background(), conversationID, token); renewErr != nil {
+					log.Printf("[context-lock] conversation=%s renew_failed err=%v", conversationID, renewErr)
+				}
+			}
+		}
+	}()
+	return func() {
+		stopRenew()
+		if unlockErr := store.Unlock(context.Background(), conversationID, token); unlockErr != nil {
+			log.Printf("[context-lock] conversation=%s unlock_failed err=%v", conversationID, unlockErr)
+		}
+	}, nil
+}
+
+func kafkaEnabled() bool {
+	return len(config.Current().Kafka.BrokerList()) > 0
+}
+
+func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID string) ([]any, func([]any) error, error) {
+	store, enabled, err := openContextStore()
+	if !enabled {
+		return chat.LoadSnapshot(ctx, a.Pool, conversationID, userID), nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	version, _, rawMessages, ok, err := store.Load(context.Background(), conversationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var prior []any
+	expected := 0
+	if ok {
+		prior, err = decodeContextMessages(rawMessages)
+		if err != nil {
+			return nil, nil, err
+		}
+		expected = version
+	} else {
+		var sourceVersion int
+		prior, sourceVersion = chat.LoadSnapshotSource(ctx, a.Pool, conversationID, userID)
+		dbVersion, dbOK, dbErr := store.DBVersion(context.Background(), conversationID)
+		if dbErr != nil {
+			return nil, nil, dbErr
+		}
+		expected = sourceVersion
+		if dbOK && dbVersion > expected {
+			expected = dbVersion
+		}
+		if len(prior) > 0 {
+			raw, marshalErr := json.Marshal(prior)
+			if marshalErr != nil {
+				log.Printf("[context-store] conversation=%s warm_marshal_failed err=%v", conversationID, marshalErr)
+			} else if warmErr := store.Warm(context.Background(), conversationID, expected, time.Now().Unix(), raw); warmErr != nil {
+				log.Printf("[context-store] conversation=%s warm_failed err=%v", conversationID, warmErr)
+			}
+		}
+	}
+	persist := func(messages []any) error {
+		raw, marshalErr := json.Marshal(messages)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		updatedUnix := time.Now().Unix()
+		newVersion, saved, saveErr := store.SaveCAS(context.Background(), conversationID, expected, updatedUnix, raw)
+		if saveErr != nil {
+			return saveErr
+		}
+		if !saved {
+			return errors.New("上下文版本冲突")
+		}
+		expected = newVersion
+		if kafkaEnabled() {
+			if pubErr := contextkafka.Publish(context.Background(), contextkafka.SnapshotEvent{
+				ConversationID: conversationID,
+				UserID:         userID,
+				MessageID:      assistantID,
+				Version:        newVersion,
+				UpdatedUnix:    updatedUnix,
+				Messages:       raw,
+			}); pubErr != nil {
+				log.Printf("[context-kafka] conversation=%s version=%d publish_failed err=%v", conversationID, newVersion, pubErr)
+			}
+		}
+		return nil
+	}
+	return prior, persist, nil
+}
+
+func (a *App) saveCancelledContext(conversationID, userID, assistantID string) {
+	store, enabled, err := openContextStore()
+	if !enabled {
+		return
+	}
+	if err != nil {
+		log.Printf("[context-store] conversation=%s cancel_load_failed err=%v", conversationID, err)
+		return
+	}
+	_, _, rawMessages, ok, err := store.Load(context.Background(), conversationID)
+	if err != nil {
+		log.Printf("[context-store] conversation=%s cancel_load_failed err=%v", conversationID, err)
+		return
+	}
+	if !ok {
+		return
+	}
+	messages, err := decodeContextMessages(rawMessages)
+	if err != nil {
+		log.Printf("[context-store] conversation=%s cancel_decode_failed err=%v", conversationID, err)
+		return
+	}
+	if len(messages) == 0 {
+		return
+	}
+	a.saveContextSnapshot(conversationID, userID, assistantID, messages)
+}
+
+func decodeContextMessages(raw json.RawMessage) ([]any, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var messages []any
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 func (a *App) saveContextSnapshot(conversationID, userID, messageID string, messages []any) {
 	if len(messages) == 0 {
 		return
@@ -494,7 +755,11 @@ func (a *App) insertMessage(ctx context.Context, id, userID, conversationID, rol
 }
 
 func (a *App) finishMessage(ctx context.Context, id, userID, content, status string) error {
-	_, err := a.Pool.Exec(ctx, `UPDATE messages SET content=$1, status=$2 WHERE id=$3 AND user_id=$4`, content, status, id, userID)
+	query := `UPDATE messages SET content=$1, status=$2 WHERE id=$3 AND user_id=$4`
+	if status == "completed" {
+		query += ` AND status='streaming'`
+	}
+	_, err := a.Pool.Exec(ctx, query, content, status, id, userID)
 	if err == nil {
 		a.syncSearchDocument(ctx, id)
 	}
@@ -539,7 +804,7 @@ func (a *App) countValidAttachments(ctx context.Context, ids []string, userID, c
 		args = append(args, id)
 	}
 	args = append(args, userID, conversationID)
-	rows, err := a.Pool.Query(ctx, `SELECT id, file_path FROM attachments WHERE id IN (`+placeholders(len(ids), 1)+`) AND user_id=$`+itoa(len(ids)+1)+` AND conversation_id=$`+itoa(len(ids)+2)+` AND message_id IS NULL AND (mime_type LIKE 'image/%' OR lower(original_name) LIKE '%.csv' OR lower(original_name) LIKE '%.xlsx')`, args...)
+	rows, err := a.Pool.Query(ctx, `SELECT id, file_path FROM attachments WHERE id IN (`+placeholders(len(ids), 1)+`) AND user_id=$`+itoa(len(ids)+1)+` AND conversation_id=$`+itoa(len(ids)+2)+` AND message_id IS NULL AND (mime_type LIKE 'image/%' OR lower(original_name) LIKE '%.csv' OR lower(original_name) LIKE '%.xlsx' OR lower(original_name) LIKE '%.pdf' OR mime_type='application/pdf')`, args...)
 	if err != nil {
 		return 0, err
 	}

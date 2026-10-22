@@ -54,7 +54,9 @@ WORKDIR /app
 ENV NODE_ENV=production
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; fi \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && apt-get install -y --no-install-recommends ca-certificates wget poppler-utils python3 python3-pip \
+    && (python3 -m pip install --no-cache-dir --break-system-packages -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com pdfplumber \
+        || python3 -m pip install --no-cache-dir --break-system-packages pdfplumber) \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=compile /out/chat-lite /app/chat-lite
 COPY --from=web /app/dist /app/dist

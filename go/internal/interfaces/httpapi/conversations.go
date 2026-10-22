@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 
@@ -53,6 +54,7 @@ func (a *App) registerConversations(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/conversations/{id}", a.withAuth(a.getConversationRoute))
 	mux.HandleFunc("PATCH /api/conversations/{id}", a.withAuth(a.patchConversation))
 	mux.HandleFunc("DELETE /api/conversations/{id}", a.withAuth(a.deleteConversationRoute))
+	mux.HandleFunc("POST /api/conversations/{id}/stop", a.withAuth(a.stopConversationRoute))
 	mux.HandleFunc("GET /api/conversations/{id}/messages", a.withAuth(a.listMessagesRoute))
 	mux.HandleFunc("DELETE /api/conversations/{id}/messages/{messageId}", a.withAuth(a.deleteMessagePairRoute))
 }
@@ -355,6 +357,104 @@ func (a *App) conversationExists(ctx context.Context, id, userID string) (bool, 
 		return false, nil
 	}
 	return err == nil, err
+}
+
+type liveGeneration struct {
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	assistantID string
+	userID      string
+	stopped     bool
+	committed   bool
+}
+
+var liveGenerations sync.Map
+
+func beginGeneration(conversationID, assistantID, userID string) (context.Context, *liveGeneration, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	gen := &liveGeneration{cancel: cancel, assistantID: assistantID, userID: userID}
+	liveGenerations.Store(conversationID, gen)
+	return ctx, gen, func() {
+		if current, ok := liveGenerations.Load(conversationID); ok && current == gen {
+			liveGenerations.Delete(conversationID)
+		}
+	}
+}
+
+func (g *liveGeneration) commit(fn func()) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return false
+	}
+	fn()
+	g.committed = true
+	return true
+}
+
+func cancelGeneration(conversationID string) (assistantID, userID string, revert bool) {
+	current, ok := liveGenerations.Load(conversationID)
+	if !ok {
+		return "", "", false
+	}
+	gen := current.(*liveGeneration)
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	gen.stopped = true
+	if gen.cancel != nil {
+		gen.cancel()
+	}
+	return gen.assistantID, gen.userID, gen.committed
+}
+
+func (a *App) stopConversationRoute(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	user := authFrom(r)
+	assistantID, ownerID, committed := cancelGeneration(id)
+	exists, err := a.conversationExists(r.Context(), id, user.UserID)
+	if err != nil {
+		httpx.Error(w, 500, "服务器错误")
+		return
+	}
+	if !exists {
+		httpx.Error(w, 404, "会话不存在")
+		return
+	}
+	if ownerID != "" && ownerID != user.UserID {
+		httpx.Error(w, 403, "无权停止该会话")
+		return
+	}
+	if assistantID != "" && committed {
+		// runCtx is already cancelled. A committed reply stays completed.
+	} else if assistantID == "" {
+		if err = a.interruptStreaming(r.Context(), id, user.UserID, ""); err != nil {
+			httpx.Error(w, 500, "停止生成失败")
+			return
+		}
+	}
+	httpx.WriteJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (a *App) discardAssistant(ctx context.Context, conversationID, userID, assistantID string, revertSnapshot bool) {
+	if assistantID == "" {
+		return
+	}
+	_, _ = a.Pool.Exec(ctx, `UPDATE messages SET status='interrupted', content='已取消' WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND role='assistant' AND status IN ('streaming','completed')`, assistantID, userID, conversationID)
+	rag.DeleteMessage(ctx, a.Pool, userID, assistantID)
+	if revertSnapshot {
+		chat.InvalidateSnapshots(ctx, a.Pool, conversationID, userID)
+	}
+}
+
+func (a *App) interruptStreaming(ctx context.Context, conversationID, userID, messageID string) error {
+	query := `UPDATE messages SET status='interrupted', content=CASE WHEN COALESCE(content, '') = '' THEN '已取消' ELSE content END WHERE conversation_id=$1 AND user_id=$2 AND role='assistant' AND status='streaming'`
+	args := []any{conversationID, userID}
+	if messageID != "" {
+		query += ` AND id=$3`
+		args = append(args, messageID)
+	}
+	_, err := a.Pool.Exec(ctx, query, args...)
+	return err
 }
 
 func (a *App) hasStreaming(ctx context.Context, conversationID, userID string) (bool, error) {

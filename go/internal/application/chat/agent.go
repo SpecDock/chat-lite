@@ -48,6 +48,7 @@ const systemPrompt = `你是 Chat Lite 的对话助手。每一轮都使用同�
 - web_search：实时信息、事实核验、用户明确要求搜索，或重要证据不足。
 - view_image：查看历史用户图或生成图。当前轮上传图片已直接可见，不要为此调用。搜索依赖图片内容时先 view_image；用户已给出独立完整搜索主题时可直接 web_search。
 - 表格和文件分析只在临时工作区进行。本轮附件已在 input/。用 write_file 写脚本，再用 run_python 运行该路径。失败时用 edit_file 改出错的一段，不要重写整个文件。只有文件清单里更早的附件才调用 download_file。留给用户的结果写入 output/。
+- PDF 由服务端解析。不要用 download_file 或 run_python 读取 PDF。短文会附在消息里；长文通过检索使用。文本过少或解析失败时没有正文。
 
 ## 上下文
 - RAG 与图片候选追加在当前用户消息之后，不插入系统提示或历史中间。RAG 只在与当前问题相关时使用，否则忽略。`
@@ -67,6 +68,7 @@ type Input struct {
 	History                                    []HistoryItem
 	Prior                                      []any
 	Saved                                      *[]any
+	Persist                                    func(messages []any) error
 }
 
 type imageCandidate struct {
@@ -155,6 +157,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		}
 		messages = append(messages, assistant)
 		if len(delta.ToolCalls) == 0 {
+			if err := persistStep(in.Persist, messages); err != nil {
+				return err
+			}
 			streamed = delta.Text
 			answered = true
 			break
@@ -170,10 +175,16 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			for _, event := range events {
 				emit(event)
 			}
+			if ctx.Err() != nil {
+				return abortErr()
+			}
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": call.ID, "content": content})
 			if viewedImage != nil {
 				viewed = append(viewed, viewedImage)
 			}
+		}
+		if ctx.Err() != nil {
+			return abortErr()
 		}
 		if len(viewed) > 0 {
 			parts := []any{map[string]any{"type": "text", "text": "这是通过 view_image 选中的历史图片。请基于图片本体继续。"}}
@@ -181,6 +192,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 				parts = append(parts, image)
 			}
 			messages = append(messages, map[string]any{"role": "user", "content": parts})
+		}
+		if err := persistStep(in.Persist, messages); err != nil {
+			return err
 		}
 	}
 	if !answered {
@@ -210,6 +224,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			assistant["reasoning_content"] = delta.ReasoningContent
 		}
 		messages = append(messages, assistant)
+		if err := persistStep(in.Persist, messages); err != nil {
+			return err
+		}
 	}
 	if answered && strings.TrimSpace(visibility.StripThinkBlocks(streamed)) == "" {
 		emit(Event{Type: "think", Text: "主模型未返回正文。"})
@@ -683,18 +700,25 @@ func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 	if len(in.AttachmentIDs) == 0 {
 		return in.UserInput
 	}
-	var notes []string
+	var tableNotes []string
+	var pdfNotes []string
 	var parts []any
 	text := in.UserInput
 	for _, id := range in.AttachmentIDs {
 		var name, filePath, mime string
 		var size int64
-		err := pool.QueryRow(ctx, `SELECT original_name, file_path, mime_type, size FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, id, in.UserID, in.ConversationID).Scan(&name, &filePath, &mime, &size)
+		var pdfStatus, pdfInline *string
+		var pdfChars *int
+		err := pool.QueryRow(ctx, `SELECT original_name, file_path, mime_type, size, pdf_status, pdf_chars, pdf_inline FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, id, in.UserID, in.ConversationID).Scan(&name, &filePath, &mime, &size, &pdfStatus, &pdfChars, &pdfInline)
 		if err != nil || !paths.IsWorkspaceAttachment(filePath, in.ConversationID, "input") {
 			continue
 		}
+		if isPDFName(name, mime) {
+			pdfNotes = append(pdfNotes, pdfContextNote(name, pdfStatus, pdfChars, pdfInline))
+			continue
+		}
 		if isTableName(name) {
-			notes = append(notes, fmt.Sprintf("%s=%s，虚拟路径=input/%s，MIME=%s，大小=%d字节", name, id, safeTableName(name), mime, size))
+			tableNotes = append(tableNotes, fmt.Sprintf("%s=%s，虚拟路径=input/%s，MIME=%s，大小=%d字节", name, id, safeTableName(name), mime, size))
 			continue
 		}
 		if !strings.HasPrefix(mime, "image/") {
@@ -709,8 +733,15 @@ func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 		}
 		parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(buf)}})
 	}
-	if len(notes) > 0 {
-		note := "\n\n本轮文件已在临时 input/。先 write_file 写 .py，再 run_python 运行该路径；新结果写入 output/：" + strings.Join(notes, "；")
+	var extra []string
+	if len(pdfNotes) > 0 {
+		extra = append(extra, strings.Join(pdfNotes, "\n"))
+	}
+	if len(tableNotes) > 0 {
+		extra = append(extra, "本轮文件已在临时 input/。先 write_file 写 .py，再 run_python 运行该路径；新结果写入 output/："+strings.Join(tableNotes, "；"))
+	}
+	if len(extra) > 0 {
+		note := "\n\n" + strings.Join(extra, "\n")
 		if len(parts) == 0 {
 			return text + note
 		}
@@ -720,6 +751,39 @@ func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 		return text
 	}
 	return parts
+}
+
+func isPDFName(name, mime string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".pdf") || strings.EqualFold(mime, "application/pdf")
+}
+
+func pdfContextNote(name string, status *string, chars *int, inline *string) string {
+	label := name
+	if strings.TrimSpace(label) == "" {
+		label = "PDF"
+	}
+	state := ""
+	if status != nil {
+		state = *status
+	}
+	n := 0
+	if chars != nil {
+		n = *chars
+	}
+	switch state {
+	case "indexed":
+		line := fmt.Sprintf("%s：已解析，约 %d 字。", label, n)
+		if inline != nil && strings.TrimSpace(*inline) != "" {
+			return line + "\n" + strings.TrimSpace(*inline)
+		}
+		return line + "正文通过检索使用，不要用代码读取。"
+	case "too_short":
+		return label + "：文本过少，未入库。"
+	case "failed":
+		return label + "：解析失败，未入库。"
+	default:
+		return label + "：尚未解析。"
+	}
 }
 
 func loadCandidates(ctx context.Context, pool *pgxpool.Pool, in Input) []imageCandidate {
@@ -858,6 +922,13 @@ func (e *PartialError) Error() string { return "回答生成过程中连接中�
 func (e *PartialError) Unwrap() error { return e.Err }
 
 func abortErr() error { return fmt.Errorf("请求已取消") }
+
+func persistStep(persist func([]any) error, messages []any) error {
+	if persist == nil {
+		return nil
+	}
+	return persist(messages)
+}
 
 func httpNew(ctx context.Context, url, key string, body []byte) (func() ([]byte, int, error), error) {
 	return func() ([]byte, int, error) {

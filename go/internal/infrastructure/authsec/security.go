@@ -1,7 +1,9 @@
 package authsec
 
 import (
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,3 +100,16 @@ func AllowedTable(mime string) bool {
 }
 
 const TableUploadMaxBytes int64 = 100 * 1024 * 1024
+const PDFUploadMaxBytes int64 = 32 * 1024 * 1024
+
+func AllowedPDF(name, mimeType string) bool {
+	if strings.ToLower(filepath.Ext(name)) != ".pdf" {
+		return false
+	}
+	switch strings.ToLower(mimeType) {
+	case "", "application/pdf", "application/octet-stream", "application/x-pdf":
+		return true
+	default:
+		return false
+	}
+}

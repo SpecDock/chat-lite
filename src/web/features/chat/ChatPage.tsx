@@ -482,6 +482,10 @@ type StreamOptions = {
   alignMeta: (data: ChatStreamData, assistantMessageId: string) => void;
 };
 
+function retainInterrupted(message: MessageDTO): MessageDTO {
+  return { ...message, content: message.content.trim() ? message.content : '已取消', status: 'interrupted' };
+}
+
 export default function ChatPage({ user, initialScroll, onLogout }: { user: UserDTO; initialScroll: 'restore' | 'bottom'; onLogout: () => void }) {
   const storageKey = `chat-lite:last-conversation:${user.id}`;
   const activityStorageKey = `chat-lite:conversation-activity:${user.id}`;
@@ -513,6 +517,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const restoredRef = useRef(false);
   const currentRef = useRef<string | undefined>(undefined);
   const tasksRef = useRef<Map<string, ActiveTask>>(new Map());
+  const stopRequestedRef = useRef(new Set<string>());
   const keyAliasesRef = useRef<Map<string, string>>(new Map());
   const firstUploadConversationRef = useRef<Promise<string> | null>(null);
   const workspaceRequestRef = useRef(0);
@@ -1206,15 +1211,12 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       return undefined;
     });
     if (result && (!isRelevant || isRelevant()) && !tasksRef.current.has(conversationId)) {
+      const stillStreaming = result.messages.some(message => message.status === 'streaming');
+      if (stopRequestedRef.current.has(conversationId)) return result.messages;
       setMessagesByConversation(cache => ({ ...cache, [conversationId]: result.messages }));
       setActivities(currentActivities => {
-        if (result.messages.some(message => message.status === 'streaming')) {
-          return transitionConversationActivity(
-            currentActivities,
-            conversationId,
-            'streaming',
-            currentRef.current === conversationId
-          );
+        if (stillStreaming) {
+          return transitionConversationActivity(currentActivities, conversationId, 'streaming', currentRef.current === conversationId);
         }
         if (currentActivities[conversationId]?.status !== 'streaming') return currentActivities;
         const latestAssistant = [...result.messages].reverse().find(message => message.role === 'assistant');
@@ -1229,6 +1231,17 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     }
     return result?.messages;
   };
+
+  useEffect(() => {
+    if (!currentConversationId || tasksRef.current.has(currentConversationId)) return;
+    if (!messages.some(message => message.status === 'streaming')) return;
+    const conversationId = currentConversationId;
+    const timer = window.setInterval(() => {
+      if (tasksRef.current.has(conversationId) || stopRequestedRef.current.has(conversationId)) return;
+      void refreshMessages(conversationId);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [currentConversationId, messages]);
 
   const refreshAll = async () => {
     const list = await refreshConversations();
@@ -1350,6 +1363,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
     try {
       await streamChat(options.conversationId, options.text, options.attachmentIds, (event, data) => {
+      if (options.task.cancelRequested) return;
       if (event !== 'delta') flushTaskDelta(options.task);
       if (event === 'meta') {
         assistantMessageId = data.messageId || assistantMessageId;
@@ -1416,7 +1430,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       if (event === 'cancelled') {
         terminalEvent = true;
         updateMessages(targetKey, currentMessages => currentMessages.map(message => message.id === assistantMessageId
-          ? { ...message, content: message.content || '已取消', status: 'interrupted' }
+          ? retainInterrupted(message)
           : message));
         setActivity(targetKey, 'error');
       }
@@ -1440,18 +1454,39 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     return assistantMessageId;
   }
 
+  function releaseStreaming(key: string) {
+    const task = tasksRef.current.get(key);
+    updateMessages(key, currentMessages => currentMessages.map(message => {
+      if ((task && message.id === task.assistantId) || message.status === 'streaming') {
+        return retainInterrupted(message);
+      }
+      return message;
+    }));
+    setActivity(key, 'error');
+    const conversationId = conversationIdForKey(key);
+    if (!conversationId) return;
+    stopRequestedRef.current.add(conversationId);
+    void api.stopGeneration(conversationId).finally(() => {
+      stopRequestedRef.current.delete(conversationId);
+    }).catch(() => undefined);
+  }
+
   function cancelCurrentRequest() {
     const key = currentRef.current || EMPTY_CONVERSATION_KEY;
     const task = tasksRef.current.get(key);
-    if (!task) return;
+    if (!task) {
+      releaseStreaming(key);
+      return;
+    }
     flushTaskDelta(task);
     task.cancelRequested = true;
     task.controller.abort();
+    releaseStreaming(key);
     if (task.operation === 'send') {
       setRefillByConversation(refills => ({ ...refills, [key]: { text: task.sentText, key: (refills[key]?.key || 0) + 1 } }));
     }
     updateMessages(key, currentMessages => currentMessages.map(message => message.id === task.assistantId
-      ? { ...message, content: message.content || '已取消', status: 'interrupted' }
+      ? retainInterrupted(message)
       : message));
     setActivity(key, 'error');
   }
@@ -1520,7 +1555,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       if (cancelled) {
         setRefillByConversation(refills => ({ ...refills, [targetKey]: { text: userText, key: (refills[targetKey]?.key || 0) + 1 } }));
         updateMessages(targetKey, currentMessages => currentMessages.map(message => message.id === task.assistantId
-          ? { ...message, content: message.content || '已取消', status: 'interrupted' }
+          ? retainInterrupted(message)
           : message));
       } else {
         const errorText = cause instanceof Error ? cause.message : '发送失败';
@@ -1635,7 +1670,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       flushTaskDelta(task);
       if (task.cancelRequested || (cause instanceof DOMException && cause.name === 'AbortError')) {
         updateMessages(targetKey, currentMessages => currentMessages.map(candidate => candidate.id === task.assistantId
-          ? { ...candidate, content: candidate.content || '已取消', status: 'interrupted' }
+          ? retainInterrupted(candidate)
           : candidate));
       } else {
         const errorText = cause instanceof Error ? cause.message : '编辑失败';
@@ -1858,7 +1893,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             conversationId={currentConversationId}
             onWorkspace={openWorkspace}
             disabled={interactionBusy || Boolean(editingMessageId) || Boolean(deleteTarget)}
-            sending={Boolean(currentTask)}
+            sending={Boolean(currentTask) || conversationStreaming}
             refillText={refill.text}
             refillKey={refill.key}
             pending={pending}

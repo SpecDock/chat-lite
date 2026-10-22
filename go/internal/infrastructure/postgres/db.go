@@ -35,6 +35,20 @@ func ApplySchema(ctx context.Context, pool *pgxpool.Pool, schemaPath string) err
 	if err != nil {
 		return err
 	}
-	_, err = pool.Exec(ctx, string(body))
+	if _, err = pool.Exec(ctx, string(body)); err != nil {
+		return err
+	}
+	if _, err = pool.Exec(ctx, `ALTER TABLE conversation_context_snapshots ADD COLUMN IF NOT EXISTS source_version INTEGER`); err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_status TEXT`)
+	if err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_chars INTEGER`)
+	if err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `ALTER TABLE attachments ADD COLUMN IF NOT EXISTS pdf_inline TEXT`)
 	return err
 }
