@@ -1,21 +1,21 @@
 services:
   chat-lite:
-    build:
-      context: .
-      args:
-        VITE_STREAM_MARKDOWN_INTERVAL_MS: ${VITE_STREAM_MARKDOWN_INTERVAL_MS:-50}
-    ports:
-      - "3000:3000"
+    build: .
     env_file:
       - .env
     environment:
-      - DATA_DIR=/data
       - NODE_ENV=production
+      - DATA_DIR=/data
+      - UPLOAD_DIR=/data/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
       - table-sandbox-runtime:/run/table-sandbox
     depends_on:
       - table-sandbox
+    ports:
+      - "3000:3000"
     restart: unless-stopped
 
   table-sandbox:

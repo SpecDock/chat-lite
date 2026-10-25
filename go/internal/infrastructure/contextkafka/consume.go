@@ -20,7 +20,7 @@ import (
 	"chatlite/internal/infrastructure/contextstore"
 )
 
-const idleSeconds int64 = 1800
+const idleSeconds int64 = 3 * 24 * 60 * 60
 
 type Runtime struct {
 	writer *kafka.Writer

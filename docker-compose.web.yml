@@ -1,0 +1,30 @@
+networks:
+  default:
+    name: shared
+    external: true
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d
+      - ./deploy/www/chat:/var/www/chat:ro
+      - ./deploy/www/zzxandyl:/var/www/zzxandyl:ro
+      - ./deploy/certbot/www:/var/www/certbot
+      - ./deploy/certbot/conf:/etc/letsencrypt
+    restart: unless-stopped
+    networks:
+      - default
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - ./deploy/certbot/www:/var/www/certbot
+      - ./deploy/certbot/conf:/etc/letsencrypt
+    networks:
+      - default
