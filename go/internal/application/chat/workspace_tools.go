@@ -87,6 +87,24 @@ func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, at
 	return "input/" + safe, nil
 }
 
+func (s *scratch) stageInputFile(name string, body []byte) (string, error) {
+	if s == nil {
+		return "", errScratch("临时工作区不可用")
+	}
+	safe := safeTableName(name)
+	if !strings.HasSuffix(strings.ToLower(safe), ".txt") {
+		safe += ".txt"
+	}
+	target := filepath.Join(s.root, "input", safe)
+	if !paths.IsWithinDirectory(filepath.Join(s.root, "input"), target) {
+		return "", errScratch("文件名无效")
+	}
+	if err := os.WriteFile(target, body, 0o644); err != nil {
+		return "", err
+	}
+	return "input/" + safe, nil
+}
+
 func (s *scratch) write(rel, content string) (string, error) {
 	target, err := s.writable(rel)
 	if err != nil {

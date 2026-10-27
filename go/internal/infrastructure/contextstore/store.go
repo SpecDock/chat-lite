@@ -429,6 +429,22 @@ func (s *Store) ForEachContextID(ctx context.Context, fn func(string) error) err
 	return iter.Err()
 }
 
+func (s *Store) Delete(ctx context.Context, conversationID string) error {
+	rdb, err := s.ready(conversationID)
+	if err != nil {
+		return err
+	}
+	return rdb.Del(ctx, ctxKey(conversationID), lockKey(conversationID), dbKey(conversationID)).Err()
+}
+
+func (s *Store) DeleteContext(ctx context.Context, conversationID string) error {
+	rdb, err := s.ready(conversationID)
+	if err != nil {
+		return err
+	}
+	return rdb.Del(ctx, ctxKey(conversationID)).Err()
+}
+
 func (s *Store) DeleteIdleContext(ctx context.Context, conversationID string, nowUnix, idleSeconds int64) (bool, error) {
 	rdb, err := s.ready(conversationID)
 	if err != nil {

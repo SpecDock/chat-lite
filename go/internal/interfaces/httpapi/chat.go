@@ -279,15 +279,30 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		extra := a.parseTurnPDFs(ctx, user.UserID, conversationID, attachmentIDs, appendThink)
 		a.indexTurnWithPDF(ctx, user.UserID, conversationID, userMessageID, userInput, attachmentIDs, extra)
 	}
+	summarized := false
+	compacted := false
 	if prepared.NeedsSummary {
 		appendThink("正在生成摘要")
-		if prepared.RunSummary(runCtx, a.Pool, user.UserID, conversationID) {
+		toolNotes := chat.ToolStateText(a.liveContextMessages(ctx, conversationID, user.UserID))
+		if prepared.RunSummary(runCtx, a.Pool, user.UserID, conversationID, toolNotes) {
 			appendThink("摘要生成完成")
 			history = prepared.History
 			summary = prepared.Summary
+			summarized = true
+			wrote, err := a.installCompactedContext(conversationID, summary, history)
+			if err != nil {
+				log.Printf("[conversation-context] conversation=%s replace_failed err=%v", conversationID, err)
+				if dropErr := a.dropLiveContext(conversationID); dropErr != nil {
+					log.Printf("[conversation-context] conversation=%s drop_failed err=%v", conversationID, dropErr)
+				}
+			}
+			compacted = wrote
 		}
 	}
 	prior, persist, loadErr := a.loadPrior(ctx, conversationID, user.UserID, assistantID)
+	if summarized && !compacted && loadErr == nil {
+		prior = nil
+	}
 	var err error
 	if loadErr != nil {
 		err = loadErr
@@ -611,6 +626,63 @@ func holdContextLock(conversationID string) (func(), error) {
 
 func kafkaEnabled() bool {
 	return len(config.Current().Kafka.BrokerList()) > 0
+}
+
+func (a *App) liveContextMessages(ctx context.Context, conversationID, userID string) []any {
+	store, enabled, err := openContextStore()
+	if enabled && err == nil {
+		_, _, raw, ok, loadErr := store.Load(context.Background(), conversationID)
+		if loadErr == nil && ok {
+			messages, decodeErr := decodeContextMessages(raw)
+			if decodeErr == nil && len(messages) > 0 {
+				return messages
+			}
+		}
+	}
+	messages, _ := chat.LoadSnapshotSource(ctx, a.Pool, conversationID, userID)
+	return messages
+}
+
+func (a *App) installCompactedContext(conversationID, summary string, history []chat.HistoryItem) (bool, error) {
+	store, enabled, err := openContextStore()
+	if !enabled {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	version, _, _, ok, err := store.Load(context.Background(), conversationID)
+	if err != nil {
+		return false, err
+	}
+	expected := 0
+	if ok {
+		expected = version
+	} else if dbVersion, dbOK, dbErr := store.DBVersion(context.Background(), conversationID); dbErr != nil {
+		return false, dbErr
+	} else if dbOK && dbVersion > expected {
+		expected = dbVersion
+	}
+	raw, err := json.Marshal(chat.PrefixMessages(summary, history))
+	if err != nil {
+		return false, err
+	}
+	_, saved, err := store.SaveCAS(context.Background(), conversationID, expected, time.Now().Unix(), raw)
+	if err != nil {
+		return false, err
+	}
+	if !saved {
+		return false, errors.New("上下文版本冲突")
+	}
+	return true, nil
+}
+
+func (a *App) dropLiveContext(conversationID string) error {
+	store, enabled, err := openContextStore()
+	if !enabled || err != nil {
+		return err
+	}
+	return store.DeleteContext(context.Background(), conversationID)
 }
 
 func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID string) ([]any, func([]any) error, error) {

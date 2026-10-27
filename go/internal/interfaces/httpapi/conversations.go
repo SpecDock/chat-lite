@@ -206,6 +206,7 @@ func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = os.RemoveAll(paths.ConversationWorkspaceDir(id))
 	rag.DeleteConversation(r.Context(), a.Pool, id)
+	dropContextCache(r.Context(), id)
 	emitToUser(user.UserID, "conversation_deleted", map[string]any{"conversationId": id})
 	emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": id, "reason": "deleted"})
 	httpx.WriteJSON(w, 200, map[string]bool{"ok": true})
@@ -289,6 +290,7 @@ func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {
 	if deleted {
 		_ = os.RemoveAll(paths.ConversationWorkspaceDir(conversationID))
 		rag.DeleteConversation(r.Context(), a.Pool, conversationID)
+		dropContextCache(r.Context(), conversationID)
 	} else {
 		rag.DeleteMessage(r.Context(), a.Pool, user.UserID, pair.User.ID)
 		if pair.Assistant != nil {
@@ -522,6 +524,14 @@ func (a *App) deleteConversationData(ctx context.Context, conversationID, userID
 		return nil, err
 	}
 	return files, nil
+}
+
+func dropContextCache(ctx context.Context, conversationID string) {
+	store, enabled, err := openContextStore()
+	if !enabled || err != nil || store == nil {
+		return
+	}
+	_ = store.Delete(ctx, conversationID)
 }
 
 func (a *App) getMessagePair(ctx context.Context, conversationID, userID, userMessageID string) (*messagePair, error) {
