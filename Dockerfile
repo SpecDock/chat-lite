@@ -42,7 +42,8 @@ ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct \
 COPY go/go.mod go/go.sum ./
 RUN go mod download || GOPROXY=https://goproxy.io,direct go mod download || GOPROXY=https://proxy.golang.org,direct go mod download
 COPY go/ ./
-RUN go build -p 1 -trimpath -ldflags="-s -w" -o /out/chat-lite ./cmd/server
+RUN go build -p 1 -trimpath -ldflags="-s -w" -o /out/chat-lite ./cmd/server \
+ && go build -p 1 -trimpath -ldflags="-s -w" -o /out/sandbox-broker ./cmd/sandbox-broker
 
 ########## runner ##########
 FROM ${DEBIAN_IMAGE} AS runner
@@ -55,6 +56,7 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i 's|deb.debian.
         || python3 -m pip install --no-cache-dir --break-system-packages pdfplumber) \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=compile /out/chat-lite /app/chat-lite
+COPY --from=compile /out/sandbox-broker /app/sandbox-broker
 COPY go/schema.sql /app/schema.sql
 COPY go/config /app/config
 EXPOSE 3000

@@ -7,7 +7,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.backend.yml}"
 
 SERVICE_NAME="${SERVICE_NAME:-chat-lite}"
 SANDBOX_SERVICE="table-sandbox"
-SERVICES=("$SERVICE_NAME" "$SANDBOX_SERVICE")
+BROKER_SERVICE="sandbox-broker"
 NO_CACHE="${NO_CACHE:-0}"
 STOP_BEFORE_BUILD="${STOP_BEFORE_BUILD:-1}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
@@ -23,8 +23,8 @@ fi
 
 echo "Using compose file: $COMPOSE_FILE"
 if [ "$STOP_BEFORE_BUILD" = "1" ]; then
-  echo "Stopping $SERVICE_NAME and $SANDBOX_SERVICE before build..."
-  docker compose -f "$COMPOSE_FILE" stop "${SERVICES[@]}" || true
+  echo "Stopping $SERVICE_NAME and $BROKER_SERVICE before build..."
+  docker compose -f "$COMPOSE_FILE" stop "$SERVICE_NAME" "$BROKER_SERVICE" || true
 fi
 
 cache=()
@@ -70,8 +70,8 @@ if ! build_sandbox "$mirror_prefix"; then
   build_sandbox "$official_prefix"
 fi
 
-echo "Recreating services: ${SERVICES[*]}"
-docker compose -f "$COMPOSE_FILE" up -d --no-build --force-recreate "${SERVICES[@]}"
+echo "Recreating services: $SERVICE_NAME $BROKER_SERVICE"
+docker compose -f "$COMPOSE_FILE" up -d --no-build --force-recreate "$SERVICE_NAME" "$BROKER_SERVICE"
 
 echo "Waiting for service to become healthy (up to $((HEALTH_RETRIES * 2))s)..."
 healthy=0

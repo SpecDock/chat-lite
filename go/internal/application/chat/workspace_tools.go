@@ -41,9 +41,19 @@ func openScratch() (*scratch, error) {
 }
 
 func (s *scratch) close() {
-	if s != nil && s.root != "" {
-		_ = os.RemoveAll(s.root)
+	if s != nil {
+		removeJobDir(s.root)
 	}
+}
+
+func removeJobDir(root string) {
+	if root == "" {
+		return
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".sandbox-held")); !os.IsNotExist(err) {
+		return
+	}
+	_ = os.RemoveAll(root)
 }
 
 func (s *scratch) mountCurrent(ctx context.Context, pool *pgxpool.Pool, in Input) {
@@ -267,4 +277,3 @@ type scratchError string
 func (e scratchError) Error() string { return string(e) }
 
 func errScratch(message string) error { return scratchError(message) }
-

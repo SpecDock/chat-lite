@@ -505,7 +505,7 @@ func runPython(ctx context.Context, pool *pgxpool.Pool, in Input, attachmentID, 
 	if err = os.MkdirAll(filepath.Dir(inputPath), 0o755); err != nil {
 		return "", nil, err
 	}
-	defer os.RemoveAll(jobRoot)
+	defer removeJobDir(jobRoot)
 	if err = os.Chmod(jobRoot, 0o1777); err != nil {
 		return "", nil, err
 	}

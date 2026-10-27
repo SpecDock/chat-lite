@@ -1,6 +1,7 @@
 services:
   chat-lite:
     build: .
+    image: chat-lite-backend
     env_file:
       - .env
     environment:
@@ -11,29 +12,25 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
-      - table-sandbox-runtime:/run/table-sandbox
+      - /var/lib/chat-lite/table-sandbox:/run/table-sandbox
     depends_on:
-      - table-sandbox
+      - sandbox-broker
     ports:
       - "3000:3000"
     restart: unless-stopped
 
+  sandbox-broker:
+    image: chat-lite-backend
+    command: ["/app/sandbox-broker"]
+    restart: unless-stopped
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/chat-lite/table-sandbox:/run/table-sandbox
+
   table-sandbox:
+    image: chat-lite-table-sandbox
     build:
       context: .
       dockerfile: sandbox/Dockerfile
-    volumes:
-      - table-sandbox-runtime:/run/table-sandbox
-    read_only: true
-    tmpfs:
-      - /tmp
-    network_mode: none
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    user: "1000:1000"
-    restart: unless-stopped
-
-volumes:
-  table-sandbox-runtime:
+    profiles: ["image"]
