@@ -80,6 +80,24 @@ func (a *App) studioCreate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 400, "不支持的画面风格")
 		return
 	}
+	if len(req.images) == 0 && req.sourceID != "" {
+		copied, err := a.loadStudioReferences(r.Context(), user.UserID, req.sourceID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpx.Error(w, 404, "原图不存在")
+				return
+			}
+			var invalid errString
+			if errors.As(err, &invalid) {
+				httpx.Error(w, 400, invalid.Error())
+				return
+			}
+			log.Printf("[studio] fail stage=copy-references source=%s err=%s", req.sourceID, trimErr(err))
+			httpx.Error(w, 500, "图片生成失败")
+			return
+		}
+		req.images = copied
+	}
 	if len(req.images) > 16 {
 		httpx.Error(w, 400, "参考图最多 16 张")
 		return
@@ -416,8 +434,50 @@ func streamStored(w http.ResponseWriter, r *http.Request, path, mimeType, dispos
 }
 
 type studioReq struct {
-	prompt, aspect, quality, style string
-	images                         []uploads.FileBytes
+	prompt, aspect, quality, style, sourceID string
+	images                                   []uploads.FileBytes
+}
+
+func (a *App) loadStudioReferences(ctx context.Context, userID, sourceID string) ([]uploads.FileBytes, error) {
+	var exists int
+	if err := a.Pool.QueryRow(ctx, `SELECT 1 FROM studio_images WHERE id=$1 AND user_id=$2`, sourceID, userID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	rows, err := a.Pool.Query(ctx, `SELECT file_path, mime_type FROM studio_image_references WHERE studio_image_id=$1 AND user_id=$2 ORDER BY sort_order ASC, id ASC`, sourceID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var images []uploads.FileBytes
+	for rows.Next() {
+		var path, mimeType string
+		if err = rows.Scan(&path, &mimeType); err != nil {
+			return nil, err
+		}
+		body, err := storage.Read(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(body)) > authsec.MaxUploadBytes() {
+			return nil, errString("图片不能超过 " + authsec.MaxUploadLabel())
+		}
+		if readImage(body) == nil {
+			return nil, errString("参考图仅支持 jpeg/png/webp 图片")
+		}
+		images = append(images, uploads.FileBytes{Buffer: body, MimeType: mimeType, Filename: referenceFilename(mimeType, len(images))})
+	}
+	return images, rows.Err()
+}
+
+func referenceFilename(mimeType string, index int) string {
+	ext := ".jpg"
+	switch strings.ToLower(mimeType) {
+	case "image/png":
+		ext = ".png"
+	case "image/webp":
+		ext = ".webp"
+	}
+	return "reference-" + strconv.Itoa(index+1) + ext
 }
 
 func parseStudio(r *http.Request) (studioReq, error) {
@@ -451,6 +511,8 @@ func parseStudio(r *http.Request) (studioReq, error) {
 				req.quality = strings.TrimSpace(string(buf))
 			case "style":
 				req.style = strings.TrimSpace(string(buf))
+			case "sourceId":
+				req.sourceID = strings.TrimSpace(string(buf))
 			}
 			continue
 		}

@@ -424,7 +424,7 @@ export default function ImageStudioPage() {
     return () => window.clearInterval(timer);
   }, [cooldownUntil]);
 
-  const submitGeneration = async (input: { promptText: string; aspectRatio: string; quality: string; style: string; images: File[]; openDetail: boolean }) => {
+  const submitGeneration = async (input: { promptText: string; aspectRatio: string; quality: string; style: string; images: File[]; sourceId?: string; openDetail: boolean }) => {
     if (Date.now() < cooldownUntilRef.current) return;
     const promptText = input.promptText.trim();
     if (!promptText) {
@@ -456,7 +456,7 @@ export default function ImageStudioPage() {
     setPending(current => [optimistic, ...current]);
     if (input.openDetail) setDetailId(clientKey);
     try {
-      const data = await api.createStudioImage({ prompt: promptText, aspectRatio: input.aspectRatio, quality: input.quality, style: input.style, images: input.images });
+      const data = await api.createStudioImage({ prompt: promptText, aspectRatio: input.aspectRatio, quality: input.quality, style: input.style, images: input.images, sourceId: input.sourceId });
       const payload = data && typeof data === 'object' && 'image' in data ? data.image : undefined;
       const image = normalizeStudioImage(payload);
       if (!image) throw new Error('生成结果无法读取');
@@ -493,6 +493,7 @@ export default function ImageStudioPage() {
       quality: detail.quality,
       style: detail.style,
       images: [],
+      sourceId: detail.id,
       openDetail: true,
     });
   };

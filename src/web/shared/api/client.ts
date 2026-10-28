@@ -58,12 +58,13 @@ export const api = {
   usage: () => fetch('/api/usage', { credentials: 'include' }).then(r => parse<UsageDTO>(r)),
   cloudFiles: () => fetch('/api/cloud-files', { credentials: 'include' }).then(r => parse<{ used: number; limit: number; files: { id: string; name: string; mimeType: string; size: number; createdAt: string; kind: string; url: string; downloadUrl: string; preview: boolean }[] }>(r)),
   listStudioImages: () => fetch('/api/studio/images', { credentials: 'include' }).then(parseStudio),
-  createStudioImage: (input: { prompt: string; aspectRatio: string; quality: string; style: string; images: File[] }) => {
+  createStudioImage: (input: { prompt: string; aspectRatio: string; quality: string; style: string; images: File[]; sourceId?: string }) => {
     const body = new FormData();
     body.append('prompt', input.prompt);
     body.append('aspectRatio', input.aspectRatio);
     body.append('quality', input.quality);
     body.append('style', input.style);
+    if (input.sourceId) body.append('sourceId', input.sourceId);
     for (const image of input.images) body.append('images', image);
     return fetch('/api/studio/images', { method: 'POST', credentials: 'include', body }).then(parseStudio);
   },
