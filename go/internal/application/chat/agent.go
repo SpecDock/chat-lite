@@ -884,6 +884,12 @@ func pdfContextNote(name string, status *string, chars *int, inline *string) str
 		return line + "正文通过检索使用，不要用代码读取。"
 	case "too_short":
 		return label + "：文本过少，未入库。"
+	case "ocr_failed":
+		reason := "OCR 调用失败。"
+		if inline != nil && strings.TrimSpace(*inline) != "" {
+			reason = strings.TrimSpace(*inline)
+		}
+		return label + "：" + reason
 	case "failed":
 		return label + "：解析失败，未入库。"
 	default:

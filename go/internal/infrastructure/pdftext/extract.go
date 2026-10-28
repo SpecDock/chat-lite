@@ -13,23 +13,42 @@ const MinRunes = 80
 const InlineRunes = 8000
 const IndexRunes = 40000
 
-func Extract(path string) (string, error) {
-	text, err := run(30*time.Second, "pdftotext", "-layout", "-enc", "UTF-8", path, "-")
-	if err != nil {
-		text = ""
-	}
-	if runeLen(text) >= MinRunes {
-		return strings.TrimSpace(text), nil
-	}
-	alt, altErr := plumber(path)
-	if runeLen(alt) > runeLen(text) {
-		text = alt
+type Result struct {
+	Text    string
+	Failure string
+}
+
+func Extract(path string) Result {
+	text, _ := plumber(path)
+	if runeLen(text) < MinRunes {
+		if alt, err := run(30*time.Second, "pdftotext", "-layout", "-enc", "UTF-8", path, "-"); err == nil && runeLen(alt) > runeLen(text) {
+			text = alt
+		}
 	}
 	text = strings.TrimSpace(text)
-	if text == "" && err != nil && altErr != nil {
-		return "", err
+	if runeLen(text) >= MinRunes {
+		return Result{Text: text}
 	}
-	return text, nil
+	ocrText, err := Recognize(path)
+	if err != nil {
+		return Result{Text: text, Failure: ocrFailure(err)}
+	}
+	ocrText = strings.TrimSpace(ocrText)
+	if ocrText == "" {
+		return Result{Text: text, Failure: "OCR 没有识别出文字"}
+	}
+	if runeLen(ocrText) > runeLen(text) {
+		text = ocrText
+	}
+	return Result{Text: strings.TrimSpace(text)}
+}
+
+func ocrFailure(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if msg == "" {
+		msg = "OCR 调用失败"
+	}
+	return "OCR 调用失败：" + Clip(msg, 300)
 }
 
 func run(timeout time.Duration, name string, args ...string) (string, error) {

@@ -59,6 +59,11 @@ image_edit:
   api_key: ${IMAGE_EDIT_API_KEY}
   model: ${IMAGE_EDIT_MODEL}
 
+ocr:
+  api_url: ${OCR_BASE_URL}
+  api_key: ${OCR_API_KEY}
+  model: ${OCR_MODEL}
+
 agent:
   max_tool_calls: ${AGENT_MAX_TOOL_CALLS}
   recursion_limit: ${AGENT_RECURSION_LIMIT}

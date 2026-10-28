@@ -171,6 +171,8 @@ func fileCatalog(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 				where = "已解析，不要下载"
 			case "too_short":
 				where = "文本过少，未入库，不要下载"
+			case "ocr_failed":
+				where = "OCR 失败，不要下载"
 			case "failed":
 				where = "解析失败，不要下载"
 			default:

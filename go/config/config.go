@@ -19,6 +19,7 @@ type File struct {
 	SMTP      SMTP      `yaml:"smtp"`
 	TextImage Vendor    `yaml:"text_image"`
 	ImageEdit Vendor    `yaml:"image_edit"`
+	OCR       Vendor    `yaml:"ocr"`
 	Agent     Agent     `yaml:"agent"`
 	RAG       RAG       `yaml:"rag"`
 	MinIO     MinIO     `yaml:"minio"`

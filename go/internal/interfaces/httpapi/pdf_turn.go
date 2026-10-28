@@ -58,13 +58,18 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
 		}
-		text, extractErr := pdftext.Extract(tmp.Name())
+		extracted := pdftext.Extract(tmp.Name())
 		_ = os.Remove(tmp.Name())
+		text := extracted.Text
 		n := utf8.RuneCountInString(strings.TrimSpace(text))
+		if extracted.Failure != "" {
+			think(name + "：" + extracted.Failure)
+			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='ocr_failed', pdf_chars=$2, pdf_inline=$3 WHERE id=$1`, id, n, extracted.Failure)
+			continue
+		}
 		if strings.TrimSpace(text) == "" {
 			think("PDF 解析失败：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
-			_ = extractErr
 			continue
 		}
 		if n < pdftext.MinRunes {
