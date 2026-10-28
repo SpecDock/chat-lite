@@ -14,9 +14,16 @@ services:
       - ./data:/data
       - /var/lib/chat-lite/table-sandbox:/run/table-sandbox
     depends_on:
-      - sandbox-broker
+      sandbox-broker:
+        condition: service_healthy
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     restart: unless-stopped
 
   sandbox-broker:
@@ -27,10 +34,16 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/chat-lite/table-sandbox:/run/table-sandbox
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -S /run/table-sandbox/table-sandbox.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 60s
 
   table-sandbox:
     image: chat-lite-table-sandbox
     build:
-      context: .
-      dockerfile: sandbox/Dockerfile
+      context: ./sandbox
+      dockerfile: Dockerfile
     profiles: ["image"]

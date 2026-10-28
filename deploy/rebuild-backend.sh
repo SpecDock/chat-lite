@@ -23,8 +23,8 @@ fi
 
 echo "Using compose file: $COMPOSE_FILE"
 if [ "$STOP_BEFORE_BUILD" = "1" ]; then
-  echo "Stopping $SERVICE_NAME and $BROKER_SERVICE before build..."
-  docker compose -f "$COMPOSE_FILE" stop "$SERVICE_NAME" "$BROKER_SERVICE" || true
+  echo "Stopping $SERVICE_NAME, $BROKER_SERVICE, and the old sandbox before build..."
+  docker compose -f "$COMPOSE_FILE" --profile image stop "$SERVICE_NAME" "$BROKER_SERVICE" "$SANDBOX_SERVICE" || true
 fi
 
 cache=()
@@ -46,7 +46,7 @@ build_app() {
   if [ "$go_mb" -lt 256 ]; then go_mb=256; fi
   echo "MemAvailable ${now_kb} kB; Go compiler capped at ${go_mb} MB"
   echo "Building $SERVICE_NAME with $prefix"
-  docker compose -f "$COMPOSE_FILE" build \
+  docker compose -f "$COMPOSE_FILE" build "${cache[@]}" \
     --build-arg "GO_IMAGE=${prefix}/golang:1.26-bookworm" \
     --build-arg "DEBIAN_IMAGE=${prefix}/debian:bookworm-slim" \
     --build-arg "GO_MEM_LIMIT_MB=${go_mb}" \
@@ -55,8 +55,8 @@ build_app() {
 
 build_sandbox() {
   local prefix="$1"
-  echo "Building $SANDBOX_SERVICE with $prefix"
-  docker compose -f "$COMPOSE_FILE" build "${cache[@]}" \
+  echo "Building sandbox image $SANDBOX_SERVICE with $prefix"
+  docker compose -f "$COMPOSE_FILE" --profile image build "${cache[@]}" \
     --build-arg "PYTHON_IMAGE=${prefix}/python:3.12-slim" \
     "$SANDBOX_SERVICE" || return 1
 }
@@ -69,6 +69,17 @@ if ! build_sandbox "$mirror_prefix"; then
   echo "Sandbox mirror failed. Falling back to Docker Hub..."
   build_sandbox "$official_prefix"
 fi
+
+echo "Preparing sandbox job directory"
+mkdir -p /var/lib/chat-lite/table-sandbox
+chmod 755 /var/lib/chat-lite/table-sandbox
+echo "Removing the old long-running sandbox container"
+docker compose -f "$COMPOSE_FILE" --profile image stop "$SANDBOX_SERVICE" || true
+docker compose -f "$COMPOSE_FILE" --profile image rm -f "$SANDBOX_SERVICE" || true
+docker ps -aq --filter name=table-sandbox | while read -r id; do
+  [ -n "$id" ] || continue
+  docker rm -f "$id" || true
+done
 
 echo "Recreating services: $SERVICE_NAME $BROKER_SERVICE"
 docker compose -f "$COMPOSE_FILE" up -d --no-build --force-recreate "$SERVICE_NAME" "$BROKER_SERVICE"
@@ -83,10 +94,19 @@ for _ in $(seq 1 "$HEALTH_RETRIES"); do
   sleep 2
 done
 
-docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME"
-if [ "$healthy" != "1" ]; then
+broker_ok=0
+for _ in $(seq 1 "$HEALTH_RETRIES"); do
+  if docker compose -f "$COMPOSE_FILE" exec -T "$BROKER_SERVICE" sh -c 'test -S /run/table-sandbox/table-sandbox.sock'; then
+    broker_ok=1
+    break
+  fi
+  sleep 2
+done
+
+docker compose -f "$COMPOSE_FILE" ps "$SERVICE_NAME" "$BROKER_SERVICE"
+if [ "$healthy" != "1" ] || [ "$broker_ok" != "1" ]; then
   echo "Health check FAILED. Recent logs:" >&2
-  docker compose -f "$COMPOSE_FILE" logs --tail=100 "$SERVICE_NAME" >&2
+  docker compose -f "$COMPOSE_FILE" logs --tail=100 "$SERVICE_NAME" "$BROKER_SERVICE" >&2
   exit 1
 fi
 echo "Health check: OK"

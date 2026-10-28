@@ -13,8 +13,8 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 if [ "$STOP_BEFORE_BUILD" = "1" ] && [ -f "$COMPOSE_FILE" ]; then
-  echo "Stopping chat-lite and sandbox-broker before the frontend build..."
-  docker compose -f "$COMPOSE_FILE" stop chat-lite sandbox-broker || true
+  echo "Stopping chat-lite, sandbox-broker, and the old sandbox before the frontend build..."
+  docker compose -f "$COMPOSE_FILE" --profile image stop chat-lite sandbox-broker table-sandbox || true
 fi
 
 avail_kb="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"

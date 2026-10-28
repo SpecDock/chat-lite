@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,14 +30,15 @@ const (
 	dockerSock   = "/var/run/docker.sock"
 	apiPrefix    = "/v1.41"
 
-	runningCap   = 2
-	waitingCap   = 2
-	runTimeout   = 30 * time.Second
-	reapTimeout  = 3 * time.Second
-	outputCap    = 64 * 1024
-	heldMarker   = ".sandbox-held"
-	maxCodeBytes = 1 * 1024 * 1024
-	maxBodyBytes = 2 * 1024 * 1024
+	runningCap    = 2
+	waitingCap    = 4
+	minFreeMemory = 400 * 1024 * 1024
+	runTimeout    = 30 * time.Second
+	reapTimeout   = 3 * time.Second
+	outputCap     = 64 * 1024
+	heldMarker    = ".sandbox-held"
+	maxCodeBytes  = 1 * 1024 * 1024
+	maxBodyBytes  = 2 * 1024 * 1024
 
 	memoryLimit = 536870912
 	pidsLimit   = 64
@@ -50,6 +52,7 @@ var (
 	jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
 	refPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 	errBusy      = errors.New("sandbox busy")
+	errLowMemory = errors.New("insufficient memory")
 	errInvalid   = errors.New("invalid job")
 	errJobsRoot  = errors.New("jobs root unavailable")
 )
@@ -169,6 +172,11 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result, err := b.eng.run(r.Context(), payload.JobID)
 	if err != nil {
 		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, errLowMemory) {
+			log.Printf("sandbox low memory job=%s", payload.JobID)
+			writeJSON(w, http.StatusServiceUnavailable, errJSON{Error: "insufficient memory"})
 			return
 		}
 		log.Printf("sandbox job=%s: %v", payload.JobID, err)
@@ -432,8 +440,43 @@ func clearHeldMarkers() {
 	}
 }
 
+func ensureMemory() error {
+	available, err := availableMemory()
+	if err != nil {
+		log.Printf("sandbox memory check: %v", err)
+		return errLowMemory
+	}
+	if available <= minFreeMemory {
+		log.Printf("sandbox low memory available=%d", available)
+		return errLowMemory
+	}
+	return nil
+}
+
+func availableMemory() (uint64, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "MemAvailable:" {
+			continue
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return kb * 1024, nil
+	}
+	return 0, errors.New("MemAvailable missing")
+}
+
 func (e *engine) run(ctx context.Context, jobID string) (runResult, error) {
 	started := time.Now()
+	if err := ensureMemory(); err != nil {
+		return runResult{}, err
+	}
 	if err := holdJob(jobID); err != nil {
 		return runResult{}, err
 	}
