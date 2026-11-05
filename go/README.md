@@ -73,6 +73,6 @@ go run ./cmd/server
 go run ./cmd/migrate
 ```
 
-SQLite 里的向量存在 sqlite-vec 虚表中。当前进程读不到这块扩展时，只迁 RAG 文本，不迁向量，并在日志里说明。向量维度不是 1536 的记录也不会写入 `embedding` 列。
+SQLite 里的向量存在 sqlite-vec 虚表中。当前进程读不到这块扩展时，只迁 RAG 文本，不迁向量，并在日志里说明。向量维度不是 1024 的记录也不会写入 `embedding` 列。
 
 迁移可以重复执行。已存在的主键会跳过。

@@ -42,6 +42,9 @@ func main() {
 		if err := postgres.ApplySchema(ctx, pool, cfg.Server.SchemaPath); err != nil {
 			log.Fatal(err)
 		}
+		if err := postgres.AlignEmbeddingDimension(ctx, pool, cfg.Embedding.Dimensions); err != nil {
+			log.Printf("[rag] embedding align skipped: %v", err)
+		}
 	}
 	if len(cfg.Kafka.BrokerList()) > 0 && strings.TrimSpace(cfg.Redis.Addr) != "" {
 		if pool == nil {

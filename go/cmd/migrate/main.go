@@ -427,7 +427,7 @@ func loadVectors(ctx context.Context, ragDB *sql.DB) map[int64]string {
 		if err := rows.Scan(&rowid, &blob); err != nil {
 			continue
 		}
-		if text, ok := vectorLiteral(blob, 1536); ok {
+		if text, ok := vectorLiteral(blob, 1024); ok {
 			out[rowid] = text
 		}
 	}

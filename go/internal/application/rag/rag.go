@@ -20,8 +20,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"chatlite/internal/domain/visibility"
 	"chatlite/config"
+	"chatlite/internal/domain/visibility"
 	"chatlite/internal/platform/idgen"
 )
 
@@ -182,6 +182,7 @@ func indexOne(ctx context.Context, pool *pgxpool.Pool, input IndexInput) error {
 			fmt.Sprintf("rag_%s_%d_%s", input.MessageID, i, idgen.NewID("c")[len("c_"):]),
 			input.UserID, input.ConversationID, input.MessageID, input.Role, i, item.chunk.Text, item.chunk.ParentText, item.chunk.Type, item.chunk.Importance, createdAt, embeddedAt, dim, hash, emb)
 		if err != nil {
+			log.Printf("[rag] embedding insert failed message=%s err=%v", input.MessageID, err)
 			_, err = pool.Exec(ctx, `INSERT INTO rag_items (id,user_id,conversation_id,message_id,role,chunk_index,chunk_text,parent_text,chunk_type,importance,created_at,embedded_at,embedding_dim,content_hash)
 				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 				ON CONFLICT (conversation_id, content_hash) DO NOTHING`,
@@ -433,7 +434,7 @@ func FormatHits(hits []Hit) string {
 
 type itemRow struct {
 	ID, Chunk, Parent, MessageID, ConversationID, Role, CreatedAt string
-	Importance                                                     float64
+	Importance                                                    float64
 }
 
 func recall(item itemRow) string {

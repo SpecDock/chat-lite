@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS rag_items (
   last_hit_at TEXT,
   last_injected_at TEXT,
   content_hash TEXT,
-  embedding vector(1536)
+  embedding vector(1024)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rag_items_conversation_content_hash
   ON rag_items(conversation_id, content_hash);
