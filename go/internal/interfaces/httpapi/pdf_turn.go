@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -37,15 +38,18 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 		if err != nil || !isPDFName(name, mime) || status != "" {
 			continue
 		}
+		log.Printf("[pdf] start id=%s name=%s", id, name)
 		think("正在解析 PDF：" + name)
 		data, readErr := storage.Read(ctx, path)
 		if readErr != nil {
+			log.Printf("[pdf] done id=%s status=failed stage=read err=%s", id, trimErr(readErr))
 			think("PDF 解析失败：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
 		}
 		tmp, tmpErr := os.CreateTemp("", "chatlite-*.pdf")
 		if tmpErr != nil {
+			log.Printf("[pdf] done id=%s status=failed stage=temp err=%s", id, trimErr(tmpErr))
 			think("PDF 解析失败：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
@@ -54,6 +58,7 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 		tmp.Close()
 		if writeErr != nil {
 			_ = os.Remove(tmp.Name())
+			log.Printf("[pdf] done id=%s status=failed stage=temp err=%s", id, trimErr(writeErr))
 			think("PDF 解析失败：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
@@ -63,16 +68,19 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 		text := extracted.Text
 		n := utf8.RuneCountInString(strings.TrimSpace(text))
 		if extracted.Failure != "" {
+			log.Printf("[pdf] done id=%s status=ocr_failed chars=%d", id, n)
 			think(name + "：" + extracted.Failure)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='ocr_failed', pdf_chars=$2, pdf_inline=$3 WHERE id=$1`, id, n, extracted.Failure)
 			continue
 		}
 		if strings.TrimSpace(text) == "" {
+			log.Printf("[pdf] done id=%s status=failed chars=0", id)
 			think("PDF 解析失败：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
 		}
 		if n < pdftext.MinRunes {
+			log.Printf("[pdf] done id=%s status=too_short chars=%d", id, n)
 			think("文本过少，未入库：" + name)
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='too_short', pdf_chars=$2 WHERE id=$1`, id, n)
 			continue
@@ -86,6 +94,7 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 		if n > pdftext.IndexRunes {
 			line += "，检索只收入前 40000 字"
 		}
+		log.Printf("[pdf] done id=%s status=indexed chars=%d", id, n)
 		think(line)
 		_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='indexed', pdf_chars=$2, pdf_inline=$3 WHERE id=$1`, id, n, inline)
 	}

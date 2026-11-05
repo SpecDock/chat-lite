@@ -3,6 +3,7 @@ package pdftext
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -19,28 +20,44 @@ type Result struct {
 }
 
 func Extract(path string) Result {
-	text, _ := plumber(path)
+	text, plumberErr := plumber(path)
+	log.Printf("[pdf] stage=pdfplumber chars=%d err=%s", runeLen(text), errText(plumberErr))
 	if runeLen(text) < MinRunes {
-		if alt, err := run(30*time.Second, "pdftotext", "-layout", "-enc", "UTF-8", path, "-"); err == nil && runeLen(alt) > runeLen(text) {
+		alt, err := run(30*time.Second, "pdftotext", "-layout", "-enc", "UTF-8", path, "-")
+		use := err == nil && runeLen(alt) > runeLen(text)
+		log.Printf("[pdf] stage=pdftotext chars=%d used=%t err=%s", runeLen(alt), use, errText(err))
+		if use {
 			text = alt
 		}
 	}
 	text = strings.TrimSpace(text)
 	if runeLen(text) >= MinRunes {
+		log.Printf("[pdf] stage=text-layer chars=%d outcome=enough", runeLen(text))
 		return Result{Text: text}
 	}
+	log.Printf("[pdf] stage=text-layer chars=%d outcome=short", runeLen(text))
 	ocrText, err := Recognize(path)
 	if err != nil {
+		log.Printf("[pdf] stage=ocr chars=%d outcome=failed err=%s", runeLen(ocrText), errText(err))
 		return Result{Text: text, Failure: ocrFailure(err)}
 	}
 	ocrText = strings.TrimSpace(ocrText)
 	if ocrText == "" {
+		log.Printf("[pdf] stage=ocr chars=0 outcome=empty")
 		return Result{Text: text, Failure: "OCR 没有识别出文字"}
 	}
 	if runeLen(ocrText) > runeLen(text) {
 		text = ocrText
 	}
+	log.Printf("[pdf] stage=ocr chars=%d outcome=ok", runeLen(text))
 	return Result{Text: strings.TrimSpace(text)}
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return Clip(strings.Join(strings.Fields(err.Error()), " "), 200)
 }
 
 func ocrFailure(err error) string {

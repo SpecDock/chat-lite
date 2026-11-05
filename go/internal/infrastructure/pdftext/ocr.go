@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,9 +35,11 @@ func Recognize(path string) (string, error) {
 	cmd := exec.Command("pdftoppm", "-jpeg", "-r", "144", "-f", "1", "-l", fmt.Sprint(ocrPageLimit), path, filepath.Join(dir, "page"))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
+			log.Printf("[pdf] stage=pdftoppm outcome=missing")
 			return "", errors.New("未找到 pdftoppm")
 		}
 		detail := strings.Join(strings.Fields(string(out)), " ")
+		log.Printf("[pdf] stage=pdftoppm outcome=failed err=%s", Clip(detail, 200))
 		if detail == "" {
 			return "", errors.New("PDF 转图片失败")
 		}
@@ -48,15 +51,19 @@ func Recognize(path string) (string, error) {
 	}
 	sort.Strings(pages)
 	if len(pages) == 0 {
+		log.Printf("[pdf] stage=pdftoppm outcome=no-pages")
 		return "", errors.New("PDF 没有可识别的页面")
 	}
+	log.Printf("[pdf] stage=pdftoppm pages=%d", len(pages))
 	var parts []string
 	for i, page := range pages {
 		text, err := recognizePage(cfg, page)
 		if err != nil {
+			log.Printf("[pdf] stage=ocr-page page=%d outcome=failed err=%s", i+1, errText(err))
 			return "", err
 		}
 		text = strings.TrimSpace(text)
+		log.Printf("[pdf] stage=ocr-page page=%d chars=%d", i+1, runeLen(text))
 		if text == "" {
 			continue
 		}
