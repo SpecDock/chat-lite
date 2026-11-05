@@ -394,6 +394,27 @@ func (g *liveGeneration) commit(fn func()) bool {
 	return true
 }
 
+func generationOwner(conversationID string) string {
+	current, ok := liveGenerations.Load(conversationID)
+	if !ok {
+		return ""
+	}
+	gen := current.(*liveGeneration)
+	gen.mu.Lock()
+	defer gen.mu.Unlock()
+	return gen.userID
+}
+
+func stopPlan(exists bool, liveOwner, caller string) (cancel bool, code int) {
+	if !exists {
+		return false, 404
+	}
+	if liveOwner != "" && liveOwner != caller {
+		return false, 403
+	}
+	return true, 200
+}
+
 func cancelGeneration(conversationID string) (assistantID, userID string, revert bool) {
 	current, ok := liveGenerations.Load(conversationID)
 	if !ok {
@@ -412,16 +433,21 @@ func cancelGeneration(conversationID string) (assistantID, userID string, revert
 func (a *App) stopConversationRoute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	user := authFrom(r)
-	assistantID, ownerID, committed := cancelGeneration(id)
 	exists, err := a.conversationExists(r.Context(), id, user.UserID)
 	if err != nil {
 		httpx.Error(w, 500, "服务器错误")
 		return
 	}
-	if !exists {
+	cancel, code := stopPlan(exists, generationOwner(id), user.UserID)
+	if !cancel {
+		if code == 403 {
+			httpx.Error(w, 403, "无权停止该会话")
+			return
+		}
 		httpx.Error(w, 404, "会话不存在")
 		return
 	}
+	assistantID, ownerID, committed := cancelGeneration(id)
 	if ownerID != "" && ownerID != user.UserID {
 		httpx.Error(w, 403, "无权停止该会话")
 		return
