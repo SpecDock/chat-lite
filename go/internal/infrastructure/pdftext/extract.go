@@ -3,6 +3,7 @@ package pdftext
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os/exec"
 	"strings"
@@ -38,6 +39,11 @@ func Extract(path string) Result {
 	log.Printf("[pdf] stage=text-layer chars=%d outcome=short", runeLen(text))
 	ocrText, err := Recognize(path)
 	if err != nil {
+		var timeout ocrTimeoutError
+		if errors.As(err, &timeout) {
+			log.Printf("[pdf] stage=ocr chars=%d outcome=timeout", runeLen(ocrText))
+			return Result{Text: text, Failure: timeout.Error()}
+		}
 		log.Printf("[pdf] stage=ocr chars=%d outcome=failed err=%s", runeLen(ocrText), errText(err))
 		return Result{Text: text, Failure: ocrFailure(err)}
 	}

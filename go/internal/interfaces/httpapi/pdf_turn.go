@@ -69,7 +69,11 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 		n := utf8.RuneCountInString(strings.TrimSpace(text))
 		if extracted.Failure != "" {
 			log.Printf("[pdf] done id=%s status=ocr_failed chars=%d", id, n)
-			think(name + "：" + extracted.Failure)
+			if strings.HasPrefix(extracted.Failure, "正在 OCR") {
+				think(extracted.Failure)
+			} else {
+				think(name + "：" + extracted.Failure)
+			}
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='ocr_failed', pdf_chars=$2, pdf_inline=$3 WHERE id=$1`, id, n, extracted.Failure)
 			continue
 		}

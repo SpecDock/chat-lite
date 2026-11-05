@@ -21,6 +21,7 @@ import (
 )
 
 const ocrPageLimit = 20
+const ocrBudget = 60 * time.Second
 
 func Recognize(path string) (string, error) {
 	cfg := config.Current().OCR
@@ -32,7 +33,9 @@ func Recognize(path string) (string, error) {
 		return "", err
 	}
 	defer os.RemoveAll(dir)
-	cmd := exec.Command("pdftoppm", "-jpeg", "-r", "144", "-f", "1", "-l", fmt.Sprint(ocrPageLimit), path, filepath.Join(dir, "page"))
+	renderCtx, renderCancel := context.WithTimeout(context.Background(), ocrBudget)
+	defer renderCancel()
+	cmd := exec.CommandContext(renderCtx, "pdftoppm", "-jpeg", "-r", "144", "-f", "1", "-l", fmt.Sprint(ocrPageLimit), path, filepath.Join(dir, "page"))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
 			log.Printf("[pdf] stage=pdftoppm outcome=missing")
@@ -55,10 +58,20 @@ func Recognize(path string) (string, error) {
 		return "", errors.New("PDF 没有可识别的页面")
 	}
 	log.Printf("[pdf] stage=pdftoppm pages=%d", len(pages))
+	started := time.Now()
 	var parts []string
 	for i, page := range pages {
-		text, err := recognizePage(cfg, page)
+		if message, stop := ocrStop(i, len(pages), started, time.Now()); stop {
+			log.Printf("[pdf] stage=ocr outcome=timeout %s", message)
+			return "", ocrTimeoutError{message: message}
+		}
+		text, err := recognizePage(cfg, page, started.Add(ocrBudget))
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				message, _ := ocrStop(i, len(pages), started, started.Add(ocrBudget))
+				log.Printf("[pdf] stage=ocr outcome=timeout %s", message)
+				return "", ocrTimeoutError{message: message}
+			}
 			log.Printf("[pdf] stage=ocr-page page=%d outcome=failed err=%s", i+1, errText(err))
 			return "", err
 		}
@@ -75,7 +88,35 @@ func Recognize(path string) (string, error) {
 	return strings.Join(parts, "\n\n"), nil
 }
 
-func recognizePage(cfg config.Vendor, path string) (string, error) {
+type ocrTimeoutError struct {
+	message string
+}
+
+func (e ocrTimeoutError) Error() string { return e.message }
+
+func ocrTimeoutMessage(done, left int, elapsed time.Duration) string {
+	eta := left * int(ocrBudget.Seconds())
+	if done > 0 && elapsed > 0 {
+		eta = int((elapsed * time.Duration(left) / time.Duration(done)).Seconds())
+		if left > 0 && eta < 1 {
+			eta = 1
+		}
+	}
+	return fmt.Sprintf("正在 OCR 解析 PDF：已完成 %d 页，还剩 %d 页，大约还需要 %d 秒", done, left, eta)
+}
+
+func ocrStop(done, total int, started, now time.Time) (string, bool) {
+	if now.Before(started.Add(ocrBudget)) {
+		return "", false
+	}
+	left := total - done
+	if left < 0 {
+		left = 0
+	}
+	return ocrTimeoutMessage(done, left, now.Sub(started)), true
+}
+
+func recognizePage(cfg config.Vendor, path string, deadline time.Time) (string, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -96,7 +137,7 @@ func recognizePage(cfg config.Vendor, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL(cfg.APIURL), bytes.NewReader(raw))
 	if err != nil {
@@ -104,7 +145,11 @@ func recognizePage(cfg config.Vendor, path string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
-	res, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return "", context.DeadlineExceeded
+	}
+	res, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return "", err
 	}
