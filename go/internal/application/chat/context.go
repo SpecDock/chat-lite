@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	contextTokenLimit  = 200_000
-	summaryChunkTokens = 80_000
+	contextTokenLimit   = 200_000
+	imageEstimateTokens = 1000
+	summaryChunkTokens  = 80_000
 )
 
 type PreparedContext struct {
@@ -249,7 +250,7 @@ func messageTokens(raw any) int {
 	if !ok {
 		return 0
 	}
-	total := 4 + estimateTokens(contentForEstimate(msg["content"]))
+	total := 4 + estimateTokens(contentForEstimate(msg["content"])) + imageCount(msg["content"])*imageEstimateTokens
 	if text, ok := msg["reasoning_content"].(string); ok {
 		total += estimateTokens(text)
 	}
@@ -273,16 +274,26 @@ func contentForEstimate(content any) string {
 			if text, _ := block["text"].(string); text != "" {
 				b.WriteString(text)
 			}
-			if block["type"] == "image_url" {
-				image, _ := block["image_url"].(map[string]any)
-				url, _ := image["url"].(string)
-				b.WriteString(url)
-			}
 		}
 		return b.String()
 	default:
 		return ""
 	}
+}
+
+func imageCount(content any) int {
+	parts, ok := content.([]any)
+	if !ok {
+		return 0
+	}
+	total := 0
+	for _, part := range parts {
+		block, ok := part.(map[string]any)
+		if ok && block["type"] == "image_url" {
+			total++
+		}
+	}
+	return total
 }
 
 func splitTokenChunks(text string, limit int) []string {

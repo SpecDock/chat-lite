@@ -131,3 +131,18 @@ func TestPrefixDropsToolProtocolAndKeepsRequestRef(t *testing.T) {
 		}
 	}
 }
+
+func TestImageBase64DoesNotTriggerContextLimit(t *testing.T) {
+	payload := strings.Repeat("A", 900_000)
+	message := map[string]any{"role": "user", "content": []any{
+		map[string]any{"type": "text", "text": "看这张图"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + payload}},
+	}}
+	tokens := messageTokens(message)
+	if tokens > 5_000 {
+		t.Fatalf("image payload counted as text: %d", tokens)
+	}
+	if tokens < imageEstimateTokens {
+		t.Fatalf("image estimate missing: %d", tokens)
+	}
+}
