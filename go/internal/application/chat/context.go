@@ -11,7 +11,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"chatlite/config"
 	"chatlite/internal/domain/visibility"
 	"chatlite/internal/infrastructure/llm"
 	"chatlite/internal/platform/idgen"
@@ -67,17 +66,6 @@ func (p *PreparedContext) RunSummary(ctx context.Context, pool *pgxpool.Pool, us
 	last := p.dropped[len(p.dropped)-1]
 	p.Summary = next
 	p.cursorAt, p.cursorID = last.CreatedAt, last.ID
-	retain := config.Current().Server.AnswerHistoryLimit
-	if retain <= 0 {
-		retain = 6
-	}
-	retain--
-	if retain < 0 {
-		retain = 0
-	}
-	if retain < len(p.History) {
-		p.History = p.History[len(p.History)-retain:]
-	}
 	saveContextState(ctx, pool, conversationID, userID, next, estimateTokens(next), p.cursorAt, p.cursorID, time.Now().UTC().Format(time.RFC3339Nano))
 	DeleteCurrentSnapshots(ctx, pool, conversationID, userID)
 	log.Printf("[conversation-context] compacted conversation=%s dropped=%d", conversationID, len(p.dropped))

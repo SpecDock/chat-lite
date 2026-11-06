@@ -43,9 +43,11 @@ const systemPrompt = `你是 Chat Lite 的对话助手。每一轮都使用同�
 ## 工具
 - 只有结构化 tool_calls 才算调用。不要在正文承诺或宣称已经搜索或调用了工具；调用后等待真实结果。失败、被拒绝、来源冲突或证据不足时如实说明，不得假装成功。同一调用被预算拒绝或失败后不要用相同参数重试。
 - 彼此独立的调用可以同一轮并行。后一步依赖前一步结果时必须分轮。
-- 可外部核验的重要事实，包括数字、日期、价格和专业结论，只基于用户内容、当前图片、历史、RAG 和 ToolMessage。证据不足时先 web_search，不猜测。闲聊、创作、情绪陪伴和改写无需搜索；若加入可核验事实，仍遵守本条。
+- todo_write 只用于多步骤或复杂任务。由你判断当前任务是否需要规划；需要时先列出步骤，每完成或切换一步就更新状态。简单问答、单次搜索、单次计算不要调用。这个工具不执行任何操作。
+- 可外部核验的重要事实，包括数字、日期、价格和专业结论，只基于用户内容、当前图片、历史、RAG 和 ToolMessage。已经知道具体网址时先 fetch，不猜测。不知道网址时再 web_search。闲聊、创作、情绪陪伴和改写无需搜索；若加入可核验事实，仍遵守本条。
 - 疾病、药品、治疗、剂量、禁忌、检查和相互作用等医学问题，用不同 query 多次 web_search 并对比来源。回答末尾精确追加：AI生成仅供参考。
-- web_search：实时信息、事实核验、用户明确要求搜索，或重要证据不足。
+- fetch：抓取一个已知网址的正文。你知道项目、文档或页面在哪个网站时优先调用，不要先搜索。它不执行 JavaScript。返回页面不存在或无法连接时，再用 web_search 查找新网址，然后对搜到的网址重新 fetch。不要反复抓同一个失败网址。
+- web_search：不知道具体网址的模糊查询、实时信息，或 fetch 已经失败后的查找。已经有明确网址时不要用它代替 fetch。
 - view_image：查看历史用户图或生成图。当前轮上传图片已直接可见，不要为此调用。搜索依赖图片内容时先 view_image；用户已给出独立完整搜索主题时可直接 web_search。
 - 表格和文件分析只在临时工作区进行。本轮附件已在 input/。用 write_file 写脚本，再用 run_python 运行该路径。失败时用 edit_file 改出错的一段，不要重写整个文件。只有文件清单里更早的附件才调用 download_file。超出上下文限制而保存的 txt 已在给出的 input/ 路径，不要对它调用 download_file。留给用户的结果写入 output/。
 - PDF 由服务端解析。不要用 download_file 或 run_python 读取 PDF。短文会附在消息里；长文通过检索使用。文本过少或解析失败时没有正文。
@@ -111,9 +113,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 	messages = append(messages, map[string]any{"role": "user", "content": candidatePrompt(candidates)})
 	replay := map[string]string{}
 	tools := openAITools()
-	budgetsTotal := config.Current().Agent.MaxToolCalls
 	recursionLimit := config.Current().Agent.RecursionLimit
-	counts := map[string]int{}
 	var recent []sig
 	answered := false
 	streamed := ""
@@ -123,6 +123,10 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			return abortErr()
 		}
 		round = step + 1
+		if planReminderDue(round) {
+			messages = append(messages, map[string]any{"role": "user", "content": planReminderText})
+			log.Printf("[todo-reminder] conversationId=%s step=%d", in.ConversationID, round)
+		}
 		var fitErr error
 		messages, currentAt, fitErr = prepareSend(ctx, messages, currentAt, emit)
 		if fitErr != nil {
@@ -173,7 +177,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			args := map[string]any{}
 			_ = json.Unmarshal([]byte(call.Arguments), &args)
 			started := time.Now()
-			content, viewedImage, events := executeTool(ctx, pool, in, work, call.Name, args, counts, budgetsTotal, &recent, candidates)
+			content, viewedImage, events := executeTool(ctx, pool, in, work, call.Name, args, &recent, candidates)
 			if work != nil && estimateTokens(content) > contextTokenLimit {
 				if note, spillErr := spillOverflowText(ctx, pool, in, work, content); spillErr != nil {
 					log.Printf("[overflow] conversation=%s tool_spill_failed err=%v", in.ConversationID, spillErr)
@@ -407,8 +411,42 @@ func retryable(err error) bool {
 
 type sig struct{ name, signature string }
 
-func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch, name string, args map[string]any, counts map[string]int, total int, recent *[]sig, candidates []imageCandidate) (string, map[string]any, []Event) {
-	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" {
+const planReminderEvery = 5
+
+const planReminderText = "如果当前任务是多步骤或复杂任务，用 todo_write 更新尚未完成的步骤。简单任务忽略这条提醒，直接继续。"
+
+func planReminderDue(round int) bool {
+	return round > 0 && round%planReminderEvery == 0
+}
+
+func runTodo(args map[string]any) (string, map[string]any, []Event) {
+	raw, _ := args["todos"].([]any)
+	if len(raw) == 0 || len(raw) > 20 {
+		return "工具 todo_write 参数无效：todos 必须是 1 到 20 项的列表。", nil, []Event{{Type: "think", Text: "规划参数无效"}}
+	}
+	lines := make([]string, 0, len(raw))
+	parts := make([]string, 0, len(raw))
+	labels := map[string]string{"pending": "待办", "in_progress": "进行中", "completed": "已完成"}
+	for i, item := range raw {
+		obj, _ := item.(map[string]any)
+		content := strings.TrimSpace(stringArg(obj["content"]))
+		status := strings.TrimSpace(stringArg(obj["status"]))
+		label, ok := labels[status]
+		if content == "" || !ok {
+			return "工具 todo_write 参数无效：每项需要 content 和 status（pending、in_progress、completed）。", nil, []Event{{Type: "think", Text: "规划参数无效"}}
+		}
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s", i+1, status, content))
+		shown := content
+		if rs := []rune(shown); len(rs) > 40 {
+			shown = string(rs[:40])
+		}
+		parts = append(parts, label+" "+shown)
+	}
+	return "当前计划：\n" + strings.Join(lines, "\n") + "\n按这个计划继续。简单任务不要反复调用。", nil, []Event{{Type: "think", Text: "规划：" + strings.Join(parts, "；")}}
+}
+
+func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch, name string, args map[string]any, recent *[]sig, candidates []imageCandidate) (string, map[string]any, []Event) {
+	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "todo_write" && name != "fetch" {
 		return "未知工具：" + name, nil, []Event{{Type: "think", Text: "未知工具：" + name}}
 	}
 	signature := name + "::" + stableArgs(args)
@@ -426,22 +464,27 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 		text := fmt.Sprintf("doom-loop guard：%s 在本轮已被重复调用 %d 次且参数几乎一致。请立即停止重复调用，基于已有工具结果给出最终回答。", name, same+1)
 		return text, nil, []Event{{Type: "think", Text: text}}
 	}
-	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && sameTool >= 3 {
+	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "todo_write" && name != "fetch" && sameTool >= 3 {
 		text := fmt.Sprintf("doom-loop guard：本轮 %s 已被调用 %d 次，疑似陷入研究循环。请立即基于已有结果给出最终回答。", name, sameTool+1)
 		return text, nil, []Event{{Type: "think", Text: text}}
 	}
 	*recent = append(*recent, sig{name, signature})
-	if counts["total"] >= total {
-		text := fmt.Sprintf("本轮工具调用次数已达总上限 %d 次，请基于已有信息完成回答。", total)
-		return text, nil, []Event{{Type: "think", Text: text}}
-	}
-	if (name == "run_python" || name == "download_file" || name == "write_file" || name == "edit_file") && counts[name] >= 10 {
-		text := "本轮 " + name + " 已达上限 10 次，请基于已有结果完成回答。"
-		return text, nil, []Event{{Type: "think", Text: text}}
-	}
-	counts["total"]++
-	counts[name]++
 	switch name {
+	case "todo_write":
+		return runTodo(args)
+	case "fetch":
+		pageURL := strings.TrimSpace(stringArg(args["url"]))
+		if pageURL == "" {
+			return "工具 fetch 参数无效：url 必填。", nil, []Event{{Type: "think", Text: "工具 fetch 参数无效"}}
+		}
+		text, err := fetchPage(ctx, pageURL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", nil, nil
+			}
+			return "工具 fetch 执行失败：" + clipLog(err.Error()) + "。页面不存在或无法连接时，改用 web_search 查找新网址，再 fetch 那个网址。", nil, []Event{{Type: "think", Text: "工具调用失败：fetch"}}
+		}
+		return text, nil, []Event{{Type: "think", Text: "工具完成：fetch"}}
 	case "web_search":
 		query := strings.TrimSpace(stringArg(args["query"]))
 		if query == "" {
@@ -458,20 +501,14 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 	case "view_image":
 		id := normalizeAttachmentID(stringArg(args["attachmentId"]))
 		if !candidateHas(candidates, id) {
-			counts["total"]--
-			counts[name]--
 			return "无法查看该图片：请选择本轮历史图片候选中的附件。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
 		var filePath string
 		err := pool.QueryRow(ctx, `SELECT file_path FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND mime_type LIKE 'image/%'`, id, in.UserID, in.ConversationID).Scan(&filePath)
 		if err != nil {
-			counts["total"]--
-			counts[name]--
 			return "无法查看该图片：图片不存在、无权访问或不属于当前会话。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
 		if _, err = storage.Read(ctx, filePath); err != nil {
-			counts["total"]--
-			counts[name]--
 			return "无法读取该图片文件，请重新上传后再试。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
 		return "已加载历史图片 " + id + "。图片本体已加入上下文，可据此识别或搜索。", imageRef(id), []Event{{Type: "think", Text: "工具完成：view_image"}}
@@ -1043,11 +1080,13 @@ func candidateHas(items []imageCandidate, id string) bool {
 func openAITools() []any {
 	return []any{
 		tool("view_image", "查看本轮提供的历史图片候选。用户引用之前上传或生成的图片、需要识别或分析其内容时调用。只能传候选摘要中给出的 attachmentId；成功后下一轮请求会看到图片本体。当前轮上传图片已直接可见，不需要调用此工具。", map[string]any{"attachmentId": map[string]any{"type": "string", "minLength": 1, "description": "历史用户图或生成图候选中的 attachmentId"}}, []string{"attachmentId"}),
-		tool("web_search", "联网搜索工具。用于事实核验、证据不足、专业知识、医药咨询、实时信息，或用户明确要求搜索；医药问题可用不同 query 多次查询和比对。不要用于纯写作、翻译或闲聊。", map[string]any{"query": map[string]any{"type": "string", "minLength": 1, "description": "搜索查询词；尽量保留用户原话的关键实体，避免额外修饰"}}, []string{"query"}),
+		tool("fetch", "抓取一个已知网址的正文。已经知道项目、文档或页面的网址时优先调用，不要先搜索。只接受 http 或 https，不执行 JavaScript。页面不存在或无法连接时不要反复抓同一个网址，改用 web_search 找到新网址后再调用。不知道具体网址的模糊问题不要使用本工具。", map[string]any{"url": map[string]any{"type": "string", "minLength": 1, "description": "要抓取的 http 或 https 网址"}}, []string{"url"}),
+		tool("web_search", "不知道具体网址时的联网搜索。用于模糊查询、实时信息、事实核验，或 fetch 失败后查找新网址。已经有明确网址时不要用本工具代替 fetch。医药问题可用不同 query 多次查询和比对。不要用于纯写作、翻译或闲聊。", map[string]any{"query": map[string]any{"type": "string", "minLength": 1, "description": "搜索查询词；尽量保留用户原话的关键实体，避免额外修饰"}}, []string{"query"}),
 		tool("download_file", "按文件清单里的 attachmentId，把更早的附件下载到临时 input/。清单已标明“已在 input/”的不要调用。", map[string]any{"attachmentId": map[string]any{"type": "string", "minLength": 1, "description": "文件清单中的 attachmentId"}}, []string{"attachmentId"}),
 		tool("write_file", "写入临时工作区的新文件。脚本用相对路径，例如 analyze.py。留给用户的结果用 output/文件名。不能写 input/。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1}, "content": map[string]any{"type": "string"}}, []string{"path", "content"}),
 		tool("edit_file", "把已有文件里唯一的一段原文替换掉。只改出错的几行，不要重写整个文件。不能改 input/。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1}, "old": map[string]any{"type": "string", "minLength": 1, "description": "文件中唯一的一段原文"}, "new": map[string]any{"type": "string", "description": "替换后的文本"}}, []string{"path", "old", "new"}),
 		tool("run_python", "运行临时工作区里的 .py 相对路径。只读 input/，结果用 print 输出。留给用户的新文件写到 output/。失败后用 edit_file 再运行。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1, "description": "要运行的 .py 相对路径"}}, []string{"path"}),
+		tool("todo_write", "只在多步骤或复杂任务中维护计划。先列出步骤，推进时更新状态。简单问答不要调用。这个工具不读取文件，也不执行命令。", map[string]any{"todos": map[string]any{"type": "array", "minItems": 1, "maxItems": 20, "description": "完整的当前计划，每次调用都提交全部步骤", "items": map[string]any{"type": "object", "properties": map[string]any{"content": map[string]any{"type": "string", "minLength": 1, "description": "一个步骤"}, "status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "pending 未开始，in_progress 进行中，completed 已完成"}}, "required": []string{"content", "status"}}}}, []string{"todos"}),
 	}
 }
 

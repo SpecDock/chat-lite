@@ -26,18 +26,17 @@ type File struct {
 }
 
 type Server struct {
-	Port               string `yaml:"port"`
-	Origin             string `yaml:"origin"`
-	NodeEnv            string `yaml:"node_env"`
-	Production         bool   `yaml:"-"`
-	SchemaPath         string `yaml:"schema_path"`
-	DataDir            string `yaml:"data_dir"`
-	UploadDir          string `yaml:"upload_dir"`
-	SessionCookieName  string `yaml:"session_cookie_name"`
-	SessionTTLDays     int    `yaml:"session_ttl_days"`
-	MaxUploadMB        int    `yaml:"max_upload_mb"`
-	InviteCode         string `yaml:"invite_code"`
-	AnswerHistoryLimit int    `yaml:"answer_history_limit"`
+	Port              string `yaml:"port"`
+	Origin            string `yaml:"origin"`
+	NodeEnv           string `yaml:"node_env"`
+	Production        bool   `yaml:"-"`
+	SchemaPath        string `yaml:"schema_path"`
+	DataDir           string `yaml:"data_dir"`
+	UploadDir         string `yaml:"upload_dir"`
+	SessionCookieName string `yaml:"session_cookie_name"`
+	SessionTTLDays    int    `yaml:"session_ttl_days"`
+	MaxUploadMB       int    `yaml:"max_upload_mb"`
+	InviteCode        string `yaml:"invite_code"`
 }
 
 type Postgres struct {

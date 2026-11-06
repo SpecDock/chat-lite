@@ -524,35 +524,6 @@ func statusOf(err error) int {
 	return 500
 }
 
-func (a *App) loadHistory(ctx context.Context, conversationID, userID, exclude string) []chat.HistoryItem {
-	limit := config.Current().Server.AnswerHistoryLimit
-	if limit <= 0 {
-		limit = 6
-	}
-	rows, err := a.Pool.Query(ctx, `SELECT role, content, status FROM messages WHERE conversation_id=$1 AND user_id=$2 AND id<>$3 AND status IN ('completed','interrupted') ORDER BY created_at DESC, id DESC LIMIT 80`, conversationID, userID, exclude)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var newest []chat.HistoryItem
-	for rows.Next() {
-		var item chat.HistoryItem
-		if err := rows.Scan(&item.Role, &item.Content, &item.Status); err != nil {
-			continue
-		}
-		if visibility.IsModelVisible(item.Role, item.Content, item.Status) {
-			newest = append(newest, item)
-		}
-		if len(newest) >= limit {
-			break
-		}
-	}
-	for i, j := 0, len(newest)-1; i < j; i, j = i+1, j-1 {
-		newest[i], newest[j] = newest[j], newest[i]
-	}
-	return newest
-}
-
 func openContextStore() (*contextstore.Store, bool, error) {
 	cfg := config.Current().Redis
 	if strings.TrimSpace(cfg.Addr) == "" {

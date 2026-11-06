@@ -12,7 +12,6 @@ server:
   session_ttl_days: ${SESSION_TTL_DAYS}
   max_upload_mb: ${MAX_UPLOAD_MB}
   invite_code: ${INVITE_CODE}
-  answer_history_limit: ${ANSWER_HISTORY_LIMIT}
 
 postgres:
   url: ${POSTGRES_URL}
