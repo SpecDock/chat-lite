@@ -3,7 +3,6 @@ package pdftext
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"os/exec"
 	"strings"
@@ -20,7 +19,7 @@ type Result struct {
 	Failure string
 }
 
-func Extract(path string) Result {
+func Extract(path string, think func(string)) Result {
 	text, plumberErr := plumber(path)
 	log.Printf("[pdf] stage=pdfplumber chars=%d err=%s", runeLen(text), errText(plumberErr))
 	if runeLen(text) < MinRunes {
@@ -37,13 +36,8 @@ func Extract(path string) Result {
 		return Result{Text: text}
 	}
 	log.Printf("[pdf] stage=text-layer chars=%d outcome=short", runeLen(text))
-	ocrText, err := Recognize(path)
+	ocrText, err := Recognize(path, think)
 	if err != nil {
-		var timeout ocrTimeoutError
-		if errors.As(err, &timeout) {
-			log.Printf("[pdf] stage=ocr chars=%d outcome=timeout", runeLen(ocrText))
-			return Result{Text: text, Failure: timeout.Error()}
-		}
 		log.Printf("[pdf] stage=ocr chars=%d outcome=failed err=%s", runeLen(ocrText), errText(err))
 		return Result{Text: text, Failure: ocrFailure(err)}
 	}

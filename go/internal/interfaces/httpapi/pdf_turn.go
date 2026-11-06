@@ -63,7 +63,7 @@ func (a *App) parseTurnPDFs(ctx context.Context, userID, conversationID string, 
 			_, _ = a.Pool.Exec(ctx, `UPDATE attachments SET pdf_status='failed', pdf_chars=0 WHERE id=$1`, id)
 			continue
 		}
-		extracted := pdftext.Extract(tmp.Name())
+		extracted := pdftext.Extract(tmp.Name(), think)
 		_ = os.Remove(tmp.Name())
 		text := extracted.Text
 		n := utf8.RuneCountInString(strings.TrimSpace(text))
