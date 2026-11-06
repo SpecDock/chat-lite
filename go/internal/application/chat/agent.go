@@ -128,7 +128,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		if fitErr != nil {
 			return fitErr
 		}
-		delta, err := streamTurn(ctx, messages, tools, replay, in.ConversationID, "decision", round, func(chunk string) {
+		outgoing, hydrateErr := hydrateImageRefs(ctx, pool, in.UserID, in.ConversationID, messages)
+		if hydrateErr != nil {
+			return hydrateErr
+		}
+		delta, err := streamTurn(ctx, outgoing, tools, replay, in.ConversationID, "decision", round, func(chunk string) {
 			emit(Event{Type: "delta", Text: chunk})
 		})
 		if err != nil {
@@ -211,7 +215,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 			return err
 		}
 		finalBody := map[string]any{"model": llm.ModelName(), "temperature": llm.Temperature(), "stream": true, "messages": messages}
-		delta, err := streamTurn(ctx, messages, nil, replay, in.ConversationID, "final", round+1, func(chunk string) {
+		outgoing, hydrateErr := hydrateImageRefs(ctx, pool, in.UserID, in.ConversationID, messages)
+		if hydrateErr != nil {
+			return hydrateErr
+		}
+		delta, err := streamTurn(ctx, outgoing, nil, replay, in.ConversationID, "final", round+1, func(chunk string) {
 			emit(Event{Type: "delta", Text: chunk})
 		})
 		_ = finalBody
@@ -454,24 +462,19 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 			counts[name]--
 			return "无法查看该图片：请选择本轮历史图片候选中的附件。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
-		var filePath, mime string
-		err := pool.QueryRow(ctx, `SELECT file_path, mime_type FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND mime_type LIKE 'image/%'`, id, in.UserID, in.ConversationID).Scan(&filePath, &mime)
+		var filePath string
+		err := pool.QueryRow(ctx, `SELECT file_path FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND mime_type LIKE 'image/%'`, id, in.UserID, in.ConversationID).Scan(&filePath)
 		if err != nil {
 			counts["total"]--
 			counts[name]--
 			return "无法查看该图片：图片不存在、无权访问或不属于当前会话。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
-		buf, err := storage.Read(ctx, filePath)
-		if err != nil {
+		if _, err = storage.Read(ctx, filePath); err != nil {
 			counts["total"]--
 			counts[name]--
 			return "无法读取该图片文件，请重新上传后再试。", nil, []Event{{Type: "think", Text: "工具调用失败：view_image"}}
 		}
-		if mime == "" {
-			mime = "image/png"
-		}
-		dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(buf)
-		return "已加载历史图片 " + id + "。图片本体已加入上下文，可据此识别或搜索。", map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL}}, []Event{{Type: "think", Text: "工具完成：view_image"}}
+		return "已加载历史图片 " + id + "。图片本体已加入上下文，可据此识别或搜索。", imageRef(id), []Event{{Type: "think", Text: "工具完成：view_image"}}
 	case "download_file":
 		return runDownload(ctx, pool, in, work, stringArg(args["attachmentId"]))
 	case "write_file":
@@ -637,7 +640,7 @@ func applySpillNote(content any, note string) any {
 	kept := []any{map[string]any{"type": "text", "text": note}}
 	for _, part := range parts {
 		block, ok := part.(map[string]any)
-		if ok && block["type"] == "image_url" {
+		if ok && (block["type"] == "image_url" || block["type"] == "image_ref") {
 			kept = append(kept, part)
 		}
 	}
@@ -801,6 +804,75 @@ func structuredSandboxResult(result sandbox.Result, validationError string) stri
 	return string(raw)
 }
 
+func imageRef(id string) map[string]any {
+	return map[string]any{"type": "image_ref", "attachmentId": id}
+}
+
+func hydrateImageRefs(ctx context.Context, pool *pgxpool.Pool, userID, conversationID string, messages []any) ([]any, error) {
+	return expandImageRefs(messages, func(id string) map[string]any {
+		part, err := loadImagePart(ctx, pool, userID, conversationID, id)
+		if err != nil {
+			return map[string]any{"type": "text", "text": "图片附件 " + id + " 无法读取"}
+		}
+		return part
+	}), nil
+}
+
+func expandImageRefs(messages []any, load func(string) map[string]any) []any {
+	out := make([]any, len(messages))
+	for i, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			out[i] = raw
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			out[i] = raw
+			continue
+		}
+		next := make([]any, len(parts))
+		changed := false
+		for j, part := range parts {
+			block, ok := part.(map[string]any)
+			id, _ := block["attachmentId"].(string)
+			if !ok || block["type"] != "image_ref" || strings.TrimSpace(id) == "" {
+				next[j] = part
+				continue
+			}
+			changed = true
+			next[j] = load(id)
+		}
+		if !changed {
+			out[i] = raw
+			continue
+		}
+		cloned := make(map[string]any, len(msg))
+		for key, value := range msg {
+			cloned[key] = value
+		}
+		cloned["content"] = next
+		out[i] = cloned
+	}
+	return out
+}
+
+func loadImagePart(ctx context.Context, pool *pgxpool.Pool, userID, conversationID, id string) (map[string]any, error) {
+	var filePath, mime string
+	err := pool.QueryRow(ctx, `SELECT file_path, mime_type FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND mime_type LIKE 'image/%'`, id, userID, conversationID).Scan(&filePath, &mime)
+	if err != nil {
+		return nil, err
+	}
+	buf, err := storage.Read(ctx, filePath)
+	if err != nil {
+		return nil, err
+	}
+	if mime == "" {
+		mime = "image/png"
+	}
+	return map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(buf)}}, nil
+}
+
 func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 	if len(in.AttachmentIDs) == 0 {
 		return in.UserInput
@@ -829,14 +901,10 @@ func buildUserContent(ctx context.Context, pool *pgxpool.Pool, in Input) any {
 		if !strings.HasPrefix(mime, "image/") {
 			continue
 		}
-		buf, err := storage.Read(ctx, filePath)
-		if err != nil {
-			continue
-		}
 		if len(parts) == 0 {
 			parts = append(parts, map[string]any{"type": "text", "text": text})
 		}
-		parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(buf)}})
+		parts = append(parts, imageRef(id))
 	}
 	var extra []string
 	if len(pdfNotes) > 0 {
