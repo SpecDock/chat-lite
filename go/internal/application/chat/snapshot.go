@@ -36,8 +36,8 @@ func LoadSnapshotSource(ctx context.Context, pool *pgxpool.Pool, conversationID,
 	return messages, version
 }
 
-func InvalidateSnapshots(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) {
-	_, _ = pool.Exec(ctx, `UPDATE conversation_context_snapshots SET status='invalid' WHERE conversation_id=$1 AND user_id=$2 AND status IN ('current','pending')`, conversationID, userID)
+func DeleteCurrentSnapshots(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) {
+	_, _ = pool.Exec(ctx, `DELETE FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND status IN ('current','pending')`, conversationID, userID)
 }
 
 func SaveSnapshot(ctx context.Context, pool *pgxpool.Pool, conversationID, userID, messageID, createdAt string, messages []any) error {
@@ -62,7 +62,7 @@ func SaveSnapshot(ctx context.Context, pool *pgxpool.Pool, conversationID, userI
 	if _, err = tx.Exec(ctx, `INSERT INTO conversation_context_snapshots (id,conversation_id,user_id,version,covered_message_id,covered_message_created_at,context_json,status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8)`, id, conversationID, userID, version, messageID, createdAt, raw, now); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='superseded' WHERE conversation_id=$1 AND user_id=$2 AND status='current' AND id<>$3`, conversationID, userID, id); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND id<>$3`, conversationID, userID, id); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='current' WHERE id=$1`, id); err != nil {
@@ -114,7 +114,7 @@ func SaveSnapshotWithSourceVersion(ctx context.Context, pool *pgxpool.Pool, conv
 	if _, err = tx.Exec(ctx, `INSERT INTO conversation_context_snapshots (id,conversation_id,user_id,version,covered_message_id,covered_message_created_at,context_json,status,created_at,source_version) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'pending',$8,$9)`, id, conversationID, userID, version, messageID, created, string(raw), now, sourceVersion); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='superseded' WHERE conversation_id=$1 AND user_id=$2 AND status='current' AND id<>$3`, conversationID, userID, id); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND id<>$3`, conversationID, userID, id); err != nil {
 		return false, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='current' WHERE id=$1`, id); err != nil {

@@ -1013,12 +1013,13 @@ func (a *App) replaceLatest(ctx context.Context, conversationID, userID string, 
 	if _, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=$1 WHERE id=$2 AND user_id=$3`, idgen.NowISO(), conversationID, userID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='invalid' WHERE conversation_id=$1 AND user_id=$2 AND status IN ('current','pending')`, conversationID, userID); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND status IN ('current','pending')`, conversationID, userID); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
+	dropContextCache(ctx, conversationID)
 	a.syncSearchDocument(ctx, pair.User.ID)
 	a.syncSearchDocument(ctx, assistantID)
 	return nil

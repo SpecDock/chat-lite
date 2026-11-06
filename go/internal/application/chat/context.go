@@ -79,7 +79,7 @@ func (p *PreparedContext) RunSummary(ctx context.Context, pool *pgxpool.Pool, us
 		p.History = p.History[len(p.History)-retain:]
 	}
 	saveContextState(ctx, pool, conversationID, userID, next, estimateTokens(next), p.cursorAt, p.cursorID, time.Now().UTC().Format(time.RFC3339Nano))
-	InvalidateSnapshots(ctx, pool, conversationID, userID)
+	DeleteCurrentSnapshots(ctx, pool, conversationID, userID)
 	log.Printf("[conversation-context] compacted conversation=%s dropped=%d", conversationID, len(p.dropped))
 	p.NeedsSummary = false
 	return true
@@ -289,7 +289,7 @@ func imageCount(content any) int {
 	total := 0
 	for _, part := range parts {
 		block, ok := part.(map[string]any)
-		if ok && block["type"] == "image_url" {
+		if ok && (block["type"] == "image_url" || block["type"] == "image_ref") {
 			total++
 		}
 	}

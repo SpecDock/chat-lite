@@ -292,6 +292,7 @@ func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {
 		rag.DeleteConversation(r.Context(), a.Pool, conversationID)
 		dropContextCache(r.Context(), conversationID)
 	} else {
+		dropContextCache(r.Context(), conversationID)
 		rag.DeleteMessage(r.Context(), a.Pool, user.UserID, pair.User.ID)
 		if pair.Assistant != nil {
 			rag.DeleteMessage(r.Context(), a.Pool, user.UserID, pair.Assistant.ID)
@@ -470,7 +471,7 @@ func (a *App) discardAssistant(ctx context.Context, conversationID, userID, assi
 	_, _ = a.Pool.Exec(ctx, `UPDATE messages SET status='interrupted', content='已取消' WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND role='assistant' AND status IN ('streaming','completed')`, assistantID, userID, conversationID)
 	rag.DeleteMessage(ctx, a.Pool, userID, assistantID)
 	if revertSnapshot {
-		chat.InvalidateSnapshots(ctx, a.Pool, conversationID, userID)
+		chat.DeleteCurrentSnapshots(ctx, a.Pool, conversationID, userID)
 	}
 }
 
@@ -654,7 +655,9 @@ func (a *App) deleteMessagePairData(ctx context.Context, conversationID, userID 
 	if _, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=$1 WHERE id=$2 AND user_id=$3`, idgen.NowISO(), conversationID, userID); err != nil {
 		return false, nil, nil, err
 	}
-	_, _ = tx.Exec(ctx, `UPDATE conversation_context_snapshots SET status='invalid' WHERE conversation_id=$1 AND user_id=$2 AND (covered_message_created_at>$3 OR (covered_message_created_at=$3 AND covered_message_id>=$4))`, conversationID, userID, pair.User.CreatedAt, pair.User.ID)
+	if _, err = tx.Exec(ctx, `DELETE FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND (covered_message_created_at>$3 OR (covered_message_created_at=$3 AND covered_message_id>=$4))`, conversationID, userID, pair.User.CreatedAt, pair.User.ID); err != nil {
+		return false, nil, nil, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return false, nil, nil, err
 	}
