@@ -56,5 +56,10 @@ docker cp "$container":/app/dist/. deploy/www/chat/
 docker rm "$container" >/dev/null
 echo "Frontend files are in deploy/www/chat"
 if [ -f docker-compose.web.yml ]; then
-  docker compose -f docker-compose.web.yml up -d
+  echo "Recreating nginx so it mounts the new frontend directory..."
+  docker compose -f docker-compose.web.yml up -d --force-recreate nginx
+fi
+if [ "$STOP_BEFORE_BUILD" = "1" ] && [ -f "$COMPOSE_FILE" ]; then
+  echo "Starting chat-lite and sandbox-broker..."
+  docker compose -f "$COMPOSE_FILE" up -d chat-lite sandbox-broker
 fi
