@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -212,9 +214,26 @@ func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, 200, map[string]bool{"ok": true})
 }
 
+const messagePageSize = 6
+
+const messageListSQL = `SELECT id,conversation_id,role,content,status,created_at FROM messages`
+
+type messagePage struct {
+	Messages []messageDTO `json:"messages"`
+	HasOlder bool         `json:"hasOlder"`
+	HasNewer bool         `json:"hasNewer"`
+}
+
+var errCursorMessageNotFound = errors.New("cursor message not found")
+
 func (a *App) listMessagesRoute(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	id := r.PathValue("id")
+	mode, cursorID, invalid := parseMessagePageQuery(r.URL.Query())
+	if invalid {
+		httpx.Error(w, 400, "只能指定 around、before、after 中的一个")
+		return
+	}
 	exists, err := a.conversationExists(r.Context(), id, user.UserID)
 	if err != nil {
 		httpx.Error(w, 500, "服务器错误")
@@ -224,22 +243,211 @@ func (a *App) listMessagesRoute(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, 404, "会话不存在")
 		return
 	}
-	rows, err := a.Pool.Query(r.Context(), `SELECT id,conversation_id,role,content,status,created_at FROM messages WHERE conversation_id=$1 AND user_id=$2 ORDER BY created_at ASC, id ASC`, id, user.UserID)
+	page, err := a.loadMessagePage(r.Context(), id, user.UserID, mode, cursorID)
 	if err != nil {
+		if errors.Is(err, errCursorMessageNotFound) {
+			httpx.Error(w, 404, "消息不存在")
+			return
+		}
 		httpx.Error(w, 500, "服务器错误")
 		return
+	}
+	httpx.WriteJSON(w, 200, page)
+}
+
+func parseMessagePageQuery(q url.Values) (mode, cursor string, invalid bool) {
+	for _, key := range []string{"around", "before", "after"} {
+		vals, ok := q[key]
+		if !ok {
+			continue
+		}
+		if mode != "" || len(vals) != 1 || strings.TrimSpace(vals[0]) == "" {
+			return "", "", true
+		}
+		mode = key
+		cursor = vals[0]
+	}
+	return mode, cursor, false
+}
+
+func (a *App) loadMessagePage(ctx context.Context, conversationID, userID, mode, cursorID string) (messagePage, error) {
+	if mode == "" {
+		return a.latestMessagePage(ctx, conversationID, userID)
+	}
+	cursor, err := a.findConversationMessage(ctx, conversationID, userID, cursorID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	if cursor == nil {
+		return messagePage{}, errCursorMessageNotFound
+	}
+	switch mode {
+	case "before":
+		return a.beforeMessagePage(ctx, conversationID, userID, cursor)
+	case "after":
+		return a.afterMessagePage(ctx, conversationID, userID, cursor)
+	case "around":
+		return a.aroundMessagePage(ctx, conversationID, userID, cursor)
+	default:
+		return messagePage{}, errors.New("invalid message page mode")
+	}
+}
+
+func (a *App) latestMessagePage(ctx context.Context, conversationID, userID string) (messagePage, error) {
+	list, err := a.queryMessageList(ctx, messageListSQL+`
+		WHERE conversation_id=$1 AND user_id=$2
+		ORDER BY created_at DESC, id DESC
+		LIMIT `+strconv.Itoa(messagePageSize+1), conversationID, userID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	page, hasOlder := trimNewest(list, messagePageSize)
+	return newMessagePage(page, hasOlder, false), nil
+}
+
+func (a *App) beforeMessagePage(ctx context.Context, conversationID, userID string, cursor *messageDTO) (messagePage, error) {
+	list, err := a.queryMessageList(ctx, messageListSQL+`
+		WHERE conversation_id=$1 AND user_id=$2
+		  AND (created_at<$3 OR (created_at=$3 AND id<$4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT `+strconv.Itoa(messagePageSize+1), conversationID, userID, cursor.CreatedAt, cursor.ID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	page, hasOlder := trimNewest(list, messagePageSize)
+	// The cursor itself is strictly newer than this window, including when the window is empty.
+	return newMessagePage(page, hasOlder, true), nil
+}
+
+func (a *App) afterMessagePage(ctx context.Context, conversationID, userID string, cursor *messageDTO) (messagePage, error) {
+	list, err := a.queryMessageList(ctx, messageListSQL+`
+		WHERE conversation_id=$1 AND user_id=$2
+		  AND (created_at>$3 OR (created_at=$3 AND id>$4))
+		ORDER BY created_at ASC, id ASC
+		LIMIT `+strconv.Itoa(messagePageSize+1), conversationID, userID, cursor.CreatedAt, cursor.ID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	hasNewer := len(list) > messagePageSize
+	if hasNewer {
+		list = list[:messagePageSize]
+	}
+	// The cursor itself is strictly older than this window, including when the window is empty.
+	return newMessagePage(list, true, hasNewer), nil
+}
+
+func (a *App) aroundMessagePage(ctx context.Context, conversationID, userID string, cursor *messageDTO) (messagePage, error) {
+	before, err := a.queryMessageList(ctx, messageListSQL+`
+		WHERE conversation_id=$1 AND user_id=$2
+		  AND (created_at<$3 OR (created_at=$3 AND id<$4))
+		ORDER BY created_at DESC, id DESC
+		LIMIT `+strconv.Itoa(messagePageSize), conversationID, userID, cursor.CreatedAt, cursor.ID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	reverseMessages(before)
+	after, err := a.queryMessageList(ctx, messageListSQL+`
+		WHERE conversation_id=$1 AND user_id=$2
+		  AND (created_at>$3 OR (created_at=$3 AND id>$4))
+		ORDER BY created_at ASC, id ASC
+		LIMIT `+strconv.Itoa(messagePageSize), conversationID, userID, cursor.CreatedAt, cursor.ID)
+	if err != nil {
+		return messagePage{}, err
+	}
+	window, hasOlder, hasNewer := fitAround(before, after, *cursor, messagePageSize)
+	return newMessagePage(window, hasOlder, hasNewer), nil
+}
+
+func (a *App) findConversationMessage(ctx context.Context, conversationID, userID, messageID string) (*messageDTO, error) {
+	var item messageDTO
+	err := a.Pool.QueryRow(ctx, messageListSQL+` WHERE id=$1 AND conversation_id=$2 AND user_id=$3`, messageID, conversationID, userID).
+		Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (a *App) queryMessageList(ctx context.Context, query string, args ...any) ([]messageDTO, error) {
+	rows, err := a.Pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	list := []messageDTO{}
 	for rows.Next() {
 		var item messageDTO
 		if err := rows.Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt); err != nil {
-			httpx.Error(w, 500, "服务器错误")
-			return
+			return nil, err
 		}
 		list = append(list, item)
 	}
-	httpx.WriteJSON(w, 200, map[string]any{"messages": list})
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func newMessagePage(messages []messageDTO, hasOlder, hasNewer bool) messagePage {
+	if messages == nil {
+		messages = []messageDTO{}
+	}
+	return messagePage{Messages: messages, HasOlder: hasOlder, HasNewer: hasNewer}
+}
+
+func trimNewest(list []messageDTO, limit int) ([]messageDTO, bool) {
+	more := len(list) > limit
+	if more {
+		list = list[:limit]
+	}
+	reverseMessages(list)
+	if list == nil {
+		list = []messageDTO{}
+	}
+	return list, more
+}
+
+func reverseMessages(list []messageDTO) {
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
+}
+
+// fitAround returns a chronological window of at most limit messages containing anchor.
+// before and after are chronological: the nearest older messages are at the end of before,
+// and the nearest newer messages are at the start of after. Neighbor slots are split in half
+// first; leftover slots fill the older side, then the newer side, so a short side is topped up
+// from the other side. Callers pass one extra message per side so the bools can see past the window.
+func fitAround(before, after []messageDTO, anchor messageDTO, limit int) ([]messageDTO, bool, bool) {
+	if limit < 1 {
+		return []messageDTO{anchor}, false, false
+	}
+	slots := limit - 1
+	half := slots / 2
+	takeBefore := min(half, len(before))
+	takeAfter := min(half, len(after))
+	leftover := slots - takeBefore - takeAfter
+	if extra := len(before) - takeBefore; extra > 0 {
+		if extra > leftover {
+			extra = leftover
+		}
+		takeBefore += extra
+		leftover -= extra
+	}
+	if extra := len(after) - takeAfter; extra > 0 && leftover > 0 {
+		if extra > leftover {
+			extra = leftover
+		}
+		takeAfter += extra
+	}
+	window := make([]messageDTO, 0, takeBefore+1+takeAfter)
+	window = append(window, before[len(before)-takeBefore:]...)
+	window = append(window, anchor)
+	window = append(window, after[:takeAfter]...)
+	return window, len(before) > takeBefore, len(after) > takeAfter
 }
 
 func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {

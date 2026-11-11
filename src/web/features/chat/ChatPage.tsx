@@ -410,7 +410,7 @@ function safeRemoveItem(key: string) {
 
 function parseEventData(event: MessageEvent) {
   try {
-    return JSON.parse(event.data || '{}') as { conversationId?: string; reason?: string };
+    return JSON.parse(event.data || '{}') as { conversationId?: string; reason?: string; userMessageId?: string; messageId?: string };
   } catch {
     return {};
   }
@@ -446,6 +446,48 @@ function removeRecordValue<T>(record: Record<string, T>, key: string): Record<st
   const next = { ...record };
   delete next[key];
   return next;
+}
+
+type MessagePageQuery = { around?: string; before?: string; after?: string };
+type MessagePage = { messages: MessageDTO[]; hasOlder: boolean; hasNewer: boolean };
+type MessageWindow = { hasOlder: boolean; hasNewer: boolean };
+
+function fetchMessagePage(conversationId: string, query?: MessagePageQuery) {
+  return api.messages(conversationId, query).then(result => ({
+    messages: result?.messages ?? [],
+    hasOlder: result?.hasOlder === true,
+    hasNewer: result?.hasNewer === true,
+  }));
+}
+
+function isMissingMessage(error: unknown) {
+  return error instanceof Error && /消息不存在|消息已不存在/.test(error.message);
+}
+
+function isBeforeMessage(message: MessageDTO, boundary: MessageDTO) {
+  if (message.created_at !== boundary.created_at) return message.created_at < boundary.created_at;
+  return message.id < boundary.id;
+}
+
+function mergeLatestMessages(existing: MessageDTO[], latest: MessageDTO[]) {
+  if (latest.length === 0) return existing;
+  if (existing.length === 0) return latest;
+  const latestIds = new Set(latest.map(message => message.id));
+  const overlapIndex = existing.findIndex(message => latestIds.has(message.id));
+  if (overlapIndex >= 0) {
+    const older = existing.slice(0, overlapIndex).filter(message => !latestIds.has(message.id));
+    return [...older, ...latest];
+  }
+  const boundary = latest[0];
+  const older = existing.filter(message => isBeforeMessage(message, boundary));
+  return [...older, ...latest];
+}
+
+function withoutDeletedPair(messages: MessageDTO[], userMessageId: string) {
+  const index = messages.findIndex(message => message.id === userMessageId);
+  if (index < 0) return messages;
+  const removeAssistant = messages[index + 1]?.role === 'assistant';
+  return [...messages.slice(0, index), ...messages.slice(index + (removeAssistant ? 2 : 1))];
 }
 
 type ScrollIntent = 'restore' | 'bottom' | 'follow';
@@ -494,6 +536,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const [convs, setConvs] = useState<ConversationDTO[]>([]);
   const [current, setCurrent] = useState<string>();
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, MessageDTO[]>>({});
+  const [messageWindows, setMessageWindows] = useState<Record<string, MessageWindow>>({});
   const [pendingByConversation, setPendingByConversation] = useState<Record<string, AttachmentDTO[]>>({});
   const [refillByConversation, setRefillByConversation] = useState<Record<string, Refill>>({});
   const [errorsByConversation, setErrorsByConversation] = useState<Record<string, string>>({});
@@ -514,6 +557,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const [imagePreview, setImagePreview] = useState<{ src: string; alt: string }>();
   const [studioOpen, setStudioOpen] = useState(() => safeGetItem(studioStorageKey) === '1');
   const [scrollIntent, setScrollIntent] = useState<ScrollIntent>(initialScroll);
+  const [bottomNonce, setBottomNonce] = useState(0);
   const restoredRef = useRef(false);
   const currentRef = useRef<string | undefined>(undefined);
   const tasksRef = useRef<Map<string, ActiveTask>>(new Map());
@@ -523,6 +567,12 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const workspaceRequestRef = useRef(0);
   const searchTriggerRef = useRef<HTMLButtonElement | null>(null);
   const searchSelectionRef = useRef(0);
+  const messagesByConversationRef = useRef(messagesByConversation);
+  const messageWindowsRef = useRef(messageWindows);
+  const olderRequestsRef = useRef(new Set<string>());
+  const newerRequestsRef = useRef(new Set<string>());
+  const messageLoadEpochRef = useRef<Record<string, number>>({});
+  const pendingJumpRef = useRef<{ conversationId: string; messageId: string; selectionId: number } | null>(null);
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const drawerBackdropRef = useRef<HTMLButtonElement | null>(null);
   const drawerGestureRef = useRef<DrawerGesture | null>(null);
@@ -1077,7 +1127,49 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }
 
   function updateMessages(key: string, update: (messages: MessageDTO[]) => MessageDTO[]) {
-    setMessagesByConversation(cache => ({ ...cache, [key]: update(cache[key] || []) }));
+    const next = { ...messagesByConversationRef.current, [key]: update(messagesByConversationRef.current[key] || []) };
+    messagesByConversationRef.current = next;
+    setMessagesByConversation(next);
+  }
+
+  function commitMessages(key: string, messages: MessageDTO[]) {
+    const next = { ...messagesByConversationRef.current, [key]: messages };
+    messagesByConversationRef.current = next;
+    setMessagesByConversation(next);
+  }
+
+  function commitWindow(key: string, messageWindow: MessageWindow) {
+    const next = { ...messageWindowsRef.current, [key]: messageWindow };
+    messageWindowsRef.current = next;
+    setMessageWindows(next);
+  }
+
+  function bumpMessageEpoch(conversationId: string) {
+    const next = (messageLoadEpochRef.current[conversationId] || 0) + 1;
+    messageLoadEpochRef.current[conversationId] = next;
+    return next;
+  }
+
+  function noteMessageLoadError(conversationId: string, error: unknown) {
+    if (error instanceof Error && /404|会话不存在|文件不存在/.test(error.message)) clearDeletedConversation(conversationId);
+  }
+
+  function applyMessageActivity(conversationId: string, loaded: MessageDTO[]) {
+    const stillStreaming = loaded.some(message => message.status === 'streaming');
+    setActivities(currentActivities => {
+      if (stillStreaming) {
+        return transitionConversationActivity(currentActivities, conversationId, 'streaming', currentRef.current === conversationId);
+      }
+      if (currentActivities[conversationId]?.status !== 'streaming') return currentActivities;
+      const latestAssistant = [...loaded].reverse().find(message => message.role === 'assistant');
+      if (latestAssistant?.status === 'completed') {
+        return transitionConversationActivity(currentActivities, conversationId, 'completed', currentRef.current === conversationId);
+      }
+      if (latestAssistant?.status === 'error' || latestAssistant?.status === 'interrupted') {
+        return transitionConversationActivity(currentActivities, conversationId, 'error', currentRef.current === conversationId);
+      }
+      return currentActivities;
+    });
   }
 
   function flushTaskDelta(task: ActiveTask) {
@@ -1132,7 +1224,16 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   function migrateConversationKey(fromKey: string, toKey: string) {
     if (fromKey === toKey) return;
     keyAliasesRef.current.set(fromKey, toKey);
-    setMessagesByConversation(cache => moveRecordValue(cache, fromKey, toKey));
+    const movedMessages = moveRecordValue(messagesByConversationRef.current, fromKey, toKey);
+    messagesByConversationRef.current = movedMessages;
+    setMessagesByConversation(movedMessages);
+    const movedWindows = moveRecordValue(messageWindowsRef.current, fromKey, toKey);
+    messageWindowsRef.current = movedWindows;
+    setMessageWindows(movedWindows);
+    if (fromKey in messageLoadEpochRef.current) {
+      messageLoadEpochRef.current[toKey] = messageLoadEpochRef.current[fromKey];
+      delete messageLoadEpochRef.current[fromKey];
+    }
     setPendingByConversation(cache => moveRecordValue(cache, fromKey, toKey));
     setRefillByConversation(cache => moveRecordValue(cache, fromKey, toKey));
     setErrorsByConversation(cache => moveRecordValue(cache, fromKey, toKey));
@@ -1175,7 +1276,13 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       task.controller.abort();
     }
     tasksRef.current.delete(key);
-    setMessagesByConversation(cache => removeRecordValue(cache, key));
+    bumpMessageEpoch(key);
+    const remainingMessages = removeRecordValue(messagesByConversationRef.current, key);
+    messagesByConversationRef.current = remainingMessages;
+    setMessagesByConversation(remainingMessages);
+    const remainingWindows = removeRecordValue(messageWindowsRef.current, key);
+    messageWindowsRef.current = remainingWindows;
+    setMessageWindows(remainingWindows);
     setPendingByConversation(cache => removeRecordValue(cache, key));
     setRefillByConversation(cache => removeRecordValue(cache, key));
     setErrorsByConversation(cache => removeRecordValue(cache, key));
@@ -1199,38 +1306,161 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     return result.conversations;
   };
 
+  async function loadLatest(conversationId?: string, propagateError = false, isRelevant?: () => boolean) {
+    if (!conversationId) return;
+    if (tasksRef.current.has(conversationId)) return messagesByConversationRef.current[conversationId];
+    const epoch = bumpMessageEpoch(conversationId);
+    let result: MessagePage | undefined;
+    try {
+      result = await fetchMessagePage(conversationId);
+    } catch (error) {
+      if (isRelevant && !isRelevant()) return;
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      noteMessageLoadError(conversationId, error);
+      if (propagateError) throw error;
+      return;
+    }
+    if (!result || (isRelevant && !isRelevant())) return result?.messages;
+    if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return result.messages;
+    if (tasksRef.current.has(conversationId) || stopRequestedRef.current.has(conversationId)) return result.messages;
+    commitMessages(conversationId, result.messages);
+    commitWindow(conversationId, { hasOlder: result.hasOlder, hasNewer: result.hasNewer });
+    applyMessageActivity(conversationId, result.messages);
+    return result.messages;
+  }
+
   const refreshMessages = async (conversationId?: string, propagateError = false, isRelevant?: () => boolean) => {
     if (!conversationId) return;
-    if (tasksRef.current.has(conversationId)) return messagesByConversation[conversationId];
-    const result = await api.messages(conversationId).catch(error => {
-      if (isRelevant && !isRelevant()) return undefined;
-      if (error instanceof Error && /404|会话不存在|文件不存在/.test(error.message)) {
-        clearDeletedConversation(conversationId);
-      }
+    if (tasksRef.current.has(conversationId)) return messagesByConversationRef.current[conversationId];
+    if (messageWindowsRef.current[conversationId]?.hasNewer) return messagesByConversationRef.current[conversationId];
+    const epoch = messageLoadEpochRef.current[conversationId] || 0;
+    let result: MessagePage | undefined;
+    try {
+      result = await fetchMessagePage(conversationId);
+    } catch (error) {
+      if (isRelevant && !isRelevant()) return;
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      noteMessageLoadError(conversationId, error);
       if (propagateError) throw error;
-      return undefined;
-    });
-    if (result && (!isRelevant || isRelevant()) && !tasksRef.current.has(conversationId)) {
-      const stillStreaming = result.messages.some(message => message.status === 'streaming');
-      if (stopRequestedRef.current.has(conversationId)) return result.messages;
-      setMessagesByConversation(cache => ({ ...cache, [conversationId]: result.messages }));
-      setActivities(currentActivities => {
-        if (stillStreaming) {
-          return transitionConversationActivity(currentActivities, conversationId, 'streaming', currentRef.current === conversationId);
-        }
-        if (currentActivities[conversationId]?.status !== 'streaming') return currentActivities;
-        const latestAssistant = [...result.messages].reverse().find(message => message.role === 'assistant');
-        if (latestAssistant?.status === 'completed') {
-          return transitionConversationActivity(currentActivities, conversationId, 'completed', currentRef.current === conversationId);
-        }
-        if (latestAssistant?.status === 'error' || latestAssistant?.status === 'interrupted') {
-          return transitionConversationActivity(currentActivities, conversationId, 'error', currentRef.current === conversationId);
-        }
-        return currentActivities;
-      });
+      return;
     }
-    return result?.messages;
+    if (!result || (isRelevant && !isRelevant())) return result?.messages;
+    if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return result.messages;
+    if (tasksRef.current.has(conversationId) || stopRequestedRef.current.has(conversationId)) return result.messages;
+    if (messageWindowsRef.current[conversationId]?.hasNewer) return messagesByConversationRef.current[conversationId];
+    const existing = messagesByConversationRef.current[conversationId] || [];
+    const merged = result.messages.length === 0 ? [] : mergeLatestMessages(existing, result.messages);
+    const keptOlder = result.messages.length > 0 && merged[0]?.id !== result.messages[0]?.id;
+    const previous = messageWindowsRef.current[conversationId];
+    commitMessages(conversationId, merged);
+    commitWindow(conversationId, {
+      hasOlder: result.messages.length === 0 ? false : (keptOlder ? previous?.hasOlder === true : result.hasOlder),
+      hasNewer: result.messages.length === 0 ? false : result.hasNewer,
+    });
+    applyMessageActivity(conversationId, result.messages);
+    return merged;
   };
+
+  async function loadAround(conversationId: string, messageId: string, isViewCurrent: () => boolean, isSelectionActive: () => boolean) {
+    const epoch = bumpMessageEpoch(conversationId);
+    let result: MessagePage | undefined;
+    try {
+      result = await fetchMessagePage(conversationId, { around: messageId });
+    } catch (error) {
+      if (!isSelectionActive()) return;
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      const message = error instanceof Error ? error.message : '消息加载失败';
+      const conversationMissing = /404|会话不存在|文件不存在/.test(message);
+      const messageMissing = /消息不存在|消息已不存在/.test(message);
+      if (conversationMissing && !messageMissing) noteMessageLoadError(conversationId, error);
+      setJumpTarget(currentTarget => currentTarget?.conversationId === conversationId && currentTarget.messageId === messageId ? undefined : currentTarget);
+      setJumpReady(false);
+      const targetKey = currentRef.current === conversationId ? conversationId : EMPTY_CONVERSATION_KEY;
+      setConversationError(targetKey, conversationMissing || messageMissing ? '消息已不存在' : message);
+      return;
+    }
+    if (!isViewCurrent() || (messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+    if (tasksRef.current.has(conversationId)) return;
+    if (!result.messages.some(message => message.id === messageId)) {
+      setJumpTarget(currentTarget => currentTarget?.conversationId === conversationId && currentTarget.messageId === messageId ? undefined : currentTarget);
+      setJumpReady(false);
+      setConversationError(conversationId, '消息已不存在');
+      return;
+    }
+    commitMessages(conversationId, result.messages);
+    commitWindow(conversationId, { hasOlder: result.hasOlder, hasNewer: result.hasNewer });
+    setJumpReady(true);
+  }
+
+  async function loadOlder(conversationId: string) {
+    if (olderRequestsRef.current.has(conversationId)) return;
+    if (!messageWindowsRef.current[conversationId]?.hasOlder) return;
+    const existing = messagesByConversationRef.current[conversationId] || [];
+    const earliest = existing[0];
+    if (!earliest) return;
+    const epoch = messageLoadEpochRef.current[conversationId] || 0;
+    olderRequestsRef.current.add(conversationId);
+    try {
+      const result = await fetchMessagePage(conversationId, { before: earliest.id });
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      const current = messagesByConversationRef.current[conversationId] || [];
+      if (current[0]?.id !== earliest.id) return;
+      const seen = new Set(current.map(message => message.id));
+      const older = result.messages.filter(message => !seen.has(message.id));
+      if (older.length > 0) commitMessages(conversationId, [...older, ...current]);
+      commitWindow(conversationId, {
+        hasOlder: result.hasOlder,
+        hasNewer: messageWindowsRef.current[conversationId]?.hasNewer === true,
+      });
+    } catch (error) {
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      if (isMissingMessage(error)) {
+        commitWindow(conversationId, {
+          hasOlder: false,
+          hasNewer: messageWindowsRef.current[conversationId]?.hasNewer === true,
+        });
+        return;
+      }
+      noteMessageLoadError(conversationId, error);
+    } finally {
+      olderRequestsRef.current.delete(conversationId);
+    }
+  }
+
+  async function loadNewer(conversationId: string) {
+    if (newerRequestsRef.current.has(conversationId)) return;
+    if (!messageWindowsRef.current[conversationId]?.hasNewer) return;
+    const existing = messagesByConversationRef.current[conversationId] || [];
+    const latest = existing[existing.length - 1];
+    if (!latest) return;
+    const epoch = messageLoadEpochRef.current[conversationId] || 0;
+    newerRequestsRef.current.add(conversationId);
+    try {
+      const result = await fetchMessagePage(conversationId, { after: latest.id });
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      const current = messagesByConversationRef.current[conversationId] || [];
+      if (current[current.length - 1]?.id !== latest.id) return;
+      const seen = new Set(current.map(message => message.id));
+      const newer = result.messages.filter(message => !seen.has(message.id));
+      if (newer.length > 0) commitMessages(conversationId, [...current, ...newer]);
+      commitWindow(conversationId, {
+        hasOlder: messageWindowsRef.current[conversationId]?.hasOlder === true,
+        hasNewer: result.hasNewer,
+      });
+    } catch (error) {
+      if ((messageLoadEpochRef.current[conversationId] || 0) !== epoch) return;
+      if (isMissingMessage(error)) {
+        commitWindow(conversationId, {
+          hasOlder: messageWindowsRef.current[conversationId]?.hasOlder === true,
+          hasNewer: false,
+        });
+        return;
+      }
+      noteMessageLoadError(conversationId, error);
+    } finally {
+      newerRequestsRef.current.delete(conversationId);
+    }
+  }
 
   useEffect(() => {
     if (!currentConversationId || tasksRef.current.has(currentConversationId)) return;
@@ -1280,22 +1510,37 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       const list = await refreshConversations();
       const saved = safeGetItem(storageKey);
       if (saved && list.some(conversation => conversation.id === saved)) {
-        setScrollIntent(initialScroll);
+        setScrollIntent('bottom');
         currentRef.current = saved;
         setCurrent(saved);
       } else if (!saved && list.length === 1) {
-        setScrollIntent(initialScroll === 'bottom' ? 'bottom' : 'restore');
+        setScrollIntent('bottom');
         currentRef.current = list[0].id;
         setCurrent(list[0].id);
       }
     })().catch(error => setConversationError(EMPTY_CONVERSATION_KEY, error instanceof Error ? error.message : '会话加载失败'));
-  }, [initialScroll, storageKey]);
+  }, [storageKey]);
 
   useEffect(() => {
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
     const conversationId = conversationIdForKey(current);
-    if (conversationId) void refreshMessages(conversationId);
+    if (!conversationId) return;
+    const pending = pendingJumpRef.current;
+    if (pending && pending.conversationId === conversationId) {
+      pendingJumpRef.current = null;
+      const selectionId = pending.selectionId;
+      const isSelectionActive = () => searchSelectionRef.current === selectionId;
+      const isViewCurrent = () => isSelectionActive() && currentRef.current === conversationId;
+      const cached = messagesByConversationRef.current[conversationId] || [];
+      if (cached.some(message => message.id === pending.messageId)) {
+        setJumpReady(true);
+        return;
+      }
+      void loadAround(conversationId, pending.messageId, isViewCurrent, isSelectionActive);
+      return;
+    }
+    void loadLatest(conversationId);
   }, [current]);
 
   useEffect(() => {
@@ -1316,6 +1561,13 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         if (data.reason === 'user_message' || data.reason === 'user_message_edited') setActivity(conversationId, 'streaming');
         if (data.reason === 'assistant_completed') setActivity(conversationId, 'completed');
         if (data.reason === 'assistant_error' || data.reason === 'assistant_interrupted') setActivity(conversationId, 'error');
+        if (data.reason === 'pair_deleted') {
+          const removedIds = new Set([data.userMessageId, data.messageId].filter((id): id is string => typeof id === 'string' && id.length > 0));
+          const currentMessages = messagesByConversationRef.current[conversationId] || [];
+          if (removedIds.size > 0 && currentMessages.some(message => removedIds.has(message.id))) {
+            commitMessages(conversationId, currentMessages.filter(message => !removedIds.has(message.id)));
+          }
+        }
         void refreshMessages(conversationId).catch(() => undefined);
       }
       void refreshConversations().catch(() => undefined);
@@ -1525,7 +1777,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     tasksRef.current.set(targetKey, task);
     bumpTasks();
     setActivity(targetKey, 'streaming');
-    updateMessages(targetKey, currentMessages => [...currentMessages, tempUser, tempAssistant]);
+    setBottomNonce(nonce => nonce + 1);
+    if (messageWindowsRef.current[targetKey]?.hasNewer) {
+      bumpMessageEpoch(targetKey);
+      commitMessages(targetKey, [tempUser, tempAssistant]);
+      commitWindow(targetKey, { hasOlder: false, hasNewer: false });
+    } else {
+      updateMessages(targetKey, currentMessages => [...currentMessages, tempUser, tempAssistant]);
+    }
 
     try {
       await consumeStream({
@@ -1590,8 +1849,9 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const editedText = text.trim();
     if (!editedText && parts.images.length === 0) return;
 
+    const viewingHistory = messageWindowsRef.current[targetKey]?.hasNewer === true;
     const latestUserIndex = baseMessages.reduce((latest, candidate, index) => candidate.role === 'user' ? index : latest, -1);
-    const optimisticMode: EditMode = latestUserIndex === userIndex ? 'replace' : 'append';
+    const optimisticMode: EditMode = !viewingHistory && latestUserIndex === userIndex ? 'replace' : 'append';
     const now = new Date().toISOString();
     const editedContent = composeUserMessage(editedText, parts.images);
     const replacementUser: MessageDTO = { ...message, content: editedContent, status: 'completed' };
@@ -1614,12 +1874,16 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     setDeleteTarget(undefined);
     setConversationError(targetKey, '');
     setScrollIntent(optimisticMode === 'append' ? 'follow' : 'bottom');
-    setMessagesByConversation(cache => ({
-      ...cache,
-      [targetKey]: optimisticMode === 'replace'
-        ? replacePair(baseMessages, userIndex, replacementUser, tempAssistant)
-        : [...baseMessages, appendedUser, tempAssistant]
-    }));
+    setBottomNonce(nonce => nonce + 1);
+    commitMessages(targetKey, optimisticMode === 'replace'
+      ? replacePair(baseMessages, userIndex, replacementUser, tempAssistant)
+      : viewingHistory
+        ? [appendedUser, tempAssistant]
+        : [...baseMessages, appendedUser, tempAssistant]);
+    if (viewingHistory) {
+      bumpMessageEpoch(targetKey);
+      commitWindow(targetKey, { hasOlder: false, hasNewer: false });
+    }
     tasksRef.current.set(targetKey, task);
     bumpTasks();
     setActivity(targetKey, 'streaming');
@@ -1641,21 +1905,16 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             const realUser = actualMode === 'replace'
               ? { ...replacementUser, id: data.userMessageId || replacementUser.id, conversation_id: realConversationId }
               : { ...appendedUser, id: data.userMessageId || appendedUser.id, conversation_id: realConversationId };
-            setMessagesByConversation(cache => ({
-              ...cache,
-              [targetKey]: (() => {
-                const currentAssistant = (cache[targetKey] || []).find(candidate => candidate.id === tempAssistant.id);
-                const realAssistant = {
-                  ...tempAssistant,
-                  content: currentAssistant?.content || tempAssistant.content,
-                  id: assistantMessageId,
-                  conversation_id: realConversationId,
-                };
-                return actualMode === 'replace'
-                  ? replacePair(baseMessages, userIndex, realUser, realAssistant)
-                  : [...baseMessages, realUser, realAssistant];
-              })()
-            }));
+            const currentAssistant = (messagesByConversationRef.current[targetKey] || []).find(candidate => candidate.id === tempAssistant.id);
+            const realAssistant = {
+              ...tempAssistant,
+              content: currentAssistant?.content || tempAssistant.content,
+              id: assistantMessageId,
+              conversation_id: realConversationId,
+            };
+            commitMessages(targetKey, actualMode === 'replace'
+              ? replacePair(baseMessages, userIndex, realUser, realAssistant)
+              : [...baseMessages, realUser, realAssistant]);
             return;
           }
           updateMessages(targetKey, currentMessages => currentMessages.map(candidate => {
@@ -1684,6 +1943,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
       flushTaskDelta(task);
       removeTask(task);
       if (editAcknowledged) await refreshMessages(targetKey).catch(() => undefined);
+      else if (viewingHistory) await loadLatest(targetKey).catch(() => undefined);
     }
   }
 
@@ -1706,7 +1966,13 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         await refreshConversations();
         return;
       }
-      await Promise.all([refreshMessages(conversationId), refreshConversations()]);
+      const nextMessages = withoutDeletedPair(messagesByConversationRef.current[conversationId] || [], target.id);
+      if (nextMessages.length === 0) {
+        await Promise.all([loadLatest(conversationId), refreshConversations()]);
+      } else {
+        commitMessages(conversationId, nextMessages);
+        await Promise.all([refreshMessages(conversationId), refreshConversations()]);
+      }
     } catch (cause) {
       setConversationError(conversationId, cause instanceof Error ? cause.message : '删除失败');
       throw cause;
@@ -1721,6 +1987,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   function selectConversation(id: string) {
     setStudioOpen(false);
+    pendingJumpRef.current = null;
     searchSelectionRef.current += 1;
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
@@ -1773,44 +2040,35 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   function selectSearchResult(result: SearchMessageResultDTO) {
     const conversationId = result.conversationId;
+    const messageId = result.messageId;
     const selectionId = ++searchSelectionRef.current;
     const isSelectionActive = () => searchSelectionRef.current === selectionId;
     const isViewCurrent = () => isSelectionActive() && currentRef.current === conversationId;
+    const alreadyViewing = currentRef.current === conversationId;
     setSearchOpen(false);
     setStudioOpen(false);
     setDrawerOpen(false);
     setEditingMessageId(undefined);
     setDeleteTarget(undefined);
-    setJumpTarget(undefined);
     setJumpReady(false);
     setScrollIntent('restore');
     setConversationError(conversationId, '');
+    setJumpTarget({ conversationId, messageId });
     currentRef.current = conversationId;
     setCurrent(conversationId);
     setActivities(currentActivities => clearConversationUnread(currentActivities, conversationId));
 
-    const cachedMessages = messagesByConversation[conversationId];
-    setJumpTarget({ conversationId, messageId: result.messageId });
-    if (cachedMessages?.some(message => message.id === result.messageId)) {
-      setJumpReady(true);
+    if (alreadyViewing) {
+      const cached = messagesByConversationRef.current[conversationId] || [];
+      if (cached.some(message => message.id === messageId)) {
+        setJumpReady(true);
+        return;
+      }
+      void loadAround(conversationId, messageId, isViewCurrent, isSelectionActive);
       return;
     }
 
-    void refreshMessages(conversationId, true, isViewCurrent).then(loadedMessages => {
-      if (!isViewCurrent()) return;
-      if (loadedMessages?.some(message => message.id === result.messageId)) {
-        setJumpReady(true);
-      } else {
-        setJumpTarget(undefined);
-        setConversationError(conversationId, '消息已不存在');
-      }
-    }).catch(cause => {
-      if (!isSelectionActive()) return;
-      const missing = cause instanceof Error && /404|会话不存在|文件不存在/.test(cause.message);
-      setJumpTarget(undefined);
-      const targetKey = currentRef.current === conversationId ? conversationId : EMPTY_CONVERSATION_KEY;
-      setConversationError(targetKey, missing ? '消息已不存在' : (cause instanceof Error ? cause.message : '消息加载失败'));
-    });
+    pendingJumpRef.current = { conversationId, messageId, selectionId };
   }
 
   function abortAllTasks() {
@@ -1882,6 +2140,11 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             onImageClick={(src, alt) => setImagePreview({ src, alt })}
             jumpMessageId={jumpTarget && jumpTarget.conversationId === currentConversationId ? jumpTarget.messageId : undefined}
             jumpReady={jumpReady}
+            hasOlder={messageWindows[currentKey]?.hasOlder === true}
+            hasNewer={messageWindows[currentKey]?.hasNewer === true}
+            bottomNonce={bottomNonce}
+            onLoadOlder={() => { if (currentConversationId) void loadOlder(currentConversationId); }}
+            onLoadNewer={() => { if (currentConversationId) void loadNewer(currentConversationId); }}
             onJumpComplete={found => {
               const target = jumpTarget;
               setJumpTarget(undefined);

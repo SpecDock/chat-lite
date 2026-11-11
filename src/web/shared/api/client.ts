@@ -51,7 +51,14 @@ export const api = {
   deleteConversation: (id: string) => fetch(`/api/conversations/${id}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
   stopGeneration: (id: string) => fetch(`/api/conversations/${id}/stop`, { method: 'POST', credentials: 'include' }).then(r => parse<{ ok: boolean }>(r)),
   deleteMessage: (conversationId: string, userMessageId: string) => fetch(`/api/conversations/${conversationId}/messages/${userMessageId}`, { method: 'DELETE', credentials: 'include' }).then(r => parse<{ ok: boolean; conversationDeleted: boolean }>(r)),
-  messages: (id: string) => fetch(`/api/conversations/${id}/messages`, { credentials: 'include' }).then(r => parse<{ messages: MessageDTO[] }>(r)),
+  messages: (id: string, cursor?: { around?: string; before?: string; after?: string }) => {
+    const params = new URLSearchParams();
+    if (cursor?.around) params.set('around', cursor.around);
+    if (cursor?.before) params.set('before', cursor.before);
+    if (cursor?.after) params.set('after', cursor.after);
+    const query = params.toString();
+    return fetch(`/api/conversations/${id}/messages${query ? `?${query}` : ''}`, { credentials: 'include' }).then(r => parse<{ messages: MessageDTO[]; hasOlder: boolean; hasNewer: boolean }>(r));
+  },
   workspace: (id: string) => fetch(`/api/conversations/${id}/workspace`, { credentials: 'include' }).then(r => parse<{ workspace: WorkspaceFilesDTO }>(r)),
   searchMessages: (q: string, offset: number, signal?: AbortSignal) => fetch(buildSearchMessagesUrl(q, offset), { credentials: 'include', signal }).then(r => parse<SearchMessagesResponseDTO>(r)),
   upload: (file: File, conversationId?: string) => { const fd = new FormData(); fd.append('file', file); if (conversationId) fd.append('conversationId', conversationId); return fetch('/api/upload', { method: 'POST', credentials: 'include', body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
