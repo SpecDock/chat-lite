@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -40,6 +41,13 @@ type sessionView struct {
 	Created   bool   `json:"created,omitempty"`
 }
 
+type sessionContainerState struct {
+	Running   bool   `json:"Running"`
+	ExitCode  int    `json:"ExitCode"`
+	OOMKilled bool   `json:"OOMKilled"`
+	Error     string `json:"Error"`
+}
+
 func (b *broker) serveSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errJSON{Error: "method not allowed"})
@@ -63,7 +71,11 @@ func (b *broker) serveSession(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/session/status":
-		view := sessions.status(id)
+		view, err := sessions.status(r.Context(), b.eng, id)
+		if err != nil {
+			writeSessionErr(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, view)
 	case "/session/ensure":
 		view, err := sessions.ensure(r.Context(), b.eng, id, payload.Refresh)
@@ -115,14 +127,25 @@ func writeSessionErr(w http.ResponseWriter, err error) {
 
 var errGone = errors.New("sandbox gone")
 
-func (t *sessionTable) status(id string) sessionView {
+func (t *sessionTable) status(ctx context.Context, eng *engine, id string) (sessionView, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	item := t.items[id]
 	if item == nil || !item.expires.After(time.Now()) {
-		return sessionView{Alive: false}
+		return sessionView{Alive: false}, nil
 	}
-	return sessionView{Alive: true, ExpiresAt: item.expires.Format(time.RFC3339)}
+	state, err := eng.inspectSession(ctx, item.container)
+	if err != nil {
+		return sessionView{}, err
+	}
+	if state == nil || !state.Running {
+		delete(t.items, id)
+		if err := eng.forceRemove(ctx, item.container); err != nil {
+			return sessionView{}, err
+		}
+		return sessionView{Alive: false}, nil
+	}
+	return sessionView{Alive: true, ExpiresAt: item.expires.Format(time.RFC3339)}, nil
 }
 
 func (t *sessionTable) ensure(ctx context.Context, eng *engine, id string, refresh bool) (sessionView, error) {
@@ -130,10 +153,21 @@ func (t *sessionTable) ensure(ctx context.Context, eng *engine, id string, refre
 	defer t.mu.Unlock()
 	now := time.Now()
 	if item := t.items[id]; item != nil && item.expires.After(now) {
-		if refresh {
-			item.expires = now.Add(sessionIdle)
+		state, err := eng.inspectSession(ctx, item.container)
+		if err != nil {
+			return sessionView{}, err
 		}
-		return sessionView{Alive: true, ExpiresAt: item.expires.Format(time.RFC3339)}, nil
+		if state != nil && state.Running {
+			if refresh {
+				item.expires = now.Add(sessionIdle)
+			}
+			return sessionView{Alive: true, ExpiresAt: item.expires.Format(time.RFC3339)}, nil
+		}
+		// A failed container must not discard scripts written for this session.
+		delete(t.items, id)
+		if err := eng.forceRemove(ctx, item.container); err != nil {
+			return sessionView{}, err
+		}
 	}
 	if old := t.items[id]; old != nil {
 		_ = eng.forceRemove(ctx, old.container)
@@ -157,6 +191,18 @@ func (t *sessionTable) ensure(ctx context.Context, eng *engine, id string, refre
 	if err = eng.start(ctx, created); err != nil {
 		_ = eng.forceRemove(ctx, created)
 		return sessionView{}, err
+	}
+	state, err := eng.inspectSession(ctx, created)
+	if err != nil {
+		_ = eng.forceRemove(ctx, created)
+		return sessionView{}, err
+	}
+	if state == nil || !state.Running {
+		_ = eng.forceRemove(ctx, created)
+		if state == nil {
+			return sessionView{}, errors.New("sandbox container missing after start")
+		}
+		return sessionView{}, fmt.Errorf("sandbox exited after start: exit_code=%d OOMKilled=%t error=%q", state.ExitCode, state.OOMKilled, state.Error)
 	}
 	item := &liveSession{container: created, expires: now.Add(sessionIdle)}
 	t.items[id] = item
@@ -330,6 +376,24 @@ func (e *engine) ensureNetwork(ctx context.Context) error {
 	return err
 }
 
+func (e *engine) inspectSession(ctx context.Context, container string) (*sessionContainerState, error) {
+	var inspected struct {
+		State *sessionContainerState `json:"State"`
+	}
+	err := e.do(ctx, http.MethodGet, containerURL(container, "/json"), nil, &inspected)
+	var dock *dockerError
+	if errors.As(err, &dock) && dock.status == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if inspected.State == nil {
+		return nil, errors.New("docker inspect returned no container state")
+	}
+	return inspected.State, nil
+}
+
 func (e *engine) createSession(ctx context.Context, name, sessionID string) (string, error) {
 	if !jobIDPattern.MatchString(sessionID) || !refPattern.MatchString(name) {
 		return "", errInvalid
@@ -338,7 +402,7 @@ func (e *engine) createSession(ctx context.Context, name, sessionID string) (str
 	spec.User = "0:0"
 	spec.Cmd = []string{"/usr/local/bin/chatlite-sandbox-init"}
 	spec.HostConfig.NetworkMode = sessionNet
-	spec.HostConfig.CapAdd = []string{"NET_ADMIN"}
+	spec.HostConfig.CapAdd = []string{"NET_ADMIN", "SETGID", "SETUID"}
 	spec.HostConfig.CapDrop = []string{"ALL"}
 	spec.HostConfig.Tmpfs = map[string]string{"/tmp": "rw,nosuid,size=268435456", "/run": "rw,nosuid,size=16777216"}
 	spec.HostConfig.Binds = []string{hostJobsRoot + "/sessions/" + sessionID + ":/work"}

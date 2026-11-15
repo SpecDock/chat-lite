@@ -390,7 +390,7 @@ func sandboxSpec(jobID string) createRequest {
 			"PYTHONUNBUFFERED=1",
 			"PYTHONDONTWRITEBYTECODE=1",
 			"HOME=/tmp",
-			"PATH=/usr/local/bin:/usr/bin:/bin",
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		},
 		Labels: map[string]string{"chatlite.sandbox": "1"},
 		Tty:    false,

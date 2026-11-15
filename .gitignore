@@ -1,11 +1,49 @@
+# ── 依赖 ───────────────────────────────────────────────
 node_modules/
+**/node_modules/
+
+# ── 构建产物 ───────────────────────────────────────────
 dist/
 dist-server/
+*.exe
+*.tsbuildinfo
+
+# ── 运行期数据 ─────────────────────────────────────────
+# data/ 不带前导斜杠 → 任意层级同名目录都命中（go/data 已实测命中）
 data/
-.env
-*.log
+switch_db/
+switch_data/
 *.db
 *.db-shm
 *.db-wal
-test/output-*.png
+*.sqlite
+*.sqlite3
+logs/
+*.log
+*.pid
+
+# ── 密钥与本地配置 ─────────────────────────────────────
+# .env.example 是模板，必须入库，所以要显式反选
+.env
+.env.*
+!.env.example
+
+# ── 本地工具与 IDE ────────────────────────────────────
+.opencode/
+.cortexkit/magic-context/
 .slim/deepwork/
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ── 测试与调试产物 ─────────────────────────────────────
+test/output-*.png
+test/output-*/
+
+# ── 一次性本地产出，不入库 ─────────────────────────────
+# fix/：架构审计报告（91 条建议 + 修复路线图）
+fix/
+# go/cmd/switchprobe：本地迁移探针，硬编码绝对路径与明文口令
+go/cmd/switchprobe/
