@@ -39,6 +39,15 @@ func (a *App) registerChat(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/chat", a.withAuth(a.chat))
 }
 
+func reasoningEffort(body map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(httpx.AsString(body["reasoningEffort"]))) {
+	case "low", "high", "max":
+		return strings.ToLower(strings.TrimSpace(httpx.AsString(body["reasoningEffort"])))
+	default:
+		return ""
+	}
+}
+
 func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	body := httpx.ReadJSON(r, 1<<20)
@@ -307,7 +316,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	if loadErr != nil {
 		err = loadErr
 	} else {
-		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist}, func(event chat.Event) {
+		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), ReasoningEffort: reasoningEffort(body), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist}, func(event chat.Event) {
 			switch event.Type {
 			case "think":
 				appendThink(event.Text)

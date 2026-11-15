@@ -49,7 +49,7 @@ const systemPrompt = `你是 Chat Lite 的对话助手。每一轮都使用同�
 - fetch：抓取一个已知网址的正文。你知道项目、文档或页面在哪个网站时优先调用，不要先搜索。它不执行 JavaScript。返回页面不存在或无法连接时，再用 web_search 查找新网址，然后对搜到的网址重新 fetch。不要反复抓同一个失败网址。
 - web_search：不知道具体网址的模糊查询、实时信息，或 fetch 已经失败后的查找。已经有明确网址时不要用它代替 fetch。
 - view_image：查看历史用户图或生成图。当前轮上传图片已直接可见，不要为此调用。搜索依赖图片内容时先 view_image；用户已给出独立完整搜索主题时可直接 web_search。
-- 表格和文件分析只在临时工作区进行。本轮附件已在 input/。用 write_file 写脚本，再用 run_python 运行该路径。失败时用 edit_file 改出错的一段，不要重写整个文件。只有文件清单里更早的附件才调用 download_file。超出上下文限制而保存的 txt 已在给出的 input/ 路径，不要对它调用 download_file。留给用户的结果写入 output/。
+- 表格和文件分析在会话工作区进行。本轮附件已在 input/。用 write_file 写脚本，再用 run_python 运行该路径。需要查看文件时用 read_file。失败时用 edit_file 改出错的一段，不要重写整个文件。只有文件清单里更早的附件才调用 download_file。超出上下文限制而保存的 txt 已在给出的 input/ 路径，不要对它调用 download_file。留给用户的结果写入 output/。写 /work 根上的 .py 或运行代码会占用容器；容器空闲 30 分钟后销毁，根上的脚本一并删除，input/ 和 output/ 留下。容器不在时，read_file 不能读容器内部。
 - PDF 由服务端解析。不要用 download_file 或 run_python 读取 PDF。短文会附在消息里；长文通过检索使用。文本过少或解析失败时没有正文。
 
 ## 上下文
@@ -65,12 +65,12 @@ type Event struct {
 }
 
 type Input struct {
-	UserID, ConversationID, UserInput, Summary string
-	AttachmentIDs                              []string
-	History                                    []HistoryItem
-	Prior                                      []any
-	Saved                                      *[]any
-	Persist                                    func(messages []any) error
+	UserID, ConversationID, UserInput, Summary, ReasoningEffort string
+	AttachmentIDs                                               []string
+	History                                                     []HistoryItem
+	Prior                                                       []any
+	Saved                                                       *[]any
+	Persist                                                     func(messages []any) error
 }
 
 type imageCandidate struct {
@@ -90,7 +90,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 	currentAt := len(messages)
 	userContent := buildUserContent(ctx, pool, in)
 	messages = append(messages, map[string]any{"role": "user", "content": userContent})
-	work, workErr := openScratch()
+	messages = append(messages, map[string]any{"role": "user", "content": containerStateLine(ctx, in.ConversationID)})
+	work, workErr := openScratch(in)
 	if workErr == nil {
 		defer work.close()
 		work.mountCurrent(ctx, pool, in)
@@ -136,7 +137,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		if hydrateErr != nil {
 			return hydrateErr
 		}
-		delta, err := streamTurn(ctx, outgoing, tools, replay, in.ConversationID, "decision", round, func(chunk string) {
+		delta, err := streamTurn(ctx, outgoing, tools, replay, in.ConversationID, in.ReasoningEffort, "decision", round, func(chunk string) {
 			emit(Event{Type: "delta", Text: chunk})
 		})
 		if err != nil {
@@ -223,7 +224,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, in Input, emit func(Event)) er
 		if hydrateErr != nil {
 			return hydrateErr
 		}
-		delta, err := streamTurn(ctx, outgoing, nil, replay, in.ConversationID, "final", round+1, func(chunk string) {
+		delta, err := streamTurn(ctx, outgoing, nil, replay, in.ConversationID, in.ReasoningEffort, "final", round+1, func(chunk string) {
 			emit(Event{Type: "delta", Text: chunk})
 		})
 		_ = finalBody
@@ -305,8 +306,9 @@ func prepareSend(ctx context.Context, messages []any, currentAt int, emit func(E
 	return fitted, nextAt, nil
 }
 
-func streamTurn(ctx context.Context, messages []any, tools []any, replay map[string]string, conversationID, phase string, step int, onText func(string)) (llm.Delta, error) {
+func streamTurn(ctx context.Context, messages []any, tools []any, replay map[string]string, conversationID, reasoningEffort, phase string, step int, onText func(string)) (llm.Delta, error) {
 	body := map[string]any{"model": llm.ModelName(), "temperature": llm.Temperature(), "stream": true, "stream_options": map[string]any{"include_usage": true}, "messages": messages}
+	applyReasoningEffort(body, reasoningEffort)
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
@@ -446,7 +448,7 @@ func runTodo(args map[string]any) (string, map[string]any, []Event) {
 }
 
 func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch, name string, args map[string]any, recent *[]sig, candidates []imageCandidate) (string, map[string]any, []Event) {
-	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "todo_write" && name != "fetch" {
+	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "read_file" && name != "todo_write" && name != "fetch" {
 		return "未知工具：" + name, nil, []Event{{Type: "think", Text: "未知工具：" + name}}
 	}
 	signature := name + "::" + stableArgs(args)
@@ -464,7 +466,7 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 		text := fmt.Sprintf("doom-loop guard：%s 在本轮已被重复调用 %d 次且参数几乎一致。请立即停止重复调用，基于已有工具结果给出最终回答。", name, same+1)
 		return text, nil, []Event{{Type: "think", Text: text}}
 	}
-	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "todo_write" && name != "fetch" && sameTool >= 3 {
+	if name != "web_search" && name != "view_image" && name != "run_python" && name != "download_file" && name != "write_file" && name != "edit_file" && name != "read_file" && name != "todo_write" && name != "fetch" && sameTool >= 3 {
 		text := fmt.Sprintf("doom-loop guard：本轮 %s 已被调用 %d 次，疑似陷入研究循环。请立即基于已有结果给出最终回答。", name, sameTool+1)
 		return text, nil, []Event{{Type: "think", Text: text}}
 	}
@@ -518,6 +520,8 @@ func executeTool(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 		return runWrite(work, stringArg(args["path"]), stringArg(args["content"]))
 	case "edit_file":
 		return runEdit(work, stringArg(args["path"]), stringArg(args["old"]), stringArg(args["new"]))
+	case "read_file":
+		return runRead(ctx, work, stringArg(args["path"]))
 	case "run_python":
 		return runPythonFile(ctx, pool, in, work, stringArg(args["path"]))
 	default:
@@ -1085,6 +1089,7 @@ func openAITools() []any {
 		tool("download_file", "按文件清单里的 attachmentId，把更早的附件下载到临时 input/。清单已标明“已在 input/”的不要调用。", map[string]any{"attachmentId": map[string]any{"type": "string", "minLength": 1, "description": "文件清单中的 attachmentId"}}, []string{"attachmentId"}),
 		tool("write_file", "写入临时工作区的新文件。脚本用相对路径，例如 analyze.py。留给用户的结果用 output/文件名。不能写 input/。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1}, "content": map[string]any{"type": "string"}}, []string{"path", "content"}),
 		tool("edit_file", "把已有文件里唯一的一段原文替换掉。只改出错的几行，不要重写整个文件。不能改 input/。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1}, "old": map[string]any{"type": "string", "minLength": 1, "description": "文件中唯一的一段原文"}, "new": map[string]any{"type": "string", "description": "替换后的文本"}}, []string{"path", "old", "new"}),
+		tool("read_file", "读取文本文件。input/、output/ 和 /work 根上的脚本用相对路径。容器内部用绝对路径，例如 /tmp/a.txt。二进制会失败。超过 1MB 会截断。容器不在时不能读容器内部。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1, "description": "相对路径或容器内绝对路径"}}, []string{"path"}),
 		tool("run_python", "运行临时工作区里的 .py 相对路径。只读 input/，结果用 print 输出。留给用户的新文件写到 output/。失败后用 edit_file 再运行。", map[string]any{"path": map[string]any{"type": "string", "minLength": 1, "description": "要运行的 .py 相对路径"}}, []string{"path"}),
 		tool("todo_write", "只在多步骤或复杂任务中维护计划。先列出步骤，推进时更新状态。简单问答不要调用。这个工具不读取文件，也不执行命令。", map[string]any{"todos": map[string]any{"type": "array", "minItems": 1, "maxItems": 20, "description": "完整的当前计划，每次调用都提交全部步骤", "items": map[string]any{"type": "object", "properties": map[string]any{"content": map[string]any{"type": "string", "minLength": 1, "description": "一个步骤"}, "status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "pending 未开始，in_progress 进行中，completed 已完成"}}, "required": []string{"content", "status"}}}}, []string{"todos"}),
 	}
@@ -1140,6 +1145,17 @@ func (e *PartialError) Error() string { return "回答生成过程中连接中�
 func (e *PartialError) Unwrap() error { return e.Err }
 
 func abortErr() error { return fmt.Errorf("请求已取消") }
+
+func applyReasoningEffort(body map[string]any, effort string) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort != "low" && effort != "high" && effort != "max" {
+		return
+	}
+	name := strings.ToLower(llm.ModelName())
+	if strings.Contains(name, "deepseek") && strings.Contains(name, "flash") {
+		body["reasoning_effort"] = effort
+	}
+}
 
 func persistStep(persist func([]any) error, messages []any) error {
 	if persist == nil {

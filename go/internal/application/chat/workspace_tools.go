@@ -1,33 +1,36 @@
 package chat
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"chatlite/internal/infrastructure/sandbox"
 	"chatlite/internal/infrastructure/storage"
-	"chatlite/internal/platform/idgen"
 	"chatlite/internal/platform/paths"
 )
 
 type scratch struct {
-	jobID     string
-	root      string
-	published map[string]int64
+	jobID, root, userID, conversationID string
+	published                           map[string]int64
 }
 
-func openScratch() (*scratch, error) {
+func openScratch(in Input) (*scratch, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errScratch("表格沙箱只在 Linux Docker 运行环境中可用")
 	}
-	jobID := idgen.NewID("job")
-	root := filepath.Join(sandbox.JobsDir, jobID)
+	if !paths.IsSafeWorkspaceID(in.ConversationID) {
+		return nil, errScratch("会话无效")
+	}
+	root := filepath.Join(sandbox.SessionsDir, in.ConversationID)
 	if err := os.MkdirAll(filepath.Join(root, "input"), 0o755); err != nil {
 		return nil, err
 	}
@@ -37,14 +40,12 @@ func openScratch() (*scratch, error) {
 	_ = os.Chmod(root, 0o1777)
 	_ = os.Chmod(filepath.Join(root, "input"), 0o755)
 	_ = os.Chmod(filepath.Join(root, "output"), 0o777)
-	return &scratch{jobID: jobID, root: root, published: map[string]int64{}}, nil
+	work := &scratch{jobID: in.ConversationID, root: root, userID: in.UserID, conversationID: in.ConversationID, published: map[string]int64{}}
+	work.restoreWorkspace()
+	return work, nil
 }
 
-func (s *scratch) close() {
-	if s != nil {
-		removeJobDir(s.root)
-	}
-}
+func (s *scratch) close() {}
 
 func removeJobDir(root string) {
 	if root == "" {
@@ -84,6 +85,9 @@ func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, at
 		return "", err
 	}
 	_ = os.Chmod(target, 0o644)
+	if body, readErr := os.ReadFile(target); readErr == nil {
+		s.syncFile("input/"+safe, body)
+	}
 	return "input/" + safe, nil
 }
 
@@ -102,6 +106,7 @@ func (s *scratch) stageInputFile(name string, body []byte) (string, error) {
 	if err := os.WriteFile(target, body, 0o644); err != nil {
 		return "", err
 	}
+	s.syncFile("input/"+safe, body)
 	return "input/" + safe, nil
 }
 
@@ -119,7 +124,11 @@ func (s *scratch) write(rel, content string) (string, error) {
 	if err = os.WriteFile(target, []byte(content), 0o644); err != nil {
 		return "", err
 	}
-	return cleanRel(rel), nil
+	saved := cleanRel(rel)
+	if isWorkspaceData(saved) {
+		s.syncFile(saved, []byte(content))
+	}
+	return saved, nil
 }
 
 func (s *scratch) edit(rel, oldText, newText string) (string, error) {
@@ -145,7 +154,11 @@ func (s *scratch) edit(rel, oldText, newText string) (string, error) {
 	if err = os.WriteFile(target, []byte(updated), 0o644); err != nil {
 		return "", err
 	}
-	return cleanRel(rel), nil
+	saved := cleanRel(rel)
+	if isWorkspaceData(saved) {
+		s.syncFile(saved, []byte(updated))
+	}
+	return saved, nil
 }
 
 func fileCatalog(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch) string {
@@ -207,6 +220,11 @@ func runWrite(work *scratch, path, content string) (string, map[string]any, []Ev
 	if work == nil {
 		return "临时工作区不可用。", nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
 	}
+	if isRootScript(cleanRel(path)) {
+		if err := sandbox.EnsureSession(context.Background(), work.conversationID, false); err != nil {
+			return "写入失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
+		}
+	}
 	saved, err := work.write(path, content)
 	if err != nil {
 		return "写入失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
@@ -267,7 +285,10 @@ func (s *scratch) run(ctx context.Context, rel string) (sandbox.Result, string, 
 	if err != nil {
 		return sandbox.Result{}, "", errScratch("文件不存在")
 	}
-	result, err := sandbox.Run(ctx, s.jobID, string(body))
+	result, err := sandbox.ExecSession(ctx, s.conversationID, rel)
+	if err == nil {
+		s.syncBucket("output")
+	}
 	return result, string(body), err
 }
 
@@ -297,3 +318,169 @@ type scratchError string
 func (e scratchError) Error() string { return string(e) }
 
 func errScratch(message string) error { return scratchError(message) }
+
+func containerStateLine(ctx context.Context, conversationID string) string {
+	now := time.Now().Format(time.RFC3339)
+	state, err := sandbox.SessionStatus(ctx, conversationID)
+	if err != nil || !state.Alive || state.ExpiresAt == "" {
+		return "现在的容器状态为没有容器。当前时间 " + now + "。"
+	}
+	return "现在的容器状态为有容器。当前时间 " + now + "。预计销毁时间 " + state.ExpiresAt + "。"
+}
+
+func isRootScript(rel string) bool {
+	rel = cleanRel(rel)
+	return strings.HasSuffix(strings.ToLower(rel), ".py") && !strings.Contains(rel, "/")
+}
+
+func isWorkspaceData(rel string) bool {
+	rel = cleanRel(rel)
+	return strings.HasPrefix(rel, "input/") || strings.HasPrefix(rel, "output/")
+}
+
+func (s *scratch) syncFile(rel string, body []byte) {
+	if s == nil || s.userID == "" || len(body) == 0 || len(body) > 20<<20 || strings.Contains(rel, "/") == false {
+		return
+	}
+	bucket := "input"
+	name := strings.TrimPrefix(rel, "input/")
+	if strings.HasPrefix(rel, "output/") {
+		bucket = "output"
+		name = strings.TrimPrefix(rel, "output/")
+	}
+	if name == "" || strings.Contains(name, "/") {
+		return
+	}
+	stored := storage.ObjectPath(s.userID, s.conversationID, "ws-"+bucket, name)
+	_ = storage.Put(context.Background(), stored, body, "application/octet-stream")
+}
+
+func (s *scratch) syncBucket(bucket string) {
+	if s == nil || (bucket != "input" && bucket != "output") {
+		return
+	}
+	dir := filepath.Join(s.root, bucket)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 20<<20 {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		s.syncFile(bucket+"/"+entry.Name(), body)
+	}
+}
+
+func (s *scratch) restoreWorkspace() {
+	if s == nil || s.userID == "" {
+		return
+	}
+	for _, bucket := range []string{"input", "output"} {
+		prefix := "u/" + s.userID + "/c/" + s.conversationID + "/ws-" + bucket + "/"
+		keys, err := storage.ListKeys(context.Background(), prefix)
+		if err != nil {
+			continue
+		}
+		for _, key := range keys {
+			name := strings.TrimPrefix(key, prefix)
+			if name == "" || strings.Contains(name, "/") {
+				continue
+			}
+			target := filepath.Join(s.root, bucket, name)
+			if _, err := os.Lstat(target); err == nil {
+				continue
+			}
+			_ = storage.Materialize(context.Background(), storage.Prefix+key, target)
+		}
+	}
+}
+
+func runRead(ctx context.Context, work *scratch, path string) (string, map[string]any, []Event) {
+	if work == nil {
+		return "临时工作区不可用。", nil, []Event{{Type: "think", Text: "工具调用失败：read_file"}}
+	}
+	text, err := work.read(ctx, path)
+	if err != nil {
+		return "读取失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：read_file"}}
+	}
+	return text, nil, []Event{{Type: "think", Text: "工具完成：read_file"}}
+}
+
+func (s *scratch) read(ctx context.Context, path string) (string, error) {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		return "", errScratch("路径无效")
+	}
+	if strings.HasPrefix(raw, "/") {
+		return s.readAbsolute(ctx, raw)
+	}
+	rel := cleanRel(raw)
+	if rel == "" {
+		return "", errScratch("路径无效")
+	}
+	target := filepath.Join(s.root, filepath.FromSlash(rel))
+	if !paths.IsWithinDirectory(s.root, target) {
+		return "", errScratch("路径无效")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		return "", errScratch("文件不存在")
+	}
+	return textBody(body)
+}
+
+func (s *scratch) readAbsolute(ctx context.Context, path string) (string, error) {
+	if strings.HasPrefix(path, "/work/") {
+		rel := strings.TrimPrefix(path, "/work/")
+		return s.read(ctx, rel)
+	}
+	if path == "/work" {
+		return "", errScratch("路径无效")
+	}
+	state, err := sandbox.SessionStatus(ctx, s.conversationID)
+	if err != nil {
+		return "", err
+	}
+	if !state.Alive {
+		return "", errScratch("容器已回收，不能读取容器内部文件")
+	}
+	body, err := sandbox.ReadSession(ctx, s.conversationID, path)
+	if err != nil {
+		return "", err
+	}
+	text, err := textBody(body)
+	if err != nil {
+		return "", err
+	}
+	_ = sandbox.TouchSession(ctx, s.conversationID)
+	return text, nil
+}
+
+func textBody(body []byte) (string, error) {
+	if len(body) == 0 {
+		return "", nil
+	}
+	cut := body
+	truncated := false
+	if len(body) > 1<<20 {
+		cut = body[:1<<20]
+		truncated = true
+	}
+	if bytes.IndexByte(cut, 0) >= 0 || !utf8.Valid(cut) {
+		return "", errScratch("只能读取文本文件")
+	}
+	text := string(cut)
+	if truncated {
+		text += "\n\n文件未读完，已截断到 1MB。"
+	}
+	return text, nil
+}

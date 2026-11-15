@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { reasoningEffort } from '../../shared/api/client';
 import { gsap } from 'gsap';
 import { FolderOpen, X } from 'lucide-react';
 import { FileTypeIcon } from '../messages/fileTypeIcon';
@@ -17,6 +18,7 @@ function isSupportedAttachment(file: File) {
 export default function MessageInput({ disabled, sending, refillText, refillKey, pending, onSend, onCancel, onImage, onRemoveImage, onPreviewImage, conversationId, onWorkspace }: { disabled?: boolean; sending?: boolean; refillText?: string; refillKey?: number; pending: AttachmentDTO[]; onSend: (text: string) => void; onCancel?: () => void; onImage: (file: File) => void | Promise<void>; onRemoveImage: (id: string) => void; onPreviewImage: (src: string, alt: string) => void; conversationId?: string; onWorkspace?: () => void }) {
   const [text, setText] = useState('');
   const [dragging, setDragging] = useState(false);
+  const [effort, setEffort] = useState(reasoningEffort);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const tweenRef = useRef<gsap.core.Tween | null>(null);
   const measuredRef = useRef(false);
@@ -131,6 +133,17 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
       </button>;
     })}</div>}
     <div className="workspace-trigger-row"><button type="button" className="workspace-trigger" onClick={onWorkspace || (() => window.dispatchEvent(new Event('chat-lite-open-workspace')))}><FolderOpen size={16} aria-hidden="true" /><span>工作区</span></button></div>
-    <div className="input"><ImageUploader onFile={onImage} /><textarea ref={textareaRef} rows={1} placeholder="输入消息，或粘贴/拖入图片或表格" value={text} disabled={disabled && !sending} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button></div>
+    <div className="input"><ImageUploader onFile={onImage} /><textarea ref={textareaRef} rows={1} placeholder="输入消息，或粘贴/拖入图片或表格" value={text} disabled={disabled && !sending} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><label className="reasoning-effort">推理
+      <select aria-label="推理程度" value={effort} onChange={event => {
+        const next = event.target.value;
+        if (next !== 'low' && next !== 'high' && next !== 'max') return;
+        setEffort(next);
+        try { localStorage.setItem('chat-lite:reasoning-effort', next); } catch { /* ignore unavailable storage */ }
+      }}>
+        <option value="low">low</option>
+        <option value="high">high</option>
+        <option value="max">max</option>
+      </select>
+    </label><button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button></div>
   </form>;
 }

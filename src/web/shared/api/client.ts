@@ -91,8 +91,16 @@ export type ChatStreamData = {
   ok?: boolean;
 };
 
+export function reasoningEffort() {
+  try {
+    const saved = localStorage.getItem('chat-lite:reasoning-effort');
+    if (saved === 'low' || saved === 'high' || saved === 'max') return saved;
+  } catch { /* ignore unavailable storage */ }
+  return 'high';
+}
+
 export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], onEvent: (event: string, data: ChatStreamData) => void, signal?: AbortSignal, editUserMessageId?: string) {
-  const body = { conversationId, content: message, attachmentIds, ...(editUserMessageId ? { editUserMessageId } : {}) };
+  const body = { conversationId, content: message, attachmentIds, reasoningEffort: reasoningEffort(), ...(editUserMessageId ? { editUserMessageId } : {}) };
   const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
   if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error || '发送失败');
   const reader = res.body.getReader();

@@ -387,7 +387,18 @@ func compactPrefix(ctx context.Context, messages []any, currentAt int) ([]any, i
 		return messages, currentAt, nil
 	}
 	head := messages[1:currentAt]
-	summary, err := summarizeChunks(ctx, renderMessages(head), ToolStateText(head))
+	var hist, states []any
+	for _, raw := range head {
+		if isContainerState(raw) {
+			states = append(states, raw)
+			continue
+		}
+		hist = append(hist, raw)
+	}
+	if !prefixHasHistory(hist) {
+		return messages, currentAt, nil
+	}
+	summary, err := summarizeChunks(ctx, renderMessages(hist), ToolStateText(hist))
 	if err != nil {
 		return nil, currentAt, err
 	}
@@ -395,6 +406,7 @@ func compactPrefix(ctx context.Context, messages []any, currentAt int) ([]any, i
 	if strings.TrimSpace(summary) != "" {
 		next = append(next, summaryMessage(summary))
 	}
+	next = append(next, states...)
 	tail := append([]any{}, messages[currentAt:]...)
 	return append(next, tail...), len(next), nil
 }
@@ -408,6 +420,14 @@ func prefixHasHistory(messages []any) bool {
 	return false
 }
 
+func isContainerState(raw any) bool {
+	msg, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(messagePlainText(msg["content"])), "现在的容器状态为")
+}
+
 func isSummaryMessage(raw any) bool {
 	msg, ok := raw.(map[string]any)
 	if !ok {
@@ -419,7 +439,7 @@ func isSummaryMessage(raw any) bool {
 func largestShrinkable(messages []any, _ int, tried map[int]bool) int {
 	best, bestN := -1, 0
 	for i := range messages {
-		if i == 0 || tried[i] {
+		if i == 0 || tried[i] || isContainerState(messages[i]) {
 			continue
 		}
 		if n := messageTokens(messages[i]); n > bestN {
@@ -433,6 +453,9 @@ func largestShrinkable(messages []any, _ int, tried map[int]bool) int {
 }
 
 func shrinkMessage(ctx context.Context, raw any, current bool) (any, bool, error) {
+	if isContainerState(raw) {
+		return raw, false, nil
+	}
 	msg, ok := raw.(map[string]any)
 	if !ok {
 		return raw, false, nil

@@ -66,6 +66,11 @@ func main() {
 		log.Fatalf("sandbox cleanup: %v", err)
 	}
 	clearHeldMarkers()
+	stripAllSessionScripts()
+	if err := eng.ensureNetwork(context.Background()); err != nil {
+		log.Fatalf("sandbox network: %v", err)
+	}
+	go sweepSessions(eng)
 
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		log.Fatal(err)
@@ -111,6 +116,10 @@ type broker struct {
 }
 
 func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/session/") {
+		b.serveSession(w, r)
+		return
+	}
 	if r.URL.Path != "/run" {
 		writeJSON(w, http.StatusNotFound, errJSON{Error: "not found"})
 		return
@@ -354,6 +363,7 @@ type createRequest struct {
 type hostConfig struct {
 	NetworkMode    string            `json:"NetworkMode"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
+	CapAdd         []string          `json:"CapAdd,omitempty"`
 	CapDrop        []string          `json:"CapDrop"`
 	SecurityOpt    []string          `json:"SecurityOpt"`
 	Memory         int64             `json:"Memory"`
@@ -767,6 +777,10 @@ func (e *engine) do(ctx context.Context, method, path string, in, out any) error
 }
 
 func demuxLogs(r io.Reader) (string, string) {
+	return demuxLogsMax(r, outputCap)
+}
+
+func demuxLogsMax(r io.Reader, cap int) (string, string) {
 	var stdout, stderr bytes.Buffer
 	hdr := make([]byte, 8)
 	for {
@@ -781,14 +795,14 @@ func demuxLogs(r io.Reader) (string, string) {
 		case 2:
 			dst = &stderr
 		}
-		if err := consumeFrame(dst, r, size); err != nil {
+		if err := consumeFrame(dst, r, size, cap); err != nil {
 			break
 		}
 	}
 	return stdout.String(), stderr.String()
 }
 
-func consumeFrame(dst *bytes.Buffer, r io.Reader, n int64) error {
+func consumeFrame(dst *bytes.Buffer, r io.Reader, n int64, cap int) error {
 	if n == 0 {
 		return nil
 	}
@@ -796,7 +810,7 @@ func consumeFrame(dst *bytes.Buffer, r io.Reader, n int64) error {
 		_, err := io.CopyN(io.Discard, r, n)
 		return err
 	}
-	remain := int64(outputCap - dst.Len())
+	remain := int64(cap - dst.Len())
 	if remain < 0 {
 		remain = 0
 	}

@@ -2437,6 +2437,26 @@ input:focus, textarea:focus {
 
 .input button { flex: 0 0 auto; }
 
+.reasoning-effort {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: inherit;
+  font-size: 13px;
+}
+
+.reasoning-effort select {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
 .send-button {
   min-width: 68px;
   display: inline-flex;

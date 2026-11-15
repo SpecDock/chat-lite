@@ -130,6 +130,23 @@ func Remove(ctx context.Context, stored string) error {
 	return client.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{})
 }
 
+func ListKeys(ctx context.Context, keyPrefix string) ([]string, error) {
+	client, bucket, _, err := open(Prefix + keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: keyPrefix, Recursive: true}) {
+		if object.Err != nil {
+			return nil, object.Err
+		}
+		if object.Key != "" {
+			keys = append(keys, object.Key)
+		}
+	}
+	return keys, nil
+}
+
 func Materialize(ctx context.Context, stored, destination string) error {
 	body, err := Read(ctx, stored)
 	if err != nil {
