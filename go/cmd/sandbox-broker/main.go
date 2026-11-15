@@ -66,7 +66,6 @@ func main() {
 		log.Fatalf("sandbox cleanup: %v", err)
 	}
 	clearHeldMarkers()
-	stripAllSessionScripts()
 	if err := eng.ensureNetwork(context.Background()); err != nil {
 		log.Fatalf("sandbox network: %v", err)
 	}
@@ -102,12 +101,15 @@ type errJSON struct {
 }
 
 type runResult struct {
-	Status     string `json:"status"`
-	ExitCode   *int   `json:"exit_code"`
-	Stdout     string `json:"stdout"`
-	Stderr     string `json:"stderr"`
-	DurationMS int    `json:"duration_ms"`
-	TimedOut   bool   `json:"timed_out"`
+	Status              string `json:"status"`
+	ExitCode            *int   `json:"exit_code"`
+	Stdout              string `json:"stdout"`
+	Stderr              string `json:"stderr"`
+	DurationMS          int    `json:"duration_ms"`
+	TimedOut            bool   `json:"timed_out"`
+	Truncated           bool   `json:"truncated"`
+	InfrastructureError string `json:"infrastructure_error,omitempty"`
+	OOMKilled           bool   `json:"oom_killed,omitempty"`
 }
 
 type broker struct {
@@ -120,79 +122,84 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.serveSession(w, r)
 		return
 	}
-	if r.URL.Path != "/run" {
-		writeJSON(w, http.StatusNotFound, errJSON{Error: "not found"})
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, errJSON{Error: "method not allowed"})
-		return
-	}
+	// The retired one-shot Python endpoint must not bypass session quotas and cleanup.
+	writeJSON(w, http.StatusGone, errJSON{Error: "use /session/bash"})
+	return
+	/*
+		if r.URL.Path != "/run" {
+			writeJSON(w, http.StatusNotFound, errJSON{Error: "not found"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, errJSON{Error: "method not allowed"})
+			return
+		}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	defer r.Body.Close()
-	var payload struct {
-		JobID string `json:"jobId"`
-		Code  string `json:"code"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) || strings.Contains(err.Error(), "request body too large") {
-			writeJSON(w, http.StatusRequestEntityTooLarge, errJSON{Error: "request too large"})
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		defer r.Body.Close()
+		var payload struct {
+			JobID string `json:"jobId"`
+			Code  string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) || strings.Contains(err.Error(), "request body too large") {
+				writeJSON(w, http.StatusRequestEntityTooLarge, errJSON{Error: "request too large"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid request"})
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid request"})
-		return
-	}
 
-	jobPath, err := resolveJob(payload.JobID)
-	if err != nil {
-		if errors.Is(err, errJobsRoot) {
-			log.Printf("sandbox jobs root: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errJSON{Error: "jobs root unavailable"})
+		jobPath, err := resolveJob(payload.JobID)
+		if err != nil {
+			if errors.Is(err, errJobsRoot) {
+				log.Printf("sandbox jobs root: %v", err)
+				writeJSON(w, http.StatusInternalServerError, errJSON{Error: "jobs root unavailable"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid job"})
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid job"})
-		return
-	}
-	if strings.TrimSpace(payload.Code) == "" || len(payload.Code) > maxCodeBytes {
-		writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid code"})
-		return
-	}
-	if err := writeScript(jobPath, payload.Code); err != nil {
-		log.Printf("sandbox job=%s write script: %v", payload.JobID, err)
-		writeJSON(w, http.StatusInternalServerError, errJSON{Error: "write script failed"})
-		return
-	}
+		if strings.TrimSpace(payload.Code) == "" || len(payload.Code) > maxCodeBytes {
+			writeJSON(w, http.StatusBadRequest, errJSON{Error: "invalid code"})
+			return
+		}
+		if err := writeScript(jobPath, payload.Code); err != nil {
+			log.Printf("sandbox job=%s write script: %v", payload.JobID, err)
+			writeJSON(w, http.StatusInternalServerError, errJSON{Error: "write script failed"})
+			return
+		}
 
-	if err := b.gate.acquire(r.Context()); err != nil {
-		if errors.Is(err, errBusy) {
-			log.Printf("sandbox busy job=%s", payload.JobID)
-			writeJSON(w, http.StatusServiceUnavailable, errJSON{Error: "sandbox busy"})
+		if err := b.gate.acquire(r.Context()); err != nil {
+			if errors.Is(err, errBusy) {
+				log.Printf("sandbox busy job=%s", payload.JobID)
+				writeJSON(w, http.StatusServiceUnavailable, errJSON{Error: "sandbox busy"})
+				return
+			}
 			return
 		}
-		return
-	}
-	defer b.gate.release()
-	if err := r.Context().Err(); err != nil {
-		return
-	}
+		defer b.gate.release()
+		if err := r.Context().Err(); err != nil {
+			return
+		}
 
-	result, err := b.eng.run(r.Context(), payload.JobID)
-	if err != nil {
-		if r.Context().Err() != nil {
+		result, err := b.eng.run(r.Context(), payload.JobID)
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			if errors.Is(err, errLowMemory) {
+				log.Printf("sandbox low memory job=%s", payload.JobID)
+				writeJSON(w, http.StatusServiceUnavailable, errJSON{Error: "insufficient memory"})
+				return
+			}
+			log.Printf("sandbox job=%s: %v", payload.JobID, err)
+			writeJSON(w, http.StatusInternalServerError, errJSON{Error: safeErr(err)})
 			return
 		}
-		if errors.Is(err, errLowMemory) {
-			log.Printf("sandbox low memory job=%s", payload.JobID)
-			writeJSON(w, http.StatusServiceUnavailable, errJSON{Error: "insufficient memory"})
-			return
-		}
-		log.Printf("sandbox job=%s: %v", payload.JobID, err)
-		writeJSON(w, http.StatusInternalServerError, errJSON{Error: safeErr(err)})
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, result)
+	*/
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -212,7 +219,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func safeErr(err error) string {
-	msg := strings.Join(strings.Fields(err.Error()), " ")
+	msg := strings.Join(strings.Fields(strings.ReplaceAll(strings.ToValidUTF8(err.Error(), "\uFFFD"), "\x00", "\\0")), " ")
 	if msg == "" {
 		return "sandbox failed"
 	}
@@ -371,6 +378,10 @@ type hostConfig struct {
 	PidsLimit      int64             `json:"PidsLimit"`
 	Ulimits        []ulimit          `json:"Ulimits"`
 	Tmpfs          map[string]string `json:"Tmpfs"`
+	NanoCPUs       int64             `json:"NanoCpus"`
+	ShmSize        int64             `json:"ShmSize"`
+	Sysctls        map[string]string `json:"Sysctls,omitempty"`
+	LogConfig      map[string]any    `json:"LogConfig,omitempty"`
 	Binds          []string          `json:"Binds"`
 }
 
@@ -389,8 +400,11 @@ func sandboxSpec(jobID string) createRequest {
 		Env: []string{
 			"PYTHONUNBUFFERED=1",
 			"PYTHONDONTWRITEBYTECODE=1",
-			"HOME=/tmp",
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME=/work/.runtime/home", "TMPDIR=/tmp", "XDG_CACHE_HOME=/work/.runtime/cache",
+			"GOCACHE=/work/.runtime/cache/go-build", "GOMODCACHE=/work/.runtime/cache/go-mod", "GOPATH=/work/.runtime/go", "GOMAXPROCS=1", "GOFLAGS=-p=1", "GOMEMLIMIT=256MiB",
+			"JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=1 -XX:+UseSerialGC -Xmx192m -Xss512k -Djava.io.tmpdir=/tmp -XX:-UsePerfData",
+			"PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"OPENBLAS_NUM_THREADS=1", "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1", "NUMEXPR_NUM_THREADS=1",
 		},
 		Labels: map[string]string{"chatlite.sandbox": "1"},
 		Tty:    false,
@@ -402,9 +416,11 @@ func sandboxSpec(jobID string) createRequest {
 			Memory:         memoryLimit,
 			MemorySwap:     memoryLimit,
 			PidsLimit:      pidsLimit,
+			NanoCPUs:       1000000000,
+			ShmSize:        1048576,
+			LogConfig:      map[string]any{"Type": "none"},
 			Ulimits: []ulimit{
 				{Name: "fsize", Soft: fsizeLimit, Hard: fsizeLimit},
-				{Name: "cpu", Soft: cpuSoft, Hard: cpuHard},
 			},
 			Tmpfs: map[string]string{"/tmp": tmpfsOpts},
 			Binds: []string{hostJobsRoot + "/jobs/" + jobID + ":/work"},

@@ -31,6 +31,9 @@ services:
     command: ["/app/sandbox-broker"]
     restart: unless-stopped
     network_mode: none
+    # Trusted broker only, for quotactl_fd/FSSETXATTR. Workers never get SYS_ADMIN.
+    cap_add:
+      - SYS_ADMIN
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/lib/chat-lite/table-sandbox:/run/table-sandbox

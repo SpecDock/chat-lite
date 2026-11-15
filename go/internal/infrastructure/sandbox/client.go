@@ -25,12 +25,56 @@ const heldMarker = ".sandbox-held"
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
 
 type Result struct {
-	Status     string `json:"status"`
-	ExitCode   *int   `json:"exit_code"`
-	Stdout     string `json:"stdout"`
-	Stderr     string `json:"stderr"`
-	DurationMS int    `json:"duration_ms"`
-	TimedOut   bool   `json:"timed_out"`
+	Status              string `json:"status"`
+	ExitCode            *int   `json:"exit_code"`
+	Stdout              string `json:"stdout"`
+	Stderr              string `json:"stderr"`
+	DurationMS          int    `json:"duration_ms"`
+	TimedOut            bool   `json:"timed_out"`
+	Truncated           bool   `json:"truncated"`
+	InfrastructureError string `json:"infrastructure_error,omitempty"`
+	OOMKilled           bool   `json:"oom_killed,omitempty"`
+}
+
+type BashRequest struct {
+	Command        string `json:"command"`
+	Cwd            string `json:"cwd"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+func ExecBashSession(ctx context.Context, conversationID string, request BashRequest) (Result, error) {
+	if runtime.GOOS != "linux" {
+		return Result{}, fmt.Errorf("沙箱只在 Linux Docker 运行环境中可用")
+	}
+	var result Result
+	err := postSession(ctx, "/session/bash", map[string]any{"id": conversationID, "command": request.Command, "cwd": request.Cwd, "timeout_seconds": request.TimeoutSeconds}, &result, nil)
+	if err != nil {
+		// Cancelling HTTP is not evidence that the container has been stopped.
+		// Status takes the broker's same-session gate. Never resend the command.
+		barrierCtx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		var state SessionState
+		barrierErr := postSession(barrierCtx, "/session/status", map[string]any{"id": conversationID}, &state, nil)
+		result.Status = "interrupted"
+		result.InfrastructureError = "execution outcome unavailable after HTTP failure; command was not retried"
+		if barrierErr != nil {
+			result.InfrastructureError += "; cleanup pending/unavailable: " + barrierErr.Error()
+			return result, fmt.Errorf("%w; %s", err, result.InfrastructureError)
+		}
+		result.InfrastructureError += "; session cleanup barrier completed"
+		return result, fmt.Errorf("%w; %s", err, result.InfrastructureError)
+	}
+	return result, err
+}
+
+func DeleteSession(ctx context.Context, conversationID string) error {
+	if !jobIDPattern.MatchString(conversationID) {
+		return errors.New("invalid sandbox session")
+	}
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	return postSession(ctx, "/session/delete", map[string]any{"id": conversationID}, nil, nil)
 }
 
 func Run(ctx context.Context, jobID, code string) (Result, error) {
@@ -126,7 +170,7 @@ func postSession(ctx context.Context, path string, payload any, into any, rawOut
 	body, _ := json.Marshal(payload)
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", SocketPath)
-	}}, Timeout: 70 * time.Second}
+	}}, Timeout: 340 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+path, bytes.NewReader(body))
 	if err != nil {
 		return err

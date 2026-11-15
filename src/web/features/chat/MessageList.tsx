@@ -141,7 +141,8 @@ export default function MessageList({ messages, conversationId, storageKey, scro
     if (!sameConversation) autoFollowRef.current = scrollIntent !== 'restore';
 
     const latest = messages[messages.length - 1];
-    const signature = `${conversationId}:${scrollIntent}:${messages.length}:${latest?.id || 'empty'}:${latest?.content?.length || 0}`;
+    const cardsSignature = latest?.executionCards?.map(card => `${card.executionId}:${card.status}:${card.durationMs}:${card.code?.length || 0}:${card.output?.length || 0}:${card.sourceSnapshots?.length || 0}:${card.showCode}:${card.showStdout}:${card.showStderr}:${card.truncated}:${card.oomKilled}:${card.infrastructureError || ''}`).join('|') || '';
+    const signature = `${conversationId}:${scrollIntent}:${messages.length}:${latest?.id || 'empty'}:${latest?.content?.length || 0}:${cardsSignature}`;
     const remember = () => {
       const firstId = nextIds[0];
       anchorRef.current = {
@@ -395,7 +396,7 @@ export default function MessageList({ messages, conversationId, storageKey, scro
               <div className={`bubble ${isEditing ? 'inline-edit-bubble' : ''}`}>
                 {isEditing && editable
                   ? <InlineMessageEditor initialText={editable.text} images={editable.images} disabled={editorDisabled} onCancel={onCancelEdit} onConfirm={text => onConfirmEdit(message, text)} />
-                  : <MarkdownMessage content={message.content || (message.status === 'streaming' ? '...' : '')} streaming={message.status === 'streaming'} onImageClick={onImageClick} />}
+                  : <MarkdownMessage content={message.content || (message.status === 'streaming' && !message.executionCards?.length ? '...' : '')} streaming={message.status === 'streaming'} executionCards={message.role === 'assistant' ? message.executionCards : undefined} onImageClick={onImageClick} />}
               </div>
               {showActions && !isEditing && <MessageActions text={copyText} isUser={isUser} disabled={actionsDisabled} onEdit={() => onEdit(message)} onDelete={() => onDelete(message)} />}
             </div>

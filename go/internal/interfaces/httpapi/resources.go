@@ -55,7 +55,11 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, statusOfUpload(err), err.Error())
 		return
 	}
-	conversationID := strings.TrimSpace(fields["conversationId"])
+	defer file.cleanup()
+	conversationID := fields["conversationId"]
+	if !requireConversationRoute(w, r, conversationID) {
+		return
+	}
 	if file.image != nil {
 		if conversationID != "" {
 			exists, err := uploads.UserConversationExists(r.Context(), a.Pool, conversationID, user.UserID)
@@ -108,6 +112,15 @@ type parsedUpload struct {
 	table *tableUpload
 	pdf   *tableUpload
 }
+
+func (file parsedUpload) cleanup() {
+	for _, part := range []*tableUpload{file.pdf, file.table} {
+		if part != nil && part.temp != "" {
+			_ = os.Remove(part.temp)
+		}
+	}
+}
+
 type tableUpload struct {
 	temp, name, mime string
 	size             int64
@@ -125,6 +138,12 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 	mr := multipart.NewReader(r.Body, params["boundary"])
 	fields := map[string]string{}
 	var parsed parsedUpload
+	complete := false
+	defer func() {
+		if !complete {
+			parsed.cleanup()
+		}
+	}()
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -135,12 +154,18 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 		}
 		if part.FileName() == "" {
 			buf, _ := io.ReadAll(io.LimitReader(part, 1<<20))
+			if _, exists := fields[part.FormName()]; exists && part.FormName() == "conversationId" {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "请勿重复提供会话 ID"}
+			}
 			fields[part.FormName()] = string(buf)
 			continue
 		}
 		if part.FormName() != "file" {
 			_, _ = io.Copy(io.Discard, part)
 			continue
+		}
+		if parsed.image != nil || parsed.pdf != nil || parsed.table != nil {
+			return parsedUpload{}, fields, &uploads.StatusError{400, "每次只能上传一个文件"}
 		}
 		name := safeName(part.FileName())
 		mimeType := strings.ToLower(part.Header.Get("Content-Type"))
@@ -182,6 +207,7 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 		}
 		parsed.table = &tableUpload{temp: temp, name: name, mime: mimeType, size: n}
 	}
+	complete = true
 	return parsed, fields, nil
 }
 

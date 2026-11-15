@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 	"runtime"
 	"strings"
 	"time"
@@ -19,48 +21,57 @@ import (
 )
 
 type scratch struct {
-	jobID, root, userID, conversationID string
-	published                           map[string]int64
+	userID, conversationID string
+	published              map[string]int64
+	fs                     *os.Root
 }
 
-func openScratch(in Input) (*scratch, error) {
+func openScratch(ctx context.Context, in Input) (*scratch, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errScratch("表格沙箱只在 Linux Docker 运行环境中可用")
 	}
 	if !paths.IsSafeWorkspaceID(in.ConversationID) {
 		return nil, errScratch("会话无效")
 	}
-	root := filepath.Join(sandbox.SessionsDir, in.ConversationID)
-	if err := os.MkdirAll(filepath.Join(root, "input"), 0o755); err != nil {
+	// Quota admission and root-owned input provisioning precede every trusted
+	// write, including restore and attachment staging. No app-side mkdir fallback.
+	if err := sandbox.EnsureSession(ctx, in.ConversationID, false); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(root, "output"), 0o777); err != nil {
+	parent, err := os.OpenRoot(sandbox.SessionsDir)
+	if err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(root, 0o1777)
-	_ = os.Chmod(filepath.Join(root, "input"), 0o755)
-	_ = os.Chmod(filepath.Join(root, "output"), 0o777)
-	work := &scratch{jobID: in.ConversationID, root: root, userID: in.UserID, conversationID: in.ConversationID, published: map[string]int64{}}
+	defer parent.Close()
+	rootFS, err := parent.OpenRoot(in.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	for _, bucket := range []string{"input", "output"} {
+		info, err := rootFS.Lstat(bucket)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			rootFS.Close()
+			return nil, errScratch("工作区目录无效")
+		}
+	}
+	work := &scratch{fs: rootFS, userID: in.UserID, conversationID: in.ConversationID, published: map[string]int64{}}
 	work.restoreWorkspace()
 	return work, nil
 }
 
-func (s *scratch) close() {}
-
-func removeJobDir(root string) {
-	if root == "" {
-		return
+func (s *scratch) close() {
+	if s != nil && s.fs != nil {
+		_ = s.fs.Close()
 	}
-	if _, err := os.Lstat(filepath.Join(root, ".sandbox-held")); !os.IsNotExist(err) {
-		return
-	}
-	_ = os.RemoveAll(root)
 }
 
-func (s *scratch) mountCurrent(ctx context.Context, pool *pgxpool.Pool, in Input) {
+func (s *scratch) mountCurrent(ctx context.Context, pool *pgxpool.Pool, in Input) error {
 	for _, id := range in.AttachmentIDs {
-		_, _ = s.download(ctx, pool, in, id)
+		if _, err := s.download(ctx, pool, in, id); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, attachmentID string) (string, error) {
@@ -77,17 +88,14 @@ func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, at
 	if safe == "" || safe == "." {
 		safe = attachmentID
 	}
-	target := filepath.Join(s.root, "input", safe)
-	if !paths.IsWithinDirectory(filepath.Join(s.root, "input"), target) {
-		return "", errScratch("文件名无效")
-	}
-	if err = storage.Materialize(ctx, filePath, target); err != nil {
+	body, err := storage.Read(ctx, filePath)
+	if err != nil {
 		return "", err
 	}
-	_ = os.Chmod(target, 0o644)
-	if body, readErr := os.ReadFile(target); readErr == nil {
-		s.syncFile("input/"+safe, body)
+	if err = s.writeInputFile(safe, body); err != nil {
+		return "", err
 	}
+	s.syncFile("input/"+safe, body)
 	return "input/" + safe, nil
 }
 
@@ -99,11 +107,7 @@ func (s *scratch) stageInputFile(name string, body []byte) (string, error) {
 	if !strings.HasSuffix(strings.ToLower(safe), ".txt") {
 		safe += ".txt"
 	}
-	target := filepath.Join(s.root, "input", safe)
-	if !paths.IsWithinDirectory(filepath.Join(s.root, "input"), target) {
-		return "", errScratch("文件名无效")
-	}
-	if err := os.WriteFile(target, body, 0o644); err != nil {
+	if err := s.writeInputFile(safe, body); err != nil {
 		return "", err
 	}
 	s.syncFile("input/"+safe, body)
@@ -118,10 +122,10 @@ func (s *scratch) write(rel, content string) (string, error) {
 	if len(content) > 1<<20 {
 		return "", errScratch("文件不能超过 1MB")
 	}
-	if err = os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
+	if err = s.fs.MkdirAll(path.Dir(target), 0o777); err != nil {
 		return "", err
 	}
-	if err = os.WriteFile(target, []byte(content), 0o644); err != nil {
+	if err = s.writeTrusted(target, []byte(content), 0o644); err != nil {
 		return "", err
 	}
 	saved := cleanRel(rel)
@@ -136,7 +140,7 @@ func (s *scratch) edit(rel, oldText, newText string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	body, err := os.ReadFile(target)
+	body, err := s.readRegular(target, 1<<20)
 	if err != nil {
 		return "", errScratch("文件不存在")
 	}
@@ -151,7 +155,7 @@ func (s *scratch) edit(rel, oldText, newText string) (string, error) {
 	if len(updated) > 1<<20 {
 		return "", errScratch("文件不能超过 1MB")
 	}
-	if err = os.WriteFile(target, []byte(updated), 0o644); err != nil {
+	if err = s.writeTrusted(target, []byte(updated), 0o644); err != nil {
 		return "", err
 	}
 	saved := cleanRel(rel)
@@ -193,7 +197,7 @@ func fileCatalog(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratc
 			}
 		}
 		if work != nil {
-			if _, err := os.Stat(filepath.Join(work.root, "input", safeTableName(name))); err == nil {
+			if _, err := work.fs.Stat("input/" + safeTableName(name)); err == nil {
 				where = "已在 input/" + safeTableName(name)
 			}
 		}
@@ -220,11 +224,6 @@ func runWrite(work *scratch, path, content string) (string, map[string]any, []Ev
 	if work == nil {
 		return "临时工作区不可用。", nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
 	}
-	if isRootScript(cleanRel(path)) {
-		if err := sandbox.EnsureSession(context.Background(), work.conversationID, false); err != nil {
-			return "写入失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
-		}
-	}
 	saved, err := work.write(path, content)
 	if err != nil {
 		return "写入失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：write_file"}}
@@ -243,71 +242,37 @@ func runEdit(work *scratch, path, oldText, newText string) (string, map[string]a
 	return "已修改 " + saved, nil, []Event{{Type: "think", Text: "工具完成：edit_file"}}
 }
 
-func runPythonFile(ctx context.Context, pool *pgxpool.Pool, in Input, work *scratch, path string) (string, map[string]any, []Event) {
-	if work == nil {
-		return "临时工作区不可用。", nil, []Event{{Type: "think", Text: "工具调用失败：run_python"}}
-	}
-	result, code, err := work.run(ctx, path)
-	if err != nil {
-		return "工具 run_python 执行失败：" + err.Error(), nil, []Event{{Type: "think", Text: "工具调用失败：run_python"}}
-	}
-	saved := ""
-	if result.Status == "succeeded" && result.ExitCode != nil && *result.ExitCode == 0 {
-		note, saveErr := publishPythonOutputs(ctx, pool, in, work, filepath.Join(work.root, "output"))
-		if saveErr != nil {
-			saved = "\n新文件保存失败：" + saveErr.Error()
-		} else if note != "" {
-			saved = "\n" + note
-		}
-	}
-	detail := structuredSandboxResult(result, "")
-	events := []Event{{Type: "execution", Language: "python", Code: code, Output: tableResultText(result)}}
-	think := "工具完成：run_python"
-	text := "Python 已执行。路径：" + path + "。" + saved + "\n" + detail
-	if result.Status != "succeeded" || result.ExitCode == nil || *result.ExitCode != 0 {
-		think = "工具返回失败：run_python"
-		text = "Python 未通过。请用 edit_file 修改后再次运行。路径：" + path + "。" + saved + "\n" + detail
-	}
-	events = append(events, Event{Type: "think", Text: think})
-	return text, nil, events
-}
-
-func (s *scratch) run(ctx context.Context, rel string) (sandbox.Result, string, error) {
-	rel = cleanRel(rel)
-	if !strings.HasSuffix(strings.ToLower(rel), ".py") || strings.HasPrefix(rel, "input/") {
-		return sandbox.Result{}, "", errScratch("只能运行工作区里的 .py 文件，不能运行 input 中的文件")
-	}
-	target := filepath.Join(s.root, filepath.FromSlash(rel))
-	if !paths.IsWithinDirectory(s.root, target) {
-		return sandbox.Result{}, "", errScratch("路径无效")
-	}
-	body, err := os.ReadFile(target)
-	if err != nil {
-		return sandbox.Result{}, "", errScratch("文件不存在")
-	}
-	result, err := sandbox.ExecSession(ctx, s.conversationID, rel)
-	if err == nil {
-		s.syncBucket("output")
-	}
-	return result, string(body), err
-}
-
 func (s *scratch) writable(rel string) (string, error) {
 	rel = cleanRel(rel)
 	if rel == "" || strings.HasPrefix(rel, "input/") || rel == "input" {
 		return "", errScratch("不能修改 input 里的原文件")
 	}
-	target := filepath.Join(s.root, filepath.FromSlash(rel))
-	if !paths.IsWithinDirectory(s.root, target) {
-		return "", errScratch("路径无效")
+	if err := s.noSymlinks(rel); err != nil {
+		return "", err
 	}
-	return target, nil
+	return rel, nil
 }
 
 func cleanRel(rel string) string {
 	rel = strings.TrimSpace(strings.ReplaceAll(rel, "\\", "/"))
-	rel = strings.TrimPrefix(rel, "/")
-	if strings.Contains(rel, "..") {
+	if rel == "" || strings.ContainsRune(rel, 0) {
+		return ""
+	}
+	// Reject parent traversal before Clean can erase it. Dots inside ordinary
+	// filenames are valid; only the complete parent component is forbidden.
+	for _, component := range strings.Split(rel, "/") {
+		if component == ".." {
+			return ""
+		}
+	}
+	rel = path.Clean(rel)
+	if path.IsAbs(rel) {
+		if !strings.HasPrefix(rel, "/work/") {
+			return ""
+		}
+		rel = strings.TrimPrefix(rel, "/work/")
+	}
+	if rel == "." || rel == "" {
 		return ""
 	}
 	return rel
@@ -328,17 +293,16 @@ func containerStateLine(ctx context.Context, conversationID string) string {
 	return "现在的容器状态为有容器。当前时间 " + now + "。预计销毁时间 " + state.ExpiresAt + "。"
 }
 
-func isRootScript(rel string) bool {
-	rel = cleanRel(rel)
-	return strings.HasSuffix(strings.ToLower(rel), ".py") && !strings.Contains(rel, "/")
-}
-
 func isWorkspaceData(rel string) bool {
 	rel = cleanRel(rel)
 	return strings.HasPrefix(rel, "input/") || strings.HasPrefix(rel, "output/")
 }
 
 func (s *scratch) syncFile(rel string, body []byte) {
+	rel = cleanRel(rel)
+	if !isWorkspaceData(rel) {
+		return
+	}
 	if s == nil || s.userID == "" || len(body) == 0 || len(body) > 20<<20 || strings.Contains(rel, "/") == false {
 		return
 	}
@@ -359,8 +323,7 @@ func (s *scratch) syncBucket(bucket string) {
 	if s == nil || (bucket != "input" && bucket != "output") {
 		return
 	}
-	dir := filepath.Join(s.root, bucket)
-	entries, err := os.ReadDir(dir)
+	entries, err := fs.ReadDir(s.fs.FS(), bucket)
 	if err != nil {
 		return
 	}
@@ -372,11 +335,15 @@ func (s *scratch) syncBucket(bucket string) {
 		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 20<<20 {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		rel := cleanRel(bucket + "/" + entry.Name())
+		if rel == "" || path.Dir(rel) != bucket {
+			continue
+		}
+		body, err := s.readRegular(rel, 20<<20)
 		if err != nil {
 			continue
 		}
-		s.syncFile(bucket+"/"+entry.Name(), body)
+		s.syncFile(rel, body)
 	}
 }
 
@@ -395,11 +362,21 @@ func (s *scratch) restoreWorkspace() {
 			if name == "" || strings.Contains(name, "/") {
 				continue
 			}
-			target := filepath.Join(s.root, bucket, name)
-			if _, err := os.Lstat(target); err == nil {
+			target := cleanRel(bucket + "/" + name)
+			if target == "" || path.Dir(target) != bucket {
 				continue
 			}
-			_ = storage.Materialize(context.Background(), storage.Prefix+key, target)
+			if _, err := s.fs.Lstat(target); err == nil {
+				continue
+			}
+			body, err := storage.Read(context.Background(), storage.Prefix+key)
+			if err == nil {
+				if bucket == "input" {
+					_ = s.writeInputFile(name, body)
+				} else {
+					_ = s.writeTrusted(target, body, 0o644)
+				}
+			}
 		}
 	}
 }
@@ -427,21 +404,113 @@ func (s *scratch) read(ctx context.Context, path string) (string, error) {
 	if rel == "" {
 		return "", errScratch("路径无效")
 	}
-	target := filepath.Join(s.root, filepath.FromSlash(rel))
-	if !paths.IsWithinDirectory(s.root, target) {
-		return "", errScratch("路径无效")
-	}
-	body, err := os.ReadFile(target)
+	body, err := s.readRegular(rel, (1<<20)+1)
 	if err != nil {
 		return "", errScratch("文件不存在")
 	}
 	return textBody(body)
 }
 
+// The root capability prevents host escapes even when a worker left symlinks.
+// Rejecting write-side symlinks also preserves the input/ read-only boundary.
+// All trusted tools execute serially, with the worker stopped between commands.
+func (s *scratch) noSymlinks(rel string) error {
+	rel = cleanRel(rel)
+	if rel == "" {
+		return errScratch("路径无效")
+	}
+	parts := strings.Split(rel, "/")
+	for i := range parts {
+		info, err := s.fs.Lstat(strings.Join(parts[:i+1], "/"))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errScratch("不能写入符号链接")
+		}
+	}
+	return nil
+}
+
+func (s *scratch) writeTrusted(rel string, body []byte, mode os.FileMode) error {
+	var err error
+	rel, err = s.writable(rel)
+	if err != nil {
+		return err
+	}
+	return s.writeWorkspaceFile(rel, body, mode)
+}
+
+// Only attachment staging/restoration may write input/. The generated name is
+// validated after normalization and must remain one direct child of input/.
+func (s *scratch) writeInputFile(name string, body []byte) error {
+	rel := cleanRel("input/" + name)
+	if rel == "" || path.Dir(rel) != "input" {
+		return errScratch("input 文件名无效")
+	}
+	return s.writeWorkspaceFile(rel, body, 0o644)
+}
+
+func (s *scratch) writeWorkspaceFile(rel string, body []byte, mode os.FileMode) error {
+	if err := s.noSymlinks(rel); err != nil {
+		return err
+	}
+	f, err := openWorkspaceFile(s.fs, rel, os.O_WRONLY|os.O_CREATE, mode)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err = f.Truncate(0); err != nil {
+		return err
+	}
+	if err = f.Chmod(mode); err != nil {
+		return err
+	}
+	_, err = f.Write(body)
+	return err
+}
+
+func (s *scratch) readRegular(rel string, limit int64) ([]byte, error) {
+	rel = cleanRel(rel)
+	if rel == "" {
+		return nil, errScratch("路径无效")
+	}
+	before, err := s.fs.Stat(rel)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Size() > limit {
+		return nil, errScratch("文件不是普通文件或超过大小限制")
+	}
+	f, err := openWorkspaceFile(s.fs, rel, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > limit {
+		return nil, errScratch("文件不是普通文件或超过大小限制")
+	}
+	body, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if int64(len(body)) > limit {
+		return nil, errScratch("文件超过大小限制")
+	}
+	return body, err
+}
+
 func (s *scratch) readAbsolute(ctx context.Context, path string) (string, error) {
-	if strings.HasPrefix(path, "/work/") {
-		rel := strings.TrimPrefix(path, "/work/")
-		return s.read(ctx, rel)
+	if rel := cleanRel(path); rel != "" {
+		body, err := s.readRegular(rel, (1<<20)+1)
+		if err != nil {
+			return "", err
+		}
+		return textBody(body)
 	}
 	if path == "/work" {
 		return "", errScratch("路径无效")

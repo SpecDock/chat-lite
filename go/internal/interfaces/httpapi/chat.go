@@ -52,11 +52,18 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	body := httpx.ReadJSON(r, 1<<20)
 	content := strings.TrimSpace(firstString(body["content"], body["message"]))
-	conversationID := strings.TrimSpace(httpx.AsString(body["conversationId"]))
+	conversationID := httpx.AsString(body["conversationId"])
+	if !requireConversationRoute(w, r, conversationID) {
+		return
+	}
+	lease, ok := a.beginConversationLease(w, r, conversationID)
+	if !ok {
+		return
+	}
+	defer lease.Release()
 	editID := strings.TrimSpace(httpx.AsString(body["editUserMessageId"]))
 	attachmentIDs := stringList(body["attachmentIds"], 4)
 	userInput := content
-	created := false
 	var userMessageID, assistantID, editMode string
 	var firstTurn bool
 	ctx := r.Context()
@@ -164,24 +171,14 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, 400, "消息不能为空")
 			return
 		}
-		if conversationID == "" {
-			conversationID = idgen.NewID("conv")
-			if _, err := a.createConversation(ctx, conversationID, user.UserID, safeTitle(userInput)); err != nil {
-				httpx.Error(w, 500, "服务器错误")
-				return
-			}
-			created = true
-			emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "created"})
-		} else {
-			exists, err := a.conversationExists(ctx, conversationID, user.UserID)
-			if err != nil {
-				httpx.Error(w, 500, "服务器错误")
-				return
-			}
-			if !exists {
-				httpx.Error(w, 404, "会话不存在")
-				return
-			}
+		exists, err := a.conversationExists(ctx, conversationID, user.UserID)
+		if err != nil {
+			httpx.Error(w, 500, "服务器错误")
+			return
+		}
+		if !exists {
+			httpx.Error(w, 404, "会话不存在")
+			return
 		}
 		release, ok := a.beginContextLock(w, conversationID)
 		if !ok {
@@ -218,7 +215,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	summary := prepared.Summary
 	if editMode == "" {
 		firstTurn = len(history) == 0 && strings.TrimSpace(summary) == ""
-		if !created && firstTurn {
+		if firstTurn {
 			_ = a.updateAutoTitle(ctx, conversationID, user.UserID, safeTitle(userInput))
 		}
 	}
@@ -252,10 +249,11 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			writeSSE(w, flusher, event, data)
 		}
 	}
-	var full, stored, execution string
-	var thinkStarted, thinkClosed, executionInserted bool
-	var executionAt, finalStart int
+	var full, stored string
+	var thinkStarted, thinkClosed bool
 	var captured *llm.Usage
+	executionCards := []chat.ExecutionCard{}
+	var executionPersistErr error
 	appendThink := func(text string) {
 		if !thinkStarted || thinkClosed {
 			thinkStarted = true
@@ -273,14 +271,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		stored += "</think>\n\n"
 	}
 	placeExecution := func(boundary bool) {
-		if executionInserted || (!boundary && execution == "") {
-			return
-		}
 		closeThink()
-		executionAt = len(stored)
-		stored += execution
-		executionInserted = true
-		finalStart = len(stored)
 	}
 	var saved []any
 	appendThink("正在思考")
@@ -316,7 +307,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	if loadErr != nil {
 		err = loadErr
 	} else {
-		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), ReasoningEffort: reasoningEffort(body), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist}, func(event chat.Event) {
+		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), ReasoningEffort: reasoningEffort(body), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist, Lease: lease}, func(event chat.Event) {
 			switch event.Type {
 			case "think":
 				appendThink(event.Text)
@@ -327,23 +318,28 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 				stored += event.Text
 				writeLive("delta", map[string]any{"text": event.Text})
 			case "execution":
-				block := encodeExecution(event.Language, event.Code, event.Output)
-				execution += block + "\n\n"
-				if executionInserted {
-					bodyText := ""
-					if finalStart <= len(stored) {
-						bodyText = stored[finalStart:]
-					}
-					stored = stored[:executionAt] + execution + bodyText
-					finalStart = executionAt + len(execution)
-				} else {
-					placeExecution(true)
+				if event.Execution == nil || executionPersistErr != nil {
+					break
 				}
-				writeLive("execution", map[string]any{"language": event.Language, "code": event.Code, "output": event.Output})
+				executionCards = append(executionCards, *event.Execution)
+				raw, marshalErr := json.Marshal(executionCards)
+				if marshalErr != nil {
+					executionPersistErr = marshalErr
+					break
+				}
+				persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, executionPersistErr = a.Pool.Exec(persistCtx, `UPDATE messages SET execution_cards=$1 WHERE id=$2 AND user_id=$3 AND conversation_id=$4`, raw, assistantID, user.UserID, conversationID)
+				cancel()
+				if executionPersistErr == nil {
+					writeLive("execution", event.Execution)
+				}
 			case "usage":
 				captured = mergeUsage(captured, event.Usage)
 			}
 		})
+	}
+	if executionPersistErr != nil {
+		err = executionPersistErr
 	}
 	if err == nil && strings.TrimSpace(full) == "" && !strings.Contains(stored, "](/api/files/att_") {
 		appendThink("主模型未返回正文，请尝试重新提问或调整描述。")
@@ -553,6 +549,19 @@ func openContextStore() (*contextstore.Store, bool, error) {
 		return nil, true, errors.New("contextstore: redis 未初始化")
 	}
 	return contextStoreVal, true, nil
+}
+
+func (a *App) beginConversationLease(w http.ResponseWriter, r *http.Request, conversationID string) (*chat.ConversationLease, bool) {
+	lease, err := chat.AcquireConversationLease(r.Context(), a.Pool, conversationID)
+	if err != nil {
+		if errors.Is(err, chat.ErrConversationBusy) {
+			httpx.Error(w, 409, err.Error())
+		} else {
+			httpx.Error(w, 500, "会话锁获取失败")
+		}
+		return nil, false
+	}
+	return lease, true
 }
 
 func (a *App) beginContextLock(w http.ResponseWriter, conversationID string) (func(), bool) {
@@ -982,7 +991,7 @@ func (a *App) replaceLatest(ctx context.Context, conversationID, userID string, 
 		return err
 	}
 	if pair.Assistant != nil {
-		if _, err = tx.Exec(ctx, `UPDATE messages SET content='', status='streaming' WHERE id=$1 AND conversation_id=$2 AND user_id=$3 AND role='assistant'`, assistantID, conversationID, userID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE messages SET content='', execution_cards='[]'::jsonb, status='streaming' WHERE id=$1 AND conversation_id=$2 AND user_id=$3 AND role='assistant'`, assistantID, conversationID, userID); err != nil {
 			return err
 		}
 	} else {

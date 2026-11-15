@@ -29,7 +29,7 @@ import ProfileMenu from '../profile/ProfileMenu';
 import WorkspaceDialog from './WorkspaceDialog';
 import ImageLightbox from '../messages/ImageLightbox';
 import ImageStudioPage from '../studio/ImageStudioPage';
-import { encodeExecutionBlock } from '../../shared/execution-block';
+import { isExecutionCard } from '../../shared/execution-block';
 
 const EMPTY_CONVERSATION_KEY = '__none__';
 const TEMPORARY_CONVERSATION_PREFIX = '__temporary__:';
@@ -563,7 +563,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   const tasksRef = useRef<Map<string, ActiveTask>>(new Map());
   const stopRequestedRef = useRef(new Set<string>());
   const keyAliasesRef = useRef<Map<string, string>>(new Map());
-  const firstUploadConversationRef = useRef<Promise<string> | null>(null);
+  const conversationCreationsRef = useRef<Map<string, Promise<string>>>(new Map());
   const workspaceRequestRef = useRef(0);
   const searchTriggerRef = useRef<HTMLButtonElement | null>(null);
   const searchSelectionRef = useRef(0);
@@ -1224,6 +1224,11 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   function migrateConversationKey(fromKey: string, toKey: string) {
     if (fromKey === toKey) return;
     keyAliasesRef.current.set(fromKey, toKey);
+    const creation = conversationCreationsRef.current.get(fromKey);
+    if (creation) {
+      conversationCreationsRef.current.delete(fromKey);
+      conversationCreationsRef.current.set(toKey, creation);
+    }
     const movedMessages = moveRecordValue(messagesByConversationRef.current, fromKey, toKey);
     messagesByConversationRef.current = movedMessages;
     setMessagesByConversation(movedMessages);
@@ -1251,21 +1256,24 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
   }
 
   async function ensureUploadConversation(uploadKey: string) {
+    uploadKey = resolveKey(uploadKey);
     const existing = conversationIdForKey(uploadKey);
     if (existing) return existing;
-    if (!firstUploadConversationRef.current) {
-      firstUploadConversationRef.current = (async () => {
+    if (!conversationCreationsRef.current.has(uploadKey)) {
+      conversationCreationsRef.current.set(uploadKey, (async () => {
         const conversation = (await api.createConversation()).conversation;
         setConvs(currentConversations => [conversation, ...currentConversations]);
-        migrateConversationKey(uploadKey, conversation.id);
+        migrateConversationKey(resolveKey(uploadKey), conversation.id);
         return conversation.id;
-      })();
+      })());
     }
-    const pending = firstUploadConversationRef.current;
+    const pending = conversationCreationsRef.current.get(uploadKey)!;
     try {
       return await pending;
     } finally {
-      if (firstUploadConversationRef.current === pending) firstUploadConversationRef.current = null;
+      for (const [key, creation] of conversationCreationsRef.current) {
+        if (creation === pending) conversationCreationsRef.current.delete(key);
+      }
     }
   }
 
@@ -1639,33 +1647,14 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         thinkClosed = thinkStarted || thinkClosed;
         queueTaskDelta(options.task, prefix + (data.text || ''), targetKey, assistantMessageId);
       }
-      if (event === 'execution' && data.code !== undefined) {
-        const execution = encodeExecutionBlock({
-          language: data.language || 'python',
-          code: data.code,
-          output: data.output || '',
-        });
-        if (thinkStarted) thinkClosed = true;
+      if (event === 'execution' && isExecutionCard(data)) {
         updateMessages(targetKey, currentMessages => currentMessages.map(message => {
           if (message.id !== assistantMessageId) return message;
-          let content = message.content;
-          const openThink = content.lastIndexOf('<think>');
-          const closeThink = content.lastIndexOf('</think>');
-          if (thinkStarted && openThink > closeThink) content += '</think>\n\n';
-          const block = `${execution}\n\n`;
-          const thinkEnd = content.indexOf('</think>');
-          if (thinkEnd >= 0) {
-            const afterThink = thinkEnd + '</think>'.length;
-            const rest = content.slice(afterThink);
-            const existing = rest.match(/^(?:\s*<chat-lite-execution v="1">[\s\S]*?<\/chat-lite-execution>\s*)*/);
-            const used = existing ? existing[0].length : 0;
-            const head = content.slice(0, afterThink + used).replace(/\s*$/, '\n\n');
-            const tail = content.slice(afterThink + used).replace(/^\s*/, '');
-            content = `${head}${block}${tail}`;
-          } else {
-            content = `${block}${content}`;
-          }
-          return { ...message, content };
+          const cards = message.executionCards || [];
+          const exists = cards.some(card => card.executionId === data.executionId);
+          return { ...message, executionCards: exists
+            ? cards.map(card => card.executionId === data.executionId ? data : card)
+            : [...cards, data] };
         }));
       }
       if (event === 'done') {
@@ -1745,7 +1734,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
 
   async function send(text: string) {
     let targetKey = currentRef.current || EMPTY_CONVERSATION_KEY;
-    const conversationId = conversationIdForKey(targetKey);
+    let conversationId = conversationIdForKey(targetKey);
     const targetMessages = messagesByConversation[targetKey] || [];
     if (tasksRef.current.has(targetKey) || activities[targetKey]?.status === 'streaming' || targetMessages.some(message => message.status === 'streaming')) return;
 
@@ -1787,6 +1776,16 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     }
 
     try {
+      if (!conversationId) {
+        conversationId = await ensureUploadConversation(targetKey);
+        targetKey = resolveKey(targetKey);
+        updateMessages(targetKey, currentMessages => currentMessages.map(message =>
+          message.id === tempUser.id || message.id === tempAssistant.id
+            ? { ...message, conversation_id: conversationId! }
+            : message));
+      }
+      // Creating the DB row may finish after cancellation, but chat must not run.
+      if (task.cancelRequested || controller.signal.aborted) return;
       await consumeStream({
         conversationId,
         text: userText,
@@ -1909,6 +1908,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             const realAssistant = {
               ...tempAssistant,
               content: currentAssistant?.content || tempAssistant.content,
+              executionCards: currentAssistant?.executionCards,
               id: assistantMessageId,
               conversation_id: realConversationId,
             };

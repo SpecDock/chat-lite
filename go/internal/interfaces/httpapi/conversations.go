@@ -15,6 +15,7 @@ import (
 
 	"chatlite/internal/application/chat"
 	"chatlite/internal/application/rag"
+	"chatlite/internal/infrastructure/sandbox"
 	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/httpx"
 	"chatlite/internal/platform/idgen"
@@ -30,12 +31,13 @@ type conversationDTO struct {
 }
 
 type messageDTO struct {
-	ID             string `json:"id"`
-	ConversationID string `json:"conversation_id"`
-	Role           string `json:"role"`
-	Content        string `json:"content"`
-	Status         string `json:"status"`
-	CreatedAt      string `json:"created_at"`
+	ID             string               `json:"id"`
+	ConversationID string               `json:"conversation_id"`
+	Role           string               `json:"role"`
+	Content        string               `json:"content"`
+	Status         string               `json:"status"`
+	CreatedAt      string               `json:"created_at"`
+	ExecutionCards []chat.ExecutionCard `json:"executionCards"`
 }
 
 type messagePair struct {
@@ -182,6 +184,11 @@ func (a *App) patchConversation(w http.ResponseWriter, r *http.Request) {
 func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	id := r.PathValue("id")
+	lease, ok := a.beginConversationLease(w, r, id)
+	if !ok {
+		return
+	}
+	defer lease.Release()
 	exists, err := a.conversationExists(r.Context(), id, user.UserID)
 	if err != nil {
 		httpx.Error(w, 500, "服务器错误")
@@ -196,6 +203,10 @@ func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if streaming {
 		httpx.Error(w, 409, "会话正在生成回复，请先停止生成后再删除")
+		return
+	}
+	if err := a.cleanupConversationWorkspace(r.Context(), id, user.UserID); err != nil {
+		httpx.Error(w, 500, "工作区清理失败，请重试")
 		return
 	}
 	files, err := a.deleteConversationData(r.Context(), id, user.UserID)
@@ -216,7 +227,7 @@ func (a *App) deleteConversationRoute(w http.ResponseWriter, r *http.Request) {
 
 const messagePageSize = 6
 
-const messageListSQL = `SELECT id,conversation_id,role,content,status,created_at FROM messages`
+const messageListSQL = `SELECT id,conversation_id,role,content,status,created_at,execution_cards FROM messages`
 
 type messagePage struct {
 	Messages []messageDTO `json:"messages"`
@@ -361,7 +372,7 @@ func (a *App) aroundMessagePage(ctx context.Context, conversationID, userID stri
 func (a *App) findConversationMessage(ctx context.Context, conversationID, userID, messageID string) (*messageDTO, error) {
 	var item messageDTO
 	err := a.Pool.QueryRow(ctx, messageListSQL+` WHERE id=$1 AND conversation_id=$2 AND user_id=$3`, messageID, conversationID, userID).
-		Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt)
+		Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt, &item.ExecutionCards)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -380,7 +391,7 @@ func (a *App) queryMessageList(ctx context.Context, query string, args ...any) (
 	list := []messageDTO{}
 	for rows.Next() {
 		var item messageDTO
-		if err := rows.Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.ConversationID, &item.Role, &item.Content, &item.Status, &item.CreatedAt, &item.ExecutionCards); err != nil {
 			return nil, err
 		}
 		list = append(list, item)
@@ -453,6 +464,11 @@ func fitAround(before, after []messageDTO, anchor messageDTO, limit int) ([]mess
 func (a *App) deleteMessagePairRoute(w http.ResponseWriter, r *http.Request) {
 	user := authFrom(r)
 	conversationID := r.PathValue("id")
+	lease, ok := a.beginConversationLease(w, r, conversationID)
+	if !ok {
+		return
+	}
+	defer lease.Release()
 	exists, err := a.conversationExists(r.Context(), conversationID, user.UserID)
 	if err != nil {
 		httpx.Error(w, 500, "服务器错误")
@@ -537,9 +553,6 @@ type httpStatusError struct {
 func (e *httpStatusError) Error() string { return e.msg }
 
 func (a *App) createConversation(ctx context.Context, id, userID, title string) (*conversationDTO, error) {
-	if err := paths.EnsureConversationWorkspace(id); err != nil {
-		return nil, err
-	}
 	now := idgen.NowISO()
 	_, err := a.Pool.Exec(ctx, `INSERT INTO conversations (id,user_id,title,created_at,updated_at) VALUES ($1,$2,$3,$4,$5)`, id, userID, title, now, now)
 	if err != nil {
@@ -771,8 +784,8 @@ func dropContextCache(ctx context.Context, conversationID string) {
 
 func (a *App) getMessagePair(ctx context.Context, conversationID, userID, userMessageID string) (*messagePair, error) {
 	var user messageDTO
-	err := a.Pool.QueryRow(ctx, `SELECT id,conversation_id,role,content,status,created_at FROM messages WHERE id=$1 AND conversation_id=$2 AND user_id=$3 AND role='user'`, userMessageID, conversationID, userID).
-		Scan(&user.ID, &user.ConversationID, &user.Role, &user.Content, &user.Status, &user.CreatedAt)
+	err := a.Pool.QueryRow(ctx, `SELECT id,conversation_id,role,content,status,created_at,execution_cards FROM messages WHERE id=$1 AND conversation_id=$2 AND user_id=$3 AND role='user'`, userMessageID, conversationID, userID).
+		Scan(&user.ID, &user.ConversationID, &user.Role, &user.Content, &user.Status, &user.CreatedAt, &user.ExecutionCards)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -780,14 +793,14 @@ func (a *App) getMessagePair(ctx context.Context, conversationID, userID, userMe
 		return nil, err
 	}
 	var assistant messageDTO
-	err = a.Pool.QueryRow(ctx, `SELECT id,conversation_id,role,content,status,created_at FROM messages candidate
+	err = a.Pool.QueryRow(ctx, `SELECT id,conversation_id,role,content,status,created_at,execution_cards FROM messages candidate
 		WHERE candidate.conversation_id=$1 AND candidate.user_id=$2 AND candidate.role='assistant' AND candidate.created_at>$3
 		AND NOT EXISTS (
 			SELECT 1 FROM messages boundary WHERE boundary.conversation_id=candidate.conversation_id AND boundary.user_id=candidate.user_id
 			AND boundary.role='user' AND boundary.created_at>$3 AND boundary.created_at<candidate.created_at
 		)
 		ORDER BY candidate.created_at ASC, candidate.id ASC LIMIT 1`, conversationID, userID, user.CreatedAt).
-		Scan(&assistant.ID, &assistant.ConversationID, &assistant.Role, &assistant.Content, &assistant.Status, &assistant.CreatedAt)
+		Scan(&assistant.ID, &assistant.ConversationID, &assistant.Role, &assistant.Content, &assistant.Status, &assistant.CreatedAt, &assistant.ExecutionCards)
 	var assistantPtr *messageDTO
 	if err == nil {
 		assistantPtr = &assistant
@@ -835,6 +848,9 @@ func (a *App) deleteMessagePairData(ctx context.Context, conversationID, userID 
 		return false, nil, nil, err
 	}
 	if remaining == 0 {
+		if err = a.cleanupConversationWorkspace(ctx, conversationID, userID); err != nil {
+			return false, nil, nil, err
+		}
 		rows, err := tx.Query(ctx, `SELECT id,file_path FROM attachments WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID)
 		if err != nil {
 			return false, nil, nil, err
@@ -876,6 +892,13 @@ func (a *App) deleteMessagePairData(ctx context.Context, conversationID, userID 
 		next, _ = a.getMessagePair(ctx, conversationID, userID, nextID)
 	}
 	return false, files, next, nil
+}
+
+func (a *App) cleanupConversationWorkspace(ctx context.Context, conversationID, userID string) error {
+	if err := sandbox.DeleteSession(ctx, conversationID); err != nil {
+		return err
+	}
+	return storage.DeleteWorkspace(ctx, userID, conversationID)
 }
 
 func attachmentsForRemoval(ctx context.Context, tx pgx.Tx, conversationID, userID string, messageIDs, refs []string, protect string) ([]attachmentFile, error) {

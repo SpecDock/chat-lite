@@ -1,3 +1,6 @@
+import type { ExecutionCardDTO } from './types';
+
+// Legacy body tags are unverified text, never server execution metadata.
 export type ExecutionBlock = {
   language: string;
   code: string;
@@ -37,6 +40,26 @@ function decodeBase64Utf8(value: string): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Only use at independent SSE / messages metadata boundaries, not on model text.
+export function isExecutionCard(value: unknown): value is ExecutionCardDTO {
+  if (!isRecord(value)) return false;
+  return typeof value.executionId === 'string' && Boolean(value.executionId.trim())
+    && typeof value.status === 'string' && Boolean(value.status.trim())
+    && value.language === 'bash'
+    && (value.exitCode === null || (typeof value.exitCode === 'number' && Number.isInteger(value.exitCode)))
+    && typeof value.durationMs === 'number' && Number.isFinite(value.durationMs) && value.durationMs >= 0
+    && typeof value.truncated === 'boolean'
+    && typeof value.showCode === 'boolean'
+    && typeof value.showStdout === 'boolean'
+    && typeof value.showStderr === 'boolean'
+    && (value.code === undefined || typeof value.code === 'string')
+    && (value.output === undefined || typeof value.output === 'string')
+    && (value.infrastructureError === undefined || typeof value.infrastructureError === 'string')
+    && (value.oomKilled === undefined || typeof value.oomKilled === 'boolean')
+    && (value.sourceSnapshots === undefined || (Array.isArray(value.sourceSnapshots)
+      && value.sourceSnapshots.every(source => isRecord(source) && typeof source.path === 'string' && typeof source.content === 'string')));
 }
 
 function isExecutionBlock(value: unknown): value is ExecutionBlock {

@@ -4,7 +4,23 @@ export type MessageStatus = 'streaming' | 'completed' | 'interrupted' | 'error';
 export interface UserDTO { id: string; email: string; created_at?: string; avatar_url?: string | null }
 export interface ConversationDTO { id: string; title: string; pinned_at: string | null; created_at: string; updated_at: string }
 export interface AttachmentDTO { id: string; original_name: string; public_path: string; mime_type: string; size: number; created_at: string }
-export interface MessageDTO { id: string; conversation_id: string; role: Role; content: string; status: MessageStatus; created_at: string; attachments?: AttachmentDTO[] }
+export interface ExecutionCardDTO {
+  executionId: string;
+  status: string;
+  language: 'bash';
+  code?: string;
+  output?: string;
+  exitCode: number | null;
+  durationMs: number;
+  truncated: boolean;
+  infrastructureError?: string;
+  oomKilled?: boolean;
+  showCode: boolean;
+  showStdout: boolean;
+  showStderr: boolean;
+  sourceSnapshots?: { path: string; content: string }[];
+}
+export interface MessageDTO { id: string; conversation_id: string; role: Role; content: string; status: MessageStatus; created_at: string; attachments?: AttachmentDTO[]; executionCards?: ExecutionCardDTO[] }
 export type WorkspaceBucket = 'input' | 'output';
 export interface WorkspaceFileDTO {
   name: string;

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -58,6 +59,9 @@ func (a *App) requirePool(w http.ResponseWriter) (*pgxpool.Pool, bool) {
 
 func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/conversations/") && !validateConversationRoute(w, r, r.PathValue("id"), false) {
+			return
+		}
 		if _, ok := a.requirePool(w); !ok {
 			return
 		}

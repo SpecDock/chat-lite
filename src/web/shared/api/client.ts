@@ -1,4 +1,4 @@
-import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO, WorkspaceFilesDTO } from '../types';
+import type { AttachmentDTO, ConversationDTO, ExecutionCardDTO, MessageDTO, SearchMessagesResponseDTO, UsageDTO, UserDTO, WorkspaceFilesDTO } from '../types';
 
 async function parse<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}));
@@ -32,6 +32,11 @@ export function buildSearchMessagesUrl(q: string, offset: number) {
   return `/api/search/messages?${params.toString()}`;
 }
 
+function requireConversationId(id: string | undefined): string {
+  if (!id || !/^conv_[A-Za-z0-9_-]{24}$/.test(id)) throw new Error('请先创建会话');
+  return id;
+}
+
 export const api = {
   me: () => fetch('/api/auth/me', { credentials: 'include' }).then(r => parse<{ user: UserDTO }>(r)),
   sendCode: (email: string, inviteCode: string) => fetch('/api/auth/send-code', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, inviteCode }) }).then(r => parse<{ ok: boolean }>(r)),
@@ -61,7 +66,7 @@ export const api = {
   },
   workspace: (id: string) => fetch(`/api/conversations/${id}/workspace`, { credentials: 'include' }).then(r => parse<{ workspace: WorkspaceFilesDTO }>(r)),
   searchMessages: (q: string, offset: number, signal?: AbortSignal) => fetch(buildSearchMessagesUrl(q, offset), { credentials: 'include', signal }).then(r => parse<SearchMessagesResponseDTO>(r)),
-  upload: (file: File, conversationId?: string) => { const fd = new FormData(); fd.append('file', file); if (conversationId) fd.append('conversationId', conversationId); return fetch('/api/upload', { method: 'POST', credentials: 'include', body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
+  upload: (file: File, conversationId?: string) => { const id = requireConversationId(conversationId); const fd = new FormData(); fd.append('file', file); fd.append('conversationId', id); return fetch('/api/upload', { method: 'POST', credentials: 'include', headers: { 'X-Conversation-ID': id }, body: fd }).then(r => parse<{ attachment: AttachmentDTO }>(r)); },
   usage: () => fetch('/api/usage', { credentials: 'include' }).then(r => parse<UsageDTO>(r)),
   cloudFiles: () => fetch('/api/cloud-files', { credentials: 'include' }).then(r => parse<{ used: number; limit: number; files: { id: string; name: string; mimeType: string; size: number; createdAt: string; kind: string; url: string; downloadUrl: string; preview: boolean }[] }>(r)),
   listStudioImages: () => fetch('/api/studio/images', { credentials: 'include' }).then(parseStudio),
@@ -78,15 +83,12 @@ export const api = {
   deleteStudioImage: (id: string) => fetch(`/api/studio/images/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' }).then(parseStudio)
 };
 
-export type ChatStreamData = {
+export type ChatStreamData = Partial<ExecutionCardDTO> & {
   conversationId?: string;
   userMessageId?: string;
   messageId?: string;
   mode?: 'replace' | 'append';
   text?: string;
-  language?: string;
-  code?: string;
-  output?: string;
   error?: string;
   ok?: boolean;
 };
@@ -100,8 +102,9 @@ export function reasoningEffort() {
 }
 
 export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], onEvent: (event: string, data: ChatStreamData) => void, signal?: AbortSignal, editUserMessageId?: string) {
+  conversationId = requireConversationId(conversationId);
   const body = { conversationId, content: message, attachmentIds, reasoningEffort: reasoningEffort(), ...(editUserMessageId ? { editUserMessageId } : {}) };
-  const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
+  const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json', 'X-Conversation-ID': conversationId }, body: JSON.stringify(body), signal });
   if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error || '发送失败');
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

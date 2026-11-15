@@ -12,6 +12,7 @@ export function splitThinkBlocks(content: string): ThinkBlocks {
   const executionTag = /<chat-lite-execution v="1">[\s\S]*?<\/chat-lite-execution>/g;
   let sawExecutionBlock = false;
   const executions: ExecutionBlock[] = [];
+  // Body tags remain readable for old history, but can never verify execution.
   const withoutExecution = String(content || '').replace(executionTag, tag => {
     sawExecutionBlock = true;
     const decoded = decodeExecutionBlock(tag);

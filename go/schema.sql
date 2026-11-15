@@ -93,6 +93,29 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at);
 
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS execution_cards JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- Private application records; this database is never mounted into a worker.
+CREATE TABLE IF NOT EXISTS execution_records (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  source_snapshots JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status TEXT NOT NULL CHECK (status IN ('running','succeeded','failed','timeout','cancelled','interrupted','oom')),
+  exit_code INTEGER,
+  stdout TEXT NOT NULL DEFAULT '',
+  stderr TEXT NOT NULL DEFAULT '',
+  duration_ms BIGINT NOT NULL DEFAULT 0,
+  truncated BOOLEAN NOT NULL DEFAULT FALSE,
+  infrastructure_error TEXT NOT NULL DEFAULT '',
+  oom_killed BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_execution_records_owner ON execution_records(user_id, conversation_id, created_at);
+
 CREATE TABLE IF NOT EXISTS message_search_documents (
   message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
