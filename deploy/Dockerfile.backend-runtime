@@ -1,0 +1,24 @@
+# Explicit environment build only; normal backend rebuilds COPY Go binaries into this image.
+# Publish a NEW version tag (or use its digest) when upgrading these dependencies.
+# Bootstrap CA using signed HTTP APT; slim has no system CA yet. pip uses HTTPS after installation.
+ARG DEBIAN_IMAGE=docker.m.daocloud.io/library/debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+
+RUN set -eu; \
+    cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.official; \
+    sed -i 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g; s|https://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g; s|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|https://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list.d/debian.sources; \
+    apt_install() { \
+        apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any update \
+        && apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends ca-certificates wget poppler-utils python3 python3-pip; \
+    }; \
+    if ! apt_install; then \
+        echo 'Domestic APT mirror failed; retrying original official sources.' >&2; \
+        cp /tmp/debian.sources.official /etc/apt/sources.list.d/debian.sources; \
+        rm -rf /var/lib/apt/lists/*; \
+        apt_install; \
+    fi; \
+    cp /tmp/debian.sources.official /etc/apt/sources.list.d/debian.sources; \
+    rm /tmp/debian.sources.official; \
+    (python3 -m pip install --no-cache-dir --break-system-packages --timeout 30 --retries 2 -i https://mirrors.aliyun.com/pypi/simple pdfplumber==0.11.8 \
+        || python3 -m pip install --no-cache-dir --break-system-packages --timeout 30 --retries 2 -i https://pypi.org/simple pdfplumber==0.11.8); \
+    rm -rf /var/lib/apt/lists/*

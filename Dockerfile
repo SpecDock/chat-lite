@@ -4,7 +4,7 @@
 
 ARG NODE_IMAGE=docker.m.daocloud.io/library/node:24.18.0-bookworm-slim
 ARG GO_IMAGE=docker.m.daocloud.io/library/golang:1.26-bookworm
-ARG DEBIAN_IMAGE=docker.m.daocloud.io/library/debian:bookworm-slim
+ARG BACKEND_RUNTIME_IMAGE=localhost/chat-lite/backend-runtime:2026-11-17-v1
 
 ########## web ##########
 FROM ${NODE_IMAGE} AS web
@@ -46,15 +46,9 @@ RUN go build -p 1 -trimpath -ldflags="-s -w" -o /out/chat-lite ./cmd/server \
  && go build -p 1 -trimpath -ldflags="-s -w" -o /out/sandbox-broker ./cmd/sandbox-broker
 
 ########## runner ##########
-FROM ${DEBIAN_IMAGE} AS runner
+FROM ${BACKEND_RUNTIME_IMAGE} AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; fi \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates wget poppler-utils python3 python3-pip \
-    && (python3 -m pip install --no-cache-dir --break-system-packages -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com pdfplumber \
-        || python3 -m pip install --no-cache-dir --break-system-packages pdfplumber) \
-    && rm -rf /var/lib/apt/lists/*
 COPY --from=compile /out/chat-lite /app/chat-lite
 COPY --from=compile /out/sandbox-broker /app/sandbox-broker
 COPY go/schema.sql /app/schema.sql
