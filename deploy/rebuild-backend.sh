@@ -57,7 +57,7 @@ build_sandbox() {
   local prefix="$1"
   echo "Building sandbox image $SANDBOX_SERVICE with $prefix"
   docker compose -f "$COMPOSE_FILE" --profile image build "${cache[@]}" \
-    --build-arg "PYTHON_IMAGE=${prefix}/python:3.12-slim" \
+    --build-arg "PYTHON_IMAGE=${prefix}/python:3.12-slim-bookworm" \
     "$SANDBOX_SERVICE" || return 1
 }
 

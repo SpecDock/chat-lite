@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -104,17 +105,27 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, 200, map[string]any{"attachment": att})
 		return
 	}
-	httpx.Error(w, 400, "请上传图片、CSV/XLSX 或 PDF 文件")
+	if file.text != nil {
+		att, err := a.saveTable(r, user.UserID, conversationID, *file.text)
+		if err != nil {
+			httpx.Error(w, statusOfUpload(err), err.Error())
+			return
+		}
+		httpx.WriteJSON(w, 200, map[string]any{"attachment": att})
+		return
+	}
+	httpx.Error(w, 400, "请上传图片、CSV/XLSX、PDF 或支持的文本/源码文件")
 }
 
 type parsedUpload struct {
 	image *uploads.FileBytes
 	table *tableUpload
 	pdf   *tableUpload
+	text  *tableUpload
 }
 
 func (file parsedUpload) cleanup() {
-	for _, part := range []*tableUpload{file.pdf, file.table} {
+	for _, part := range []*tableUpload{file.pdf, file.table, file.text} {
 		if part != nil && part.temp != "" {
 			_ = os.Remove(part.temp)
 		}
@@ -164,15 +175,28 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 			_, _ = io.Copy(io.Discard, part)
 			continue
 		}
-		if parsed.image != nil || parsed.pdf != nil || parsed.table != nil {
+		if parsed.image != nil || parsed.pdf != nil || parsed.table != nil || parsed.text != nil {
 			return parsedUpload{}, fields, &uploads.StatusError{400, "每次只能上传一个文件"}
 		}
 		name := safeName(part.FileName())
 		mimeType := strings.ToLower(part.Header.Get("Content-Type"))
-		if authsec.AllowedImage(mimeType) {
-			buf, _ := io.ReadAll(io.LimitReader(part, authsec.MaxUploadBytes()+1))
+		if mimeType != "" {
+			parsedMIME, _, err := mime.ParseMediaType(mimeType)
+			if err != nil {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "文件 MIME 类型无效"}
+			}
+			mimeType = parsedMIME
+		}
+		if authsec.AllowedImage(mimeType) && !authsec.IsTextUploadName(name) {
+			buf, err := io.ReadAll(io.LimitReader(part, authsec.MaxUploadBytes()+1))
+			if err != nil {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "上传失败"}
+			}
 			if int64(len(buf)) > authsec.MaxUploadBytes() {
 				return parsedUpload{}, fields, &uploads.StatusError{400, "图片不能超过 " + authsec.MaxUploadLabel()}
+			}
+			if http.DetectContentType(buf) != mimeType {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "图片内容与 MIME 类型不符"}
 			}
 			parsed.image = &uploads.FileBytes{Buffer: buf, Filename: name, MimeType: mimeType}
 			continue
@@ -188,9 +212,27 @@ func readUpload(r *http.Request, userID string) (parsedUpload, map[string]string
 			parsed.pdf = &tableUpload{temp: temp, name: name, mime: "application/pdf", size: n}
 			continue
 		}
+		if textMIME, ok := authsec.TextUploadMIME(name, mimeType); ok {
+			buf, err := io.ReadAll(io.LimitReader(part, authsec.TextUploadMaxBytes+1))
+			if err != nil {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "上传失败"}
+			}
+			if int64(len(buf)) > authsec.TextUploadMaxBytes {
+				return parsedUpload{}, fields, &uploads.StatusError{413, "文本/源码文件不能超过 5MiB"}
+			}
+			if !authsec.ValidTextUpload(buf) {
+				return parsedUpload{}, fields, &uploads.StatusError{400, "文本/源码文件必须为有效 UTF-8 且不能包含 NUL"}
+			}
+			temp, n, err := writeLimitedTemp(userID, bytes.NewReader(buf), authsec.TextUploadMaxBytes)
+			if err != nil {
+				return parsedUpload{}, fields, err
+			}
+			parsed.text = &tableUpload{temp: temp, name: name, mime: textMIME, size: n}
+			continue
+		}
 		if !isTableName(name, mimeType) {
 			_, _ = io.Copy(io.Discard, part)
-			return parsedUpload{}, fields, &uploads.StatusError{400, "仅支持 jpeg/png/webp 图片、CSV/XLSX 或 PDF 文件"}
+			return parsedUpload{}, fields, &uploads.StatusError{400, "仅支持 jpeg/png/webp、CSV/XLSX、PDF 及白名单文本/源码文件，且扩展名须匹配 MIME"}
 		}
 		dir := filepath.Join(paths.UploadDir(), userID)
 		_ = os.MkdirAll(dir, 0o755)
@@ -299,21 +341,27 @@ func (a *App) saveTable(r *http.Request, userID, conversationID string, file tab
 	if conversationID == "" || !exists {
 		return uploads.Attachment{}, &uploads.StatusError{404, "会话不存在"}
 	}
-	if !isTableName(file.name, file.mime) {
-		return uploads.Attachment{}, &uploads.StatusError{400, "仅支持 CSV 或 XLSX 文件"}
+	textMIME, isText := authsec.TextUploadMIME(file.name, file.mime)
+	if !isTableName(file.name, file.mime) && !isText {
+		return uploads.Attachment{}, &uploads.StatusError{400, "不支持的附件类型"}
+	}
+	limit := authsec.TableUploadMaxBytes
+	if isText {
+		limit = authsec.TextUploadMaxBytes
+		file.mime = textMIME
 	}
 	info, err := os.Stat(file.temp)
-	if err != nil || info.Size() != file.size || file.size < 1 || file.size > authsec.TableUploadMaxBytes {
+	if err != nil || info.Size() != file.size || file.size > limit || (!isText && file.size < 1) {
 		return uploads.Attachment{}, &uploads.StatusError{400, "上传文件校验失败"}
 	}
 	id := idgen.NewID("att")
-	ext := ".csv"
-	if strings.HasSuffix(strings.ToLower(file.name), ".xlsx") {
-		ext = ".xlsx"
-	}
+	ext := strings.ToLower(filepath.Ext(file.name))
 	data, err := os.ReadFile(file.temp)
 	if err != nil {
 		return uploads.Attachment{}, err
+	}
+	if isText && !authsec.ValidTextUpload(data) {
+		return uploads.Attachment{}, &uploads.StatusError{400, "文本/源码文件必须为有效 UTF-8 且不能包含 NUL"}
 	}
 	dest := storage.ObjectPath(userID, conversationID, "input", id+ext)
 	if err = storagequota.Ensure(r.Context(), a.Pool, userID, file.size); err != nil {
@@ -357,7 +405,10 @@ func (a *App) file(w http.ResponseWriter, r *http.Request) {
 		label = *name
 	}
 	disposition := "inline"
-	if r.URL.Query().Get("download") == "1" {
+	if authsec.IsTextUploadName(label) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		disposition = "attachment; filename*=UTF-8''" + urlQuery(label)
+	} else if r.URL.Query().Get("download") == "1" {
 		disposition = "attachment; filename*=UTF-8''" + urlQuery(label)
 	}
 	streamStored(w, r, path, mimeType, disposition)
@@ -561,7 +612,12 @@ func (a *App) workspaceFile(w http.ResponseWriter, r *http.Request) {
 		fileName = *original
 	}
 	disposition := "inline"
-	if r.URL.Query().Get("download") == "1" {
+	if authsec.IsTextUploadName(fileName) {
+		w.Header().Set("Content-Type", mimeType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		disposition = "attachment; filename*=UTF-8''" + urlQuery(fileName)
+		w.Header().Set("Content-Disposition", disposition)
+	} else if r.URL.Query().Get("download") == "1" {
 		disposition = "attachment"
 	}
 	http.ServeFile(w, r, path)

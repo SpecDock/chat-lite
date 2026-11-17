@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/sandbox"
 	"chatlite/internal/infrastructure/storage"
 	"chatlite/internal/platform/paths"
@@ -67,6 +68,15 @@ func (s *scratch) close() {
 
 func (s *scratch) mountCurrent(ctx context.Context, pool *pgxpool.Pool, in Input) error {
 	for _, id := range in.AttachmentIDs {
+		var name, mimeType string
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(original_name,''), mime_type FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, id, in.UserID, in.ConversationID).Scan(&name, &mimeType); err != nil {
+			return errScratch("附件不存在或不属于当前会话")
+		}
+		// PDFs keep their existing server-side parsing path; download_file still
+		// rejects them, but automatic staging must not abort a mixed-file turn.
+		if isPDFName(name, mimeType) {
+			continue
+		}
 		if _, err := s.download(ctx, pool, in, id); err != nil {
 			return err
 		}
@@ -76,12 +86,12 @@ func (s *scratch) mountCurrent(ctx context.Context, pool *pgxpool.Pool, in Input
 
 func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, attachmentID string) (string, error) {
 	attachmentID = strings.TrimSpace(attachmentID)
-	var name, filePath string
-	err := pool.QueryRow(ctx, `SELECT original_name, file_path FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, attachmentID, in.UserID, in.ConversationID).Scan(&name, &filePath)
+	var name, filePath, mimeType string
+	err := pool.QueryRow(ctx, `SELECT original_name, file_path, mime_type FROM attachments WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, attachmentID, in.UserID, in.ConversationID).Scan(&name, &filePath, &mimeType)
 	if err != nil {
 		return "", errScratch("附件不存在或不属于当前会话")
 	}
-	if strings.HasSuffix(strings.ToLower(name), ".pdf") {
+	if isPDFName(name, mimeType) {
 		return "", errScratch("PDF 由服务端解析，不能放进工作区")
 	}
 	safe := safeTableName(name)
@@ -91,6 +101,11 @@ func (s *scratch) download(ctx context.Context, pool *pgxpool.Pool, in Input, at
 	body, err := storage.Read(ctx, filePath)
 	if err != nil {
 		return "", err
+	}
+	if authsec.IsTextUploadName(name) {
+		if _, ok := authsec.TextUploadMIME(name, mimeType); !ok || !authsec.ValidTextUpload(body) {
+			return "", errScratch("文本/源码附件校验失败")
+		}
 	}
 	if err = s.writeInputFile(safe, body); err != nil {
 		return "", err

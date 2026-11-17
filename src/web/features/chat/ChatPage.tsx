@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import type { AttachmentDTO, ConversationDTO, MessageDTO, SearchMessageResultDTO, UserDTO, WorkspaceFilesDTO } from '../../shared/types';
-import { api, streamChat, type ChatStreamData } from '../../shared/api/client';
+import { api, reasoningEffort, streamChat, type ChatStreamData } from '../../shared/api/client';
 import ConversationList from './ConversationList';
 import ConversationSearch from './ConversationSearch';
 import DeleteConversationDialog from './DeleteConversationDialog';
@@ -30,6 +30,7 @@ import WorkspaceDialog from './WorkspaceDialog';
 import ImageLightbox from '../messages/ImageLightbox';
 import ImageStudioPage from '../studio/ImageStudioPage';
 import { isExecutionCard } from '../../shared/execution-block';
+import { getUploadValidationError } from '../../shared/upload-types';
 
 const EMPTY_CONVERSATION_KEY = '__none__';
 const TEMPORARY_CONVERSATION_PREFIX = '__temporary__:';
@@ -517,6 +518,7 @@ type StreamOptions = {
   conversationId?: string;
   text: string;
   attachmentIds: string[];
+  reasoningEffort: ReturnType<typeof reasoningEffort>;
   editUserMessageId?: string;
   tempAssistantId: string;
   task: ActiveTask;
@@ -1622,7 +1624,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     let terminalEvent = false;
 
     try {
-      await streamChat(options.conversationId, options.text, options.attachmentIds, (event, data) => {
+      await streamChat(options.conversationId, options.text, options.attachmentIds, options.reasoningEffort, (event, data) => {
       if (options.task.cancelRequested) return;
       if (event !== 'delta') flushTaskDelta(options.task);
       if (event === 'meta') {
@@ -1737,6 +1739,8 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     let conversationId = conversationIdForKey(targetKey);
     const targetMessages = messagesByConversation[targetKey] || [];
     if (tasksRef.current.has(targetKey) || activities[targetKey]?.status === 'streaming' || targetMessages.some(message => message.status === 'streaming')) return;
+    // Snapshot before asynchronous conversation creation; selector changes apply to the next send.
+    const effort = reasoningEffort();
 
     if (!conversationId) {
       const temporaryKey = `${TEMPORARY_CONVERSATION_PREFIX}${crypto.randomUUID()}`;
@@ -1790,6 +1794,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         conversationId,
         text: userText,
         attachmentIds: attachments.map(attachment => attachment.id),
+        reasoningEffort: effort,
         tempAssistantId: tempAssistant.id,
         task,
         getTargetKey: () => targetKey,
@@ -1847,6 +1852,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
     const parts = splitUserMessage(message);
     const editedText = text.trim();
     if (!editedText && parts.images.length === 0) return;
+    const effort = reasoningEffort();
 
     const viewingHistory = messageWindowsRef.current[targetKey]?.hasNewer === true;
     const latestUserIndex = baseMessages.reduce((latest, candidate, index) => candidate.role === 'user' ? index : latest, -1);
@@ -1892,6 +1898,7 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
         conversationId: targetKey,
         text: editedText,
         attachmentIds: [],
+        reasoningEffort: effort,
         editUserMessageId: message.id,
         tempAssistantId: tempAssistant.id,
         task,
@@ -2169,13 +2176,18 @@ export default function ChatPage({ user, initialScroll, onLogout }: { user: User
             onPreviewImage={(src, alt) => setImagePreview({ src, alt })}
             onImage={async file => {
               const uploadKey = currentRef.current || EMPTY_CONVERSATION_KEY;
+              const validationError = getUploadValidationError(file);
+              if (validationError) {
+                setConversationError(resolveKey(uploadKey), validationError);
+                return;
+              }
               try {
                 const conversationId = await ensureUploadConversation(uploadKey);
                 const result = await api.upload(file, conversationId);
                 const targetKey = resolveKey(uploadKey);
                 setPendingByConversation(cache => ({ ...cache, [targetKey]: [...(cache[targetKey] || []), result.attachment] }));
               } catch (cause) {
-                setConversationError(resolveKey(uploadKey), cause instanceof Error ? cause.message : '上传失败');
+                setConversationError(resolveKey(uploadKey), cause instanceof Error ? `上传失败：${cause.message}` : '上传失败，请重试');
               }
             }}
           />

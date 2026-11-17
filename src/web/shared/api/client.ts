@@ -101,9 +101,9 @@ export function reasoningEffort() {
   return 'high';
 }
 
-export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], onEvent: (event: string, data: ChatStreamData) => void, signal?: AbortSignal, editUserMessageId?: string) {
+export async function streamChat(conversationId: string | undefined, message: string, attachmentIds: string[], effort: ReturnType<typeof reasoningEffort>, onEvent: (event: string, data: ChatStreamData) => void, signal?: AbortSignal, editUserMessageId?: string) {
   conversationId = requireConversationId(conversationId);
-  const body = { conversationId, content: message, attachmentIds, reasoningEffort: reasoningEffort(), ...(editUserMessageId ? { editUserMessageId } : {}) };
+  const body = { conversationId, content: message, attachmentIds, reasoningEffort: effort, ...(editUserMessageId ? { editUserMessageId } : {}) };
   const res = await fetch('/api/chat', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json', 'X-Conversation-ID': conversationId }, body: JSON.stringify(body), signal });
   if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).error || '发送失败');
   const reader = res.body.getReader();

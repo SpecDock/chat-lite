@@ -5,15 +5,11 @@ import { gsap } from 'gsap';
 import { Check, ChevronDown, FolderOpen, X } from 'lucide-react';
 import { FileTypeIcon } from '../messages/fileTypeIcon';
 import type { AttachmentDTO } from '../../shared/types';
+import { UPLOAD_DESCRIPTION } from '../../shared/upload-types';
 import ImageUploader from './ImageUploader';
 
 function reducedMotion() {
   return typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
-
-function isSupportedAttachment(file: File) {
-  const name = file.name.toLowerCase();
-  return file.type.startsWith('image/') || name.endsWith('.csv') || name.endsWith('.xlsx') || name.endsWith('.pdf');
 }
 
 const effortOptions = ['low', 'high', 'max'] as const;
@@ -227,7 +223,7 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
   }, [syncTextareaHeight]);
 
   const addFiles = (files: FileList | File[]) => {
-    Array.from(files).filter(isSupportedAttachment).forEach(file => void onImage(file));
+    Array.from(files).forEach(file => void onImage(file));
   };
   const submit = () => {
     if (sending) { onCancel?.(); return; }
@@ -238,7 +234,7 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
     className={dragging ? 'composer dragging' : 'composer'}
     onSubmit={e => { e.preventDefault(); submit(); }}
     onPaste={e => {
-      const files = Array.from(e.clipboardData.files).filter(isSupportedAttachment);
+      const files = Array.from(e.clipboardData.files);
       if (files.length) { e.preventDefault(); addFiles(files); }
     }}
     onDragOver={e => { e.preventDefault(); setDragging(true); }}
@@ -258,6 +254,6 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
       </button>;
     })}</div>}
     <div className="workspace-trigger-row"><button type="button" className="workspace-trigger" onClick={onWorkspace || (() => window.dispatchEvent(new Event('chat-lite-open-workspace')))}><FolderOpen size={16} aria-hidden="true" /><span>工作区</span></button></div>
-    <div className="input"><ImageUploader onFile={onImage} /><textarea ref={textareaRef} rows={1} placeholder="输入消息，或粘贴/拖入图片或表格" value={text} disabled={disabled && !sending} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><ReasoningEffortSelect /><button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button></div>
+    <div className="input"><ImageUploader onFile={onImage} /><textarea ref={textareaRef} rows={1} placeholder={`输入消息，或粘贴/拖入${UPLOAD_DESCRIPTION}`} value={text} disabled={disabled && !sending} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><ReasoningEffortSelect /><button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button></div>
   </form>;
 }

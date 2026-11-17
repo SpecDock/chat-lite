@@ -13,8 +13,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN (python -m pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com pandas openpyxl \
      || python -m pip install --no-cache-dir pandas openpyxl) \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends bash curl ca-certificates iptables iproute2 util-linux openjdk-17-jdk-headless git build-essential procps findutils \
+    && cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.official \
+    && python -c 'from pathlib import Path; p=Path("/etc/apt/sources.list.d/debian.sources"); s=p.read_text(); s=s.replace("http://deb.debian.org/debian-security", "https://mirrors.aliyun.com/debian-security").replace("https://deb.debian.org/debian-security", "https://mirrors.aliyun.com/debian-security").replace("http://deb.debian.org/debian", "https://mirrors.aliyun.com/debian").replace("https://deb.debian.org/debian", "https://mirrors.aliyun.com/debian"); p.write_text(s)' \
+    && ( (apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any update \
+          && apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends bash curl ca-certificates iptables iproute2 util-linux openjdk-17-jdk-headless git build-essential procps findutils) \
+         || (echo 'Domestic APT mirror failed; retrying with original official sources.' >&2 \
+             && cp /tmp/debian.sources.official /etc/apt/sources.list.d/debian.sources \
+             && rm -rf /var/lib/apt/lists/* \
+             && apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any update \
+             && apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends bash curl ca-certificates iptables iproute2 util-linux openjdk-17-jdk-headless git build-essential procps findutils) ) \
+    && cp /tmp/debian.sources.official /etc/apt/sources.list.d/debian.sources \
+    && rm /tmp/debian.sources.official \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin table-sandbox
 

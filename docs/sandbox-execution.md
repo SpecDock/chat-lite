@@ -10,6 +10,20 @@
 
 ## 工具契约
 
+### 失败、取消与上下文快照
+
+已接受的用户消息及本轮已解析的短 PDF 正文，在工作区准备和模型调用前保存；成功、失败、取消或部分输出中断退出时，统一保存最后一份合法的上下文检查点。每个已返回的工具结果都保存对应的已完成调用子组，不保存未执行调用、未配对工具消息或失败占位回答，也不自动重放命令。持久化使用独立、有界超时，不随请求取消而立即中断；存储读写失败会明确报错或记录，不能保证存储不可用时仍能落盘，也不会用空历史覆盖旧快照。
+
+快照内携带内部格式及最后接受的用户消息 ID，发送模型前移除。旧格式或与权威历史不一致的快照会保守重建，并补回可见历史消息关联的短 PDF 正文；因此升级后的首次重建不保留旧工具中间步骤，但不修改数据库里的原用户消息、回答及执行卡片。新格式身份一致时继续保留完整工具上下文。
+
+### 附件上传范围
+
+除原有 JPEG/PNG/WebP、CSV/XLSX 和 PDF 外，上传入口还允许 UTF-8 文本、数据与源码：`.txt`、`.md`、`.json`、`.tsv`、`.log`、`.yaml`、`.yml`、`.xml`、`.py`、`.go`、`.java`、`.js`、`.ts`、`.sql`、`.sh`、`.html`、`.css`。新增类别每个文件最多 5MiB，服务端验证编码并拒绝 NUL；前端选择、拖放和粘贴使用相同类型集合。原有图片、表格、PDF 限额保持不变。
+
+新增类别按普通附件进入会话 `input/`，可由模型调用 `read_file` 或沙箱脚本分析；上传源码不会自动执行，HTML 不作为页面预览。允许上传不等于自带相应解释器、编译器或第三方解析库。新增类别下载使用附件响应及 `nosniff`，不新增任意 HTML 渲染、自动 RAG 或富预览能力。压缩包、音视频及新增 Office 类型不在此范围。
+
+执行卡片支持整卡默认折叠，收起时保留执行状态；展开后仍可分别查看命令、源文件快照和输出。折叠不改变服务端执行记录或展示字段的授权范围。
+
 - `bash`：参数 `command`、`cwd`（默认 `/work`）、`timeout_seconds`（默认 60，最大 300）。模型不能指定容器、运行身份、挂载、资源限额或网络策略。
 - `source_paths` 可选，最多 5 个工作区源文件；执行前安全读取快照。默认只保存实际命令，不猜测任意 Bash 会执行的所有文件。
 - `bash` 返回 `execution_id`、真实状态、退出码、stdout、stderr、耗时和输出截断标记；默认不发送详细代码卡片。
@@ -29,9 +43,22 @@
 
 ## 资源边界与部署前置
 
-工作区使用宿主已配置的 XFS project quota，每个会话设置 512MiB 块硬上限和 32768 inode 硬上限。可信 broker 设置并复查配额；文件系统不支持、配额未启用或权限不足时拒绝执行，不降级为扫描目录。不得为此给模型运行的 worker 提供特权模式。
+工作区使用宿主已配置的 ext4 或 XFS project quota，每个会话设置 512MiB 块硬上限和 32768 inode 硬上限。可信 broker 设置并复查配额；文件系统不支持、配额未启用或权限不足时拒绝执行，不降级为扫描目录。不得为此给模型运行的 worker 提供特权模式。ext4 需要 `project`、`quota` 文件系统特性和已启用 enforcement 的项目配额；仅文件系统类型为 ext4 不代表满足要求。
 
-人工前置检查脚本是 `deploy/prepare-sandbox-storage.sh`，本次未执行。它要求 Linux 5.14+、已在 `/var/lib/chat-lite/table-sandbox` 专门挂载并启用 `prjquota` 的 XFS、`findmnt` 和 `xfsprogs`；不自动挂载、格式化或创建 loop。脚本会创建/规范化 `jobs`、`sessions` 目录的 root 权限，并输出 quota 状态；实际准入仍由 broker 检查内核 enforcement。project ID 的 1000000..1999999999 范围需专门保留给 broker。可信 broker 增加 `SYS_ADMIN` 以设置配额，worker 不具备此能力。
+人工前置检查脚本是 `deploy/prepare-sandbox-storage.sh`。它要求 Linux 5.14+、已在 `/var/lib/chat-lite/table-sandbox` 专门挂载并启用 `prjquota` 的 ext4 或 XFS；不自动挂载、格式化或创建 loop。脚本只检查存储前置条件及 `jobs`、`sessions` 目录的 root:root、755 权限，不自动修改权限；实际准入仍由 broker 检查内核 enforcement。project ID 的 1000000..1999999999 范围需专门保留给 broker。可信 broker 增加 `SYS_ADMIN` 以设置配额，worker 不具备此能力。
+
+ext4 根分区未启用上述特性时，不应直接在线修改系统盘。可在获得明确授权后建立专用 ext4 文件卷并离线迁移沙箱数据：新卷实际预留固定空间，启用项目配额；原目录保留为回退备份，不能只挂载新卷遮住旧文件后就视为迁移完成。迁移时必须停止所有使用旧目录的应用、broker 和 worker，并在挂载切换后重新创建应用和 broker 容器，避免旧 bind mount 继续引用原目录。单会话硬配额之外，整个卷也有总容量上限；4GiB 卷不能同时容纳任意多个占满 512MiB 的会话。配额不等于预留容量，卷空间不足时仍会写入失败。
+
+手动迁移脚本为 `deploy/migrate-sandbox-ext4.py`：默认只读 dry-run，停服后明确指定 `--apply` 才执行；目标镜像固定为 `/var/lib/chat-lite/table-sandbox.ext4.img`，只格式化本次独占新建的普通文件。已有镜像、已有 quota registry、不安全文件类型或超限旧会话均拒绝自动迁移。脚本保留原目录及 fstab 备份，不自动启动服务，也不允许覆盖已有镜像来重试。格式化使用 `mkfs.ext4 -O quota,project -E nodiscard,quotatype=prjquota`，不是 `tune2fs` 的 `-Q` 参数。
+
+### 2026-11-17 ext4 部署记录
+
+- 两台服务器均以独立 4GiB loop ext4 卷挂载沙箱目录，挂载选项含 `prjquota,nosuid,nodev`，fstab 已追加对应条目；没有格式化或启用根分区的配额特性。
+- 47 节点迁移 5 个会话，旧目录备份 `/var/lib/chat-lite/table-sandbox.backup-20261117T062146.589786Z`；182 节点迁移 2 个会话，备份 `/var/lib/chat-lite/table-sandbox.backup-20261117T062235.333628Z`。
+- 迁移读取内核配额状态确认 accounting/enforcement，回读各会话 512MiB/32768 inode 硬限额并验证继承；旧会话当时只有空目录，没有普通文件内容。
+- 本地 Linux amd64 broker 编译成功；两台基于各自旧后端镜像只替换 broker 二进制，保留 `chat-lite-backend:pre-ext4-20261117T061613Z` 旧镜像。后端和 broker 均 force-recreate，Compose 的健康等待成功；未更改 worker 镜像、前端、数据库服务或 Nginx 配置。
+- 第一台首次迁移在 mkfs 参数解析阶段失败，未触及旧目录；修正后重新创建卷成功，失败的未格式化临时文件经检查后已回收。
+- 未执行聊天 Hello World、写满磁盘或 inode 等运行测试；部署健康和配额读回不等于完整沙箱运行验收。回退涉及服务停用、fstab 与旧目录挂载恢复及容器重建，不能只切回不支持 ext4 的旧 broker 镜像。
 
 旧非空且未分配配额的会话目录会被拒绝，而不是自动归档、改属或删除。上线前必须备份并离线迁移旧工作区到已配额的新目录；不得直接清空目录或对已有设备运行 `mkfs`。原有服务正常启动不等于这些前置条件已经满足。
 

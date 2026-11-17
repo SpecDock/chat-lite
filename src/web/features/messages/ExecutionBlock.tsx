@@ -51,14 +51,21 @@ export default function ExecutionBlock({ blocks = [], card }: { blocks?: Executi
     const status = executionStatus(card);
     const hasInfrastructureError = Boolean(card.infrastructureError);
     const tone = hasInfrastructureError || card.oomKilled || (card.exitCode !== null && card.exitCode !== 0) ? 'error' : status.tone;
+    const statusLabel = card.status === 'succeeded' && tone === 'error' ? '执行异常' : status.label;
     const showOutput = card.showStdout || card.showStderr;
     return <article ref={rootRef} className={`execution-block execution-block--${tone}`} aria-label="沙箱执行记录">
-      <header className="execution-block__header">
+      <details className="execution-block__disclosure">
+      <summary className="execution-block__header">
         <span className="execution-block__title"><Terminal size={15} aria-hidden="true" />沙箱执行<span className="execution-block__language">bash</span></span>
-        <span className={`execution-block__status execution-block__status--${tone}`}>{status.label}</span>
-      </header>
+        <span className="execution-block__summary-status">
+          {card.truncated && <span className="execution-block__summary-notice">输出已截断</span>}
+          <span className={`execution-block__status execution-block__status--${tone}`}>{statusLabel}</span>
+          <ChevronDown size={14} className="execution-block__chevron" aria-hidden="true" />
+        </span>
+      </summary>
       <div className="execution-block__meta">
         <span className="execution-block__provenance">服务端记录</span>
+        {statusLabel !== status.label && <span>服务端状态：{status.label}</span>}
         <span>{durationLabel(card.durationMs)}</span>
         <span>退出码 {card.exitCode === null ? '—' : card.exitCode}</span>
         <span className="execution-block__id" title={card.executionId}>记录 {card.executionId}</span>
@@ -82,15 +89,20 @@ export default function ExecutionBlock({ blocks = [], card }: { blocks?: Executi
         </details>}
         {!card.showCode && !showOutput && <p className="execution-block__hidden">此记录仅展示执行状态，命令和输出未公开。</p>}
       </div>
+      </details>
     </article>;
   }
 
   const language = blocks.find(block => block.language)?.language || 'text';
   return <article ref={rootRef} className="execution-block execution-block--legacy" aria-label="未验证的历史执行内容">
-    <header className="execution-block__header">
-      <span className="execution-block__title"><Code2 size={15} aria-hidden="true" />历史执行内容</span>
-      <span className="execution-block__status">未验证</span>
-    </header>
+    <details className="execution-block__disclosure">
+    <summary className="execution-block__header">
+      <span className="execution-block__title"><Code2 size={15} aria-hidden="true" />历史执行内容<span className="execution-block__language">{language}</span></span>
+      <span className="execution-block__summary-status">
+        <span className="execution-block__status">未验证</span>
+        <ChevronDown size={14} className="execution-block__chevron" aria-hidden="true" />
+      </span>
+    </summary>
     <p className="execution-block__notice">来自消息正文，无法验证是否真实执行。</p>
     <details className="execution-section execution-block__legacy-details">
       <summary><span>展开历史内容<span className="execution-block__language">{language}</span></span><ChevronDown size={14} className="execution-section__chevron" aria-hidden="true" /></summary>
@@ -116,6 +128,7 @@ export default function ExecutionBlock({ blocks = [], card }: { blocks?: Executi
         </section>
       </section>)}
       </div>
+    </details>
     </details>
   </article>;
 }

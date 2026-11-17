@@ -718,7 +718,7 @@ func prepareSessionDir(id string) error {
 	}
 	// Fail closed before granting write access or admitting any process.
 	if err = prepareQuota(root, id); err != nil {
-		return fmt.Errorf("sandbox storage quota unavailable (requires dedicated XFS prjquota, Linux >=5.14 and broker SYS_ADMIN): %w", err)
+		return fmt.Errorf("sandbox storage quota unavailable (requires dedicated XFS/ext4 with enforced project quotas, Linux >=5.14 and broker SYS_ADMIN; ext4 needs project/quota features and prjquota): %w", err)
 	}
 	if err = os.Chown(root, 0, 0); err != nil {
 		return err

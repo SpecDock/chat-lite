@@ -19,6 +19,11 @@ func LoadSnapshot(ctx context.Context, pool *pgxpool.Pool, conversationID, userI
 }
 
 func LoadSnapshotSource(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) ([]any, int) {
+	messages, version, _ := LoadSnapshotSourceChecked(ctx, pool, conversationID, userID)
+	return messages, version
+}
+
+func LoadSnapshotSourceChecked(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) ([]any, int, error) {
 	var raw []byte
 	var source *int
 	err := pool.QueryRow(ctx, `SELECT context_json, source_version FROM conversation_context_snapshots WHERE conversation_id=$1 AND user_id=$2 AND status='current'`, conversationID, userID).Scan(&raw, &source)
@@ -26,14 +31,23 @@ func LoadSnapshotSource(ctx context.Context, pool *pgxpool.Pool, conversationID,
 	if source != nil && *source > 0 {
 		version = *source
 	}
-	if err != nil || len(raw) == 0 {
-		return nil, version
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, version, nil
+	}
+	if err != nil {
+		return nil, version, err
+	}
+	if len(raw) == 0 {
+		return nil, version, nil
 	}
 	var messages []any
-	if json.Unmarshal(raw, &messages) != nil || !snapshotMatchesPrompt(messages) {
-		return nil, version
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return nil, version, err
 	}
-	return messages, version
+	if !snapshotMatchesPrompt(messages) {
+		return nil, version, nil
+	}
+	return messages, version, nil
 }
 
 func DeleteCurrentSnapshots(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) {

@@ -20,6 +20,7 @@ import (
 	"chatlite/internal/application/rag"
 	"chatlite/internal/application/storagequota"
 	"chatlite/internal/domain/visibility"
+	"chatlite/internal/infrastructure/authsec"
 	"chatlite/internal/infrastructure/contextkafka"
 	"chatlite/internal/infrastructure/contextstore"
 	"chatlite/internal/infrastructure/llm"
@@ -192,7 +193,7 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if count != len(attachmentIDs) {
-				httpx.Error(w, 400, "包含无效图片、表格或 PDF 附件")
+				httpx.Error(w, 400, "包含无效或不属于当前会话的附件")
 				return
 			}
 		}
@@ -210,7 +211,20 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		assistantPersisted = true
 	}
-	prepared := chat.PrepareContext(ctx, a.Pool, user.UserID, conversationID, userMessageID, editMode == "")
+	prepareCtx, cancelPrepare := context.WithTimeout(context.Background(), 5*time.Second)
+	prepared, prepareErr := chat.PrepareContextChecked(prepareCtx, a.Pool, user.UserID, conversationID, userMessageID, editMode == "")
+	cancelPrepare()
+	if prepareErr != nil {
+		log.Printf("[conversation-context] conversation=%s accepted_user=%s prepare_failed_snapshot_not_updated err=%v", conversationID, userMessageID, prepareErr)
+		finishCtx, cancelFinish := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := a.finishMessage(finishCtx, assistantID, user.UserID, userFacing(prepareErr), "error"); err != nil {
+			log.Printf("[conversation-context] conversation=%s finish_failed err=%v", conversationID, err)
+		}
+		cancelFinish()
+		emitToUser(user.UserID, "messages_changed", map[string]any{"conversationId": conversationID, "reason": "assistant_error"})
+		httpx.Error(w, 500, userFacing(prepareErr))
+		return
+	}
 	history := prepared.History
 	summary := prepared.Summary
 	if editMode == "" {
@@ -299,15 +313,16 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 			compacted = wrote
 		}
 	}
-	prior, persist, loadErr := a.loadPrior(ctx, conversationID, user.UserID, assistantID)
+	prior, persist, loadErr := a.loadPrior(ctx, conversationID, user.UserID, userMessageID, assistantID)
 	if summarized && !compacted && loadErr == nil {
 		prior = nil
 	}
 	var err error
 	if loadErr != nil {
+		log.Printf("[conversation-context] conversation=%s accepted_user=%s load_failed_snapshot_not_updated err=%v", conversationID, userMessageID, loadErr)
 		err = loadErr
 	} else {
-		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), ReasoningEffort: reasoningEffort(body), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist, Lease: lease}, func(event chat.Event) {
+		err = chat.Run(runCtx, a.Pool, chat.Input{UserID: user.UserID, ConversationID: conversationID, UserMessageID: userMessageID, UserInput: userInput, Summary: visibility.StripThinkBlocks(summary), ReasoningEffort: reasoningEffort(body), AttachmentIDs: attachmentIDs, History: history, Prior: prior, Saved: &saved, Persist: persist, Lease: lease}, func(event chat.Event) {
 			switch event.Type {
 			case "think":
 				appendThink(event.Text)
@@ -359,9 +374,6 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 		}
 		wrote := gen.commit(func() {
 			_ = a.finishMessage(context.Background(), assistantID, user.UserID, completed, "completed")
-			if !kafkaEnabled() {
-				a.saveContextSnapshot(conversationID, user.UserID, assistantID, saved)
-			}
 			if firstTurn {
 				chat.ScheduleTitle(a.Pool, user.UserID, conversationID, userInput, completed, func() {
 					emitToUser(user.UserID, "conversations_changed", map[string]any{"conversationId": conversationID, "reason": "title_updated"})
@@ -382,9 +394,6 @@ func (a *App) chat(w http.ResponseWriter, r *http.Request) {
 	cancelled := runCtx.Err() != nil || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "请求已取消")
 	if cancelled {
 		a.recordUsage(context.Background(), user.UserID, conversationID, assistantID, userInput, history, "已取消", captured)
-		if !kafkaEnabled() {
-			a.saveCancelledContext(conversationID, user.UserID, assistantID)
-		}
 		text := stored
 		if text == "" {
 			text = full
@@ -674,15 +683,27 @@ func (a *App) dropLiveContext(conversationID string) error {
 	return store.DeleteContext(context.Background(), conversationID)
 }
 
-func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID string) ([]any, func([]any) error, error) {
+func (a *App) loadPrior(ctx context.Context, conversationID, userID, userMessageID, assistantID string) ([]any, func([]any) error, error) {
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelLoad()
 	store, enabled, err := openContextStore()
 	if !enabled {
-		return chat.LoadSnapshot(ctx, a.Pool, conversationID, userID), nil, nil
+		var created string
+		if err := a.Pool.QueryRow(loadCtx, `SELECT created_at FROM messages WHERE id=$1 AND user_id=$2 AND conversation_id=$3`, userMessageID, userID, conversationID).Scan(&created); err != nil {
+			return nil, nil, err
+		}
+		persist := func(messages []any) error {
+			persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			return chat.SaveSnapshot(persistCtx, a.Pool, conversationID, userID, userMessageID, created, messages)
+		}
+		prior, _, loadErr := chat.LoadSnapshotSourceChecked(loadCtx, a.Pool, conversationID, userID)
+		return prior, persist, loadErr
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	version, _, rawMessages, ok, err := store.Load(context.Background(), conversationID)
+	version, _, rawMessages, ok, err := store.Load(loadCtx, conversationID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -696,8 +717,11 @@ func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID
 		expected = version
 	} else {
 		var sourceVersion int
-		prior, sourceVersion = chat.LoadSnapshotSource(ctx, a.Pool, conversationID, userID)
-		dbVersion, dbOK, dbErr := store.DBVersion(context.Background(), conversationID)
+		prior, sourceVersion, err = chat.LoadSnapshotSourceChecked(loadCtx, a.Pool, conversationID, userID)
+		if err != nil {
+			return nil, nil, err
+		}
+		dbVersion, dbOK, dbErr := store.DBVersion(loadCtx, conversationID)
 		if dbErr != nil {
 			return nil, nil, dbErr
 		}
@@ -709,18 +733,20 @@ func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID
 			raw, marshalErr := json.Marshal(prior)
 			if marshalErr != nil {
 				log.Printf("[context-store] conversation=%s warm_marshal_failed err=%v", conversationID, marshalErr)
-			} else if warmErr := store.Warm(context.Background(), conversationID, expected, time.Now().Unix(), raw); warmErr != nil {
-				log.Printf("[context-store] conversation=%s warm_failed err=%v", conversationID, warmErr)
+			} else if warmErr := store.Warm(loadCtx, conversationID, expected, time.Now().Unix(), raw); warmErr != nil {
+				return nil, nil, warmErr
 			}
 		}
 	}
 	persist := func(messages []any) error {
+		persistCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 		raw, marshalErr := json.Marshal(messages)
 		if marshalErr != nil {
 			return marshalErr
 		}
 		updatedUnix := time.Now().Unix()
-		newVersion, saved, saveErr := store.SaveCAS(context.Background(), conversationID, expected, updatedUnix, raw)
+		newVersion, saved, saveErr := store.SaveCAS(persistCtx, conversationID, expected, updatedUnix, raw)
 		if saveErr != nil {
 			return saveErr
 		}
@@ -729,7 +755,7 @@ func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID
 		}
 		expected = newVersion
 		if kafkaEnabled() {
-			if pubErr := contextkafka.Publish(context.Background(), contextkafka.SnapshotEvent{
+			if pubErr := contextkafka.Publish(persistCtx, contextkafka.SnapshotEvent{
 				ConversationID: conversationID,
 				UserID:         userID,
 				MessageID:      assistantID,
@@ -738,7 +764,11 @@ func (a *App) loadPrior(ctx context.Context, conversationID, userID, assistantID
 				Messages:       raw,
 			}); pubErr != nil {
 				log.Printf("[context-kafka] conversation=%s version=%d publish_failed err=%v", conversationID, newVersion, pubErr)
+				return pubErr
 			}
+		} else {
+			_, err := chat.SaveSnapshotWithSourceVersion(persistCtx, a.Pool, conversationID, userID, userMessageID, newVersion, raw)
+			return err
 		}
 		return nil
 	}
@@ -840,7 +870,7 @@ func (a *App) userMessageContent(ctx context.Context, input string, ids []string
 			lines = append(lines, "![image](/api/files/"+id+")")
 			continue
 		}
-		label := "表格附件"
+		label := "附件"
 		if name != nil && *name != "" {
 			label = strings.NewReplacer("[", "", "]", "", "(", "", ")", "", "`", "").Replace(*name)
 			if len([]rune(label)) > 120 {
@@ -865,22 +895,31 @@ func (a *App) countValidAttachments(ctx context.Context, ids []string, userID, c
 		args = append(args, id)
 	}
 	args = append(args, userID, conversationID)
-	rows, err := a.Pool.Query(ctx, `SELECT id, file_path FROM attachments WHERE id IN (`+placeholders(len(ids), 1)+`) AND user_id=$`+itoa(len(ids)+1)+` AND conversation_id=$`+itoa(len(ids)+2)+` AND message_id IS NULL AND (mime_type LIKE 'image/%' OR lower(original_name) LIKE '%.csv' OR lower(original_name) LIKE '%.xlsx' OR lower(original_name) LIKE '%.pdf' OR mime_type='application/pdf')`, args...)
+	rows, err := a.Pool.Query(ctx, `SELECT id, file_path, COALESCE(original_name,''), mime_type, size FROM attachments WHERE id IN (`+placeholders(len(ids), 1)+`) AND user_id=$`+itoa(len(ids)+1)+` AND conversation_id=$`+itoa(len(ids)+2)+` AND message_id IS NULL`, args...)
 	if err != nil {
 		return 0, err
 	}
 	defer rows.Close()
 	count := 0
 	for rows.Next() {
-		var id, filePath string
-		if err := rows.Scan(&id, &filePath); err != nil {
+		var id, filePath, name, mimeType string
+		var size int64
+		if err := rows.Scan(&id, &filePath, &name, &mimeType, &size); err != nil {
 			return 0, err
+		}
+		_, isText := authsec.TextUploadMIME(name, mimeType)
+		allowed := strings.HasPrefix(mimeType, "image/") || strings.HasSuffix(strings.ToLower(name), ".csv") || strings.HasSuffix(strings.ToLower(name), ".xlsx") || strings.HasSuffix(strings.ToLower(name), ".pdf") || mimeType == "application/pdf"
+		if authsec.IsTextUploadName(name) {
+			allowed = isText && size >= 0 && size <= authsec.TextUploadMaxBytes
+		}
+		if !allowed {
+			continue
 		}
 		if paths.IsWorkspaceAttachment(filePath, conversationID, "input") {
 			count++
 		}
 	}
-	return count, nil
+	return count, rows.Err()
 }
 
 func (a *App) linkAttachments(ctx context.Context, ids []string, userID, conversationID, messageID string) error {

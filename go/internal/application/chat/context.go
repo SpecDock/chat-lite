@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"chatlite/internal/domain/visibility"
@@ -37,8 +38,19 @@ type ctxMessage struct {
 }
 
 func PrepareContext(ctx context.Context, pool *pgxpool.Pool, userID, conversationID, currentMessageID string, allowSummary bool) PreparedContext {
-	state := loadContextState(ctx, pool, conversationID, userID)
-	messages := listAfterCursor(ctx, pool, conversationID, userID, state.cursorAt, state.cursorID, currentMessageID)
+	prepared, _ := PrepareContextChecked(ctx, pool, userID, conversationID, currentMessageID, allowSummary)
+	return prepared
+}
+
+func PrepareContextChecked(ctx context.Context, pool *pgxpool.Pool, userID, conversationID, currentMessageID string, allowSummary bool) (PreparedContext, error) {
+	state, err := loadContextState(ctx, pool, conversationID, userID)
+	if err != nil {
+		return PreparedContext{}, err
+	}
+	messages, err := listAfterCursor(ctx, pool, conversationID, userID, state.cursorAt, state.cursorID, currentMessageID)
+	if err != nil {
+		return PreparedContext{}, err
+	}
 	var visible []ctxMessage
 	for _, message := range messages {
 		if visibility.IsModelVisible(message.Role, message.Content, message.Status) {
@@ -50,7 +62,7 @@ func PrepareContext(ctx context.Context, pool *pgxpool.Pool, userID, conversatio
 	if allowSummary {
 		saveContextState(ctx, pool, conversationID, userID, summary, estimateTokens(summary), cursorAt, cursorID, time.Now().UTC().Format(time.RFC3339Nano))
 	}
-	return PreparedContext{Summary: summary, History: toHistory(visible), cursorAt: cursorAt, cursorID: cursorID, summary: summary}
+	return PreparedContext{Summary: summary, History: toHistory(visible), cursorAt: cursorAt, cursorID: cursorID, summary: summary}, nil
 }
 
 func (p *PreparedContext) RunSummary(ctx context.Context, pool *pgxpool.Pool, userID, conversationID, toolNotes string) bool {
@@ -143,10 +155,13 @@ type contextState struct {
 	summary, cursorAt, cursorID, lastUserAt string
 }
 
-func loadContextState(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) contextState {
+func loadContextState(ctx context.Context, pool *pgxpool.Pool, conversationID, userID string) (contextState, error) {
 	var state contextState
 	var cursorAt, cursorID, lastUser *string
-	_ = pool.QueryRow(ctx, `SELECT summary_text, summarized_through_created_at, summarized_through_message_id, last_user_message_at FROM conversation_context_states WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID).Scan(&state.summary, &cursorAt, &cursorID, &lastUser)
+	err := pool.QueryRow(ctx, `SELECT summary_text, summarized_through_created_at, summarized_through_message_id, last_user_message_at FROM conversation_context_states WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID).Scan(&state.summary, &cursorAt, &cursorID, &lastUser)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return state, err
+	}
 	if cursorAt != nil {
 		state.cursorAt = *cursorAt
 	}
@@ -156,7 +171,7 @@ func loadContextState(ctx context.Context, pool *pgxpool.Pool, conversationID, u
 	if lastUser != nil {
 		state.lastUserAt = *lastUser
 	}
-	return state
+	return state, nil
 }
 
 func saveContextState(ctx context.Context, pool *pgxpool.Pool, conversationID, userID, summary string, tokens int, cursorAt, cursorID, lastUser string) {
@@ -167,7 +182,7 @@ func saveContextState(ctx context.Context, pool *pgxpool.Pool, conversationID, u
 		WHERE conversation_context_states.user_id=EXCLUDED.user_id`, conversationID, userID, summary, tokens, cursorAt, cursorID, lastUser, now)
 }
 
-func listAfterCursor(ctx context.Context, pool *pgxpool.Pool, conversationID, userID, cursorAt, cursorID, exclude string) []ctxMessage {
+func listAfterCursor(ctx context.Context, pool *pgxpool.Pool, conversationID, userID, cursorAt, cursorID, exclude string) ([]ctxMessage, error) {
 	query := `SELECT id, role, status, content, created_at FROM messages WHERE conversation_id=$1 AND user_id=$2 AND id<>$3`
 	args := []any{conversationID, userID, exclude}
 	if cursorAt != "" && cursorID != "" {
@@ -177,23 +192,24 @@ func listAfterCursor(ctx context.Context, pool *pgxpool.Pool, conversationID, us
 	query += ` ORDER BY created_at ASC, id ASC`
 	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 	var out []ctxMessage
 	for rows.Next() {
 		var message ctxMessage
-		if rows.Scan(&message.ID, &message.Role, &message.Status, &message.Content, &message.CreatedAt) == nil {
-			out = append(out, message)
+		if err := rows.Scan(&message.ID, &message.Role, &message.Status, &message.Content, &message.CreatedAt); err != nil {
+			return nil, err
 		}
+		out = append(out, message)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func toHistory(messages []ctxMessage) []HistoryItem {
 	out := make([]HistoryItem, 0, len(messages))
 	for _, message := range messages {
-		out = append(out, HistoryItem{Role: message.Role, Content: message.Content, Status: message.Status})
+		out = append(out, HistoryItem{ID: message.ID, Role: message.Role, Content: message.Content, Status: message.Status})
 	}
 	return out
 }
