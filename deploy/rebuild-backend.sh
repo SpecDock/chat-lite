@@ -6,7 +6,6 @@ cd "$(dirname "$0")/.."
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.backend.yml}"
 SERVICE_NAME="${SERVICE_NAME:-chat-lite}"
 NO_CACHE="${NO_CACHE:-0}"
-STOP_BEFORE_BUILD="${STOP_BEFORE_BUILD:-0}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
 broker_service=sandbox-broker
 runtime_image=localhost/chat-lite/backend-runtime:2026-11-17-v1
@@ -18,6 +17,7 @@ usage() {
   echo 'Usage: bash deploy/rebuild-backend.sh [--runtime-image REGISTRY/NAME:VERSION_OR_DIGEST] [--sandbox-image REGISTRY/NAME:VERSION_OR_DIGEST]'
   echo 'Local versioned defaults must first be made with bash deploy/build-runtime-images.sh.'
   echo 'Missing images are pulled only from an explicit registry ref. No environment is built here.'
+  echo 'Low-memory mode only: app and broker are stopped before compilation; failures restore the old deployment.'
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -37,10 +37,9 @@ command -v docker >/dev/null 2>&1 || { echo 'docker not found' >&2; exit 1; }
 # Worker/backend aliases are host-wide; hold this lock through rollback and exit.
 command -v flock >/dev/null 2>&1 || { echo 'flock is required for safe deployment' >&2; exit 1; }
 exec 9>/var/lock/chat-lite-backend-deploy.lock
-flock -n 9 || { echo 'Another backend deployment holds the host lock; no services were changed.' >&2; exit 1; }
-if [ "$STOP_BEFORE_BUILD" = 1 ]; then
-  echo 'STOP_BEFORE_BUILD=1 is deprecated and ignored: old services are retained until the candidate is built.' >&2
-fi
+flock -n 9 || { echo 'Another backend deployment or environment build holds the host lock; no services were changed.' >&2; exit 1; }
+echo 'Low-memory mode only; STOP_BEFORE_BUILD is ignored regardless of its value.'
+echo 'Host lock serializes these deployment/environment scripts only; manual Docker builds and other host processes are not controlled.'
 
 ensure_image() {
   local image="$1" last registry
@@ -79,29 +78,12 @@ runtime_pin="localhost/chat-lite/backend-runtime-selected:$stamp"
 docker image tag "$runtime_id" "$runtime_pin"
 cache=()
 if [ "$NO_CACHE" = 1 ]; then cache=(--no-cache); fi
-go_mb=384
-if [ -r /proc/meminfo ]; then
-  while read -r key value rest; do
-    if [ "$key" = MemAvailable: ]; then
-      go_mb=$((value / 1024 - 500))
-      break
-    fi
-  done < /proc/meminfo
-fi
-if [ "$go_mb" -gt 512 ]; then go_mb=512; fi
-if [ "$go_mb" -lt 256 ]; then go_mb=256; fi
 build_app() {
   docker build "${cache[@]}" --target runner \
     --build-arg "GO_IMAGE=$1/golang:1.26-bookworm" \
     --build-arg "BACKEND_RUNTIME_IMAGE=$runtime_pin" \
     --build-arg "GO_MEM_LIMIT_MB=$go_mb" -t "$candidate" .
 }
-echo "Building candidate before stopping services (Go memory cap ${go_mb} MB)"
-if ! build_app docker.m.daocloud.io/library; then
-  echo 'Backend build failed; retrying official Go base with the SAME selected runtime.' >&2
-  build_app docker.io/library
-fi
-
 # Save the actual deployed image IDs, not just a mutable shared tag.
 old_app_container="$(docker compose -f "$COMPOSE_FILE" ps -aq "$SERVICE_NAME")"
 old_broker_container="$(docker compose -f "$COMPOSE_FILE" ps -aq "$broker_service")"
@@ -134,6 +116,7 @@ override="$(mktemp "./deploy/.backend-switch.XXXXXX")"
 rollback_override="$(mktemp "./deploy/.backend-rollback.XXXXXX")"
 switching=0
 committed=0
+aliases_changed=0
 compose_candidate() { docker compose -f "$COMPOSE_FILE" -f "$override" "$@"; }
 compose_old() { docker compose -f "$COMPOSE_FILE" -f "$rollback_override" "$@"; }
 wait_healthy() {
@@ -163,10 +146,12 @@ finish() {
   trap - EXIT INT TERM
   if [ "$switching" = 1 ] && [ "$committed" = 0 ]; then
     set +e
-    echo 'Switch failed/interrupted; restoring worker alias and previous backend images.' >&2
+    echo 'Build/switch failed or interrupted; restoring the previous deployment.' >&2
     compose_candidate stop --timeout 30 "$SERVICE_NAME" "$broker_service" || failed=1
-    restore_alias "$worker_alias" "$old_worker_alias" || failed=1
-    restore_alias "$backend_alias" "$old_backend_alias" || failed=1
+    if [ "$aliases_changed" = 1 ]; then
+      restore_alias "$worker_alias" "$old_worker_alias" || failed=1
+      restore_alias "$backend_alias" "$old_backend_alias" || failed=1
+    fi
     if [ -n "$old_app_image" ]; then
       compose_old up -d --no-build --pull never --no-deps --force-recreate "$broker_service" "$SERVICE_NAME" || failed=1
       wait_healthy "$rollback_override" || failed=1
@@ -193,10 +178,35 @@ fi
 # Parse both merged compose configurations before entering the maintenance window.
 compose_candidate config --quiet
 if [ -n "$old_app_image" ]; then compose_old config --quiet; fi
-echo 'Entering maintenance window. Existing sandbox tasks are NOT guaranteed uninterrupted.'
-echo 'No worker containers, job directories, permissions, caches, or volumes will be cleaned.'
+echo 'Entering low-memory maintenance window BEFORE compilation.'
+echo 'Independent session workers are NOT stopped by this script and may still consume memory.'
+echo 'Existing broker startup cleanup removes managed workers, including on rollback; sessions/tasks cannot be restored.'
+echo 'This script does not delete worker containers, job directories, permissions, caches, or volumes.'
 switching=1
 compose_candidate stop --timeout 30 "$SERVICE_NAME" "$broker_service"
+# Measure only after stopping services. Reserve 500 MiB for Docker, BuildKit and the OS.
+# GOMEMLIMIT is a Go runtime soft target, not a container limit or an OOM guarantee.
+available_kb=0
+if [ -r /proc/meminfo ]; then
+  while read -r key value rest; do
+    if [ "$key" = MemAvailable: ]; then
+      available_kb="$value"
+      break
+    fi
+  done < /proc/meminfo
+fi
+if ! [[ "$available_kb" =~ ^[0-9]+$ ]] || [ "$available_kb" -lt $((756 * 1024)) ]; then
+  echo "Insufficient/unknown MemAvailable after stop: ${available_kb} kB; need at least 756 MiB (500 reserve + 256 Go target). Restoring old services." >&2
+  exit 1
+fi
+go_mb=$((available_kb / 1024 - 500))
+if [ "$go_mb" -gt 512 ]; then go_mb=512; fi
+echo "MemAvailable ${available_kb} kB; serial Go build with soft GOMEMLIMIT ${go_mb} MiB (not an OOM guarantee)."
+if ! build_app docker.m.daocloud.io/library; then
+  echo 'Backend build failed; retrying official Go base with the SAME selected runtime.' >&2
+  build_app docker.io/library
+fi
+aliases_changed=1
 docker image tag "$worker_id" "$worker_alias"
 docker image tag "$candidate" "$backend_alias"
 compose_candidate up -d --no-build --pull never --no-deps --force-recreate "$broker_service" "$SERVICE_NAME"

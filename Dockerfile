@@ -40,9 +40,14 @@ ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct \
     CGO_ENABLED=0
 
 COPY go/go.mod go/go.sum ./
-RUN go mod download || GOPROXY=https://goproxy.io,direct go mod download || GOPROXY=https://proxy.golang.org,direct go mod download
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    go env -w GOMODCACHE=/go/pkg/mod GOCACHE=/root/.cache/go-build \
+    && (go mod download || GOPROXY=https://goproxy.io,direct go mod download || GOPROXY=https://proxy.golang.org,direct go mod download)
 COPY go/ ./
-RUN go build -p 1 -trimpath -ldflags="-s -w" -o /out/chat-lite ./cmd/server \
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    go build -p 1 -trimpath -ldflags="-s -w" -o /out/chat-lite ./cmd/server \
  && go build -p 1 -trimpath -ldflags="-s -w" -o /out/sandbox-broker ./cmd/sandbox-broker
 
 ########## runner ##########

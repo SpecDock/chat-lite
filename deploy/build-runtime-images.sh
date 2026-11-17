@@ -30,6 +30,11 @@ for image in "$runtime_image" "$sandbox_image"; do
   fi
 done
 command -v docker >/dev/null 2>&1 || { echo 'docker not found' >&2; exit 1; }
+# Share the deployment lock: environment builds must not compete with a backend build.
+command -v flock >/dev/null 2>&1 || { echo 'flock is required for serial environment builds' >&2; exit 1; }
+exec 9>/var/lock/chat-lite-backend-deploy.lock
+flock -n 9 || { echo 'Another environment build or backend deployment holds the host lock; nothing was built.' >&2; exit 1; }
+echo 'Host lock serializes these deployment/environment scripts only; manual Docker builds and other host processes are not controlled.'
 
 build_runtime() {
   docker build -f deploy/Dockerfile.backend-runtime \

@@ -58,7 +58,7 @@ bash deploy/build-runtime-images.sh
 bash deploy/rebuild-backend.sh
 ```
 
-部署脚本会构建前端或后端 Docker 镜像并重建对应服务。后端发布先准备候选镜像，再短暂切换主后端与 broker；健康失败时尝试回退，不承诺执行中的沙箱任务零中断。生产环境需要预先配置 Compose、`.env`、数据服务及外部 Docker 网络 `shared`。环境镜像制作、指定仓库拉取与双机复用见 [预制运行环境与后端发布](docs/runtime-images.md)。
+部署脚本会构建前端或后端 Docker 镜像并重建对应服务。后端发布只支持低内存模式：先准备环境镜像和回退信息，再停止主后端与 broker，串行编译后启动新版；构建或健康检查失败时尝试恢复旧版。维护窗口包含编译时间，不承诺执行中的沙箱任务零中断，也不能保证宿主绝不 OOM。生产环境需要预先配置 Compose、`.env`、数据服务及外部 Docker 网络 `shared`。环境镜像制作、指定仓库拉取与双机复用见 [预制运行环境与后端发布](docs/runtime-images.md)。
 
 通用命令沙箱还要求宿主预先启用 ext4 或 XFS project quota；未满足硬配额前置条件时会拒绝执行，不降级为无配额目录。新版执行卡片来自服务端独立记录，旧正文卡片仅作为未验证历史内容兼容。工作区归属、网络与部署边界见 [会话沙箱执行方案](docs/sandbox-execution.md)。
 
