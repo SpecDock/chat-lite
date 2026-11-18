@@ -167,19 +167,21 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
     const overflowing = naturalHeight > maxHeight + 0.5;
     node.style.overflowY = overflowing ? 'auto' : 'hidden';
     if (!overflowing) node.scrollTop = 0;
-    node.style.height = `${currentHeight}px`;
-
     if (!animate || reducedMotion() || Math.abs(currentHeight - targetHeight) < 0.5) {
-      gsap.set(node, { height: targetHeight });
+      node.style.height = node.value ? `${targetHeight}px` : '';
       return;
     }
 
+    node.style.height = `${currentHeight}px`;
     tweenRef.current = gsap.to(node, {
       height: targetHeight,
       duration: 0.18,
       ease: 'power1.out',
       overwrite: 'auto',
-      onComplete: () => { tweenRef.current = null; }
+      onComplete: () => {
+        tweenRef.current = null;
+        if (!node.value) node.style.height = '';
+      }
     });
   }, []);
 
@@ -231,7 +233,7 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
     if (v || pending.length) { onSend(v); setText(''); }
   };
   return <form
-    className={dragging ? 'composer dragging' : 'composer'}
+    className={dragging ? 'composer chat-composer dragging' : 'composer chat-composer'}
     onSubmit={e => { e.preventDefault(); submit(); }}
     onPaste={e => {
       const files = Array.from(e.clipboardData.files);
@@ -253,7 +255,28 @@ export default function MessageInput({ disabled, sending, refillText, refillKey,
         <span>×</span>
       </button>;
     })}</div>}
-    <div className="workspace-trigger-row"><button type="button" className="workspace-trigger" onClick={onWorkspace || (() => window.dispatchEvent(new Event('chat-lite-open-workspace')))}><FolderOpen size={16} aria-hidden="true" /><span>工作区</span></button></div>
-    <div className="input"><ImageUploader onFile={onImage} /><textarea ref={textareaRef} rows={1} placeholder={`输入消息，或粘贴/拖入${UPLOAD_DESCRIPTION}`} value={text} disabled={disabled && !sending} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} /><ReasoningEffortSelect /><button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button></div>
+    <div className="prompt-card">
+      <textarea
+        ref={textareaRef}
+        className="prompt-card__field chat-prompt"
+        rows={1}
+        aria-label="输入消息"
+        placeholder={`输入消息，或粘贴/拖入${UPLOAD_DESCRIPTION}`}
+        value={text}
+        disabled={disabled && !sending}
+        onChange={e => setText(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !sending) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }}
+      />
+      <div className="prompt-card__toolbar">
+        <div className="chat-composer__tools">
+          <ImageUploader onFile={onImage} />
+          <button type="button" className="workspace-trigger" onClick={onWorkspace || (() => window.dispatchEvent(new Event('chat-lite-open-workspace')))}><FolderOpen size={16} aria-hidden="true" /><span>工作区</span></button>
+        </div>
+        <div className="chat-composer__actions">
+          <ReasoningEffortSelect />
+          <button className={sending ? 'send-button sending' : 'send-button'} type="submit" disabled={!sending && (disabled || !hasContent)} aria-label={sending ? '取消生成' : '发送消息'}>{sending ? <><span className="send-spinner" aria-hidden="true" />取消</> : '发送'}</button>
+        </div>
+      </div>
+    </div>
   </form>;
 }

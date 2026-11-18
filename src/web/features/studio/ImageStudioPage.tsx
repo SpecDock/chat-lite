@@ -324,15 +324,36 @@ export default function ImageStudioPage() {
   const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
   referencesRef.current = references;
 
-  useLayoutEffect(() => {
+  const syncPromptHeight = useCallback(() => {
     const node = promptRef.current;
     if (!node) return;
-    node.style.height = 'auto';
-    const maxHeight = Number.parseFloat(window.getComputedStyle(node).maxHeight);
-    const next = Math.min(node.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : node.scrollHeight);
-    node.style.height = `${next}px`;
-    node.style.overflowY = node.scrollHeight > next + 1 ? 'auto' : 'hidden';
-  }, [prompt]);
+    node.style.height = '';
+    if (node.value) node.style.height = `${node.scrollHeight}px`;
+  }, []);
+
+  useLayoutEffect(syncPromptHeight, [prompt, syncPromptHeight]);
+
+  useEffect(() => {
+    const card = promptRef.current?.parentElement;
+    if (!card) return;
+    let width = card.clientWidth;
+    let frame = 0;
+    const resize = () => {
+      const nextWidth = card.clientWidth;
+      if (nextWidth === width) return;
+      width = nextWidth;
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(syncPromptHeight);
+    };
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(resize) : null;
+    if (observer) observer.observe(card);
+    else window.addEventListener('resize', resize);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', resize);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [syncPromptHeight]);
 
   useEffect(() => () => {
     for (const item of referencesRef.current) URL.revokeObjectURL(item.url);
@@ -519,26 +540,11 @@ export default function ImageStudioPage() {
             </button>
           </div>)}
         </div>}
-        <div className="studio-prompt-row">
-          <label className={references.length >= STUDIO_REFERENCE_LIMIT ? 'studio-upload is-disabled' : 'studio-upload'}>
-            <ImagePlus size={16} aria-hidden="true" />
-            <span>参考图 {references.length}/{STUDIO_REFERENCE_LIMIT}</span>
-            <input
-              type="file"
-              accept="image/jpeg,image/png,image/webp,image/gif"
-              multiple
-              disabled={references.length >= STUDIO_REFERENCE_LIMIT}
-              aria-label="上传参考图"
-              onChange={event => {
-                addFiles(event.target.files);
-                event.currentTarget.value = '';
-              }}
-            />
-          </label>
+        <div className="prompt-card studio-prompt-card">
           <textarea
             ref={promptRef}
             id="studio-prompt"
-            className="studio-prompt"
+            className="prompt-card__field studio-prompt"
             name="prompt"
             rows={1}
             value={prompt}
@@ -552,25 +558,42 @@ export default function ImageStudioPage() {
               addFiles(images);
             }}
           />
-          <label className="studio-label studio-label-aspect" htmlFor="studio-aspect">
-            比例
-            <select id="studio-aspect" name="aspectRatio" value={aspectRatio} onChange={event => setAspectRatio(event.target.value as (typeof STUDIO_ASPECTS)[number])}>
-              {STUDIO_ASPECTS.map(value => <option key={value} value={value}>{aspectLabel(value)}</option>)}
-            </select>
-          </label>
-          <label className="studio-label studio-label-quality" htmlFor="studio-quality">
-            质量
-            <select id="studio-quality" name="quality" value={quality} onChange={event => setQuality(event.target.value as (typeof STUDIO_QUALITIES)[number])}>
-              {STUDIO_QUALITIES.map(value => <option key={value} value={value}>{qualityLabel(value)}</option>)}
-            </select>
-          </label>
-          <label className="studio-label studio-label-style" htmlFor="studio-style">
-            风格
-            <select id="studio-style" value={style} onChange={event => setStyle(event.target.value as (typeof STUDIO_STYLES)[number])}>
-              {STUDIO_STYLES.map(value => <option key={value} value={value}>{styleLabel(value)}</option>)}
-            </select>
-          </label>
-          <button className="studio-submit" type="submit" disabled={!prompt.trim() || cooldownLeft > 0} aria-describedby={limitMessage ? 'studio-limit' : undefined}>{cooldownLeft > 0 ? `${cooldownLeft}s` : '生成'}</button>
+          <div className="prompt-card__toolbar studio-toolbar">
+            <label className={references.length >= STUDIO_REFERENCE_LIMIT ? 'studio-upload is-disabled' : 'studio-upload'}>
+              <ImagePlus size={16} aria-hidden="true" />
+              <span>参考图 {references.length}/{STUDIO_REFERENCE_LIMIT}</span>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/gif"
+                multiple
+                disabled={references.length >= STUDIO_REFERENCE_LIMIT}
+                aria-label="上传参考图"
+                onChange={event => {
+                  addFiles(event.target.files);
+                  event.currentTarget.value = '';
+                }}
+              />
+            </label>
+            <label className="studio-label studio-label--aspect" htmlFor="studio-aspect">
+              比例
+              <select id="studio-aspect" name="aspectRatio" value={aspectRatio} onChange={event => setAspectRatio(event.target.value as (typeof STUDIO_ASPECTS)[number])}>
+                {STUDIO_ASPECTS.map(value => <option key={value} value={value}>{aspectLabel(value)}</option>)}
+              </select>
+            </label>
+            <label className="studio-label studio-label--quality" htmlFor="studio-quality">
+              质量
+              <select id="studio-quality" name="quality" value={quality} onChange={event => setQuality(event.target.value as (typeof STUDIO_QUALITIES)[number])}>
+                {STUDIO_QUALITIES.map(value => <option key={value} value={value}>{qualityLabel(value)}</option>)}
+              </select>
+            </label>
+            <label className="studio-label studio-label--style" htmlFor="studio-style">
+              风格
+              <select id="studio-style" value={style} onChange={event => setStyle(event.target.value as (typeof STUDIO_STYLES)[number])}>
+                {STUDIO_STYLES.map(value => <option key={value} value={value}>{styleLabel(value)}</option>)}
+              </select>
+            </label>
+            <button className="studio-submit" type="submit" disabled={!prompt.trim() || cooldownLeft > 0} aria-describedby={limitMessage ? 'studio-limit' : undefined}>{cooldownLeft > 0 ? `${cooldownLeft}s` : '生成'}</button>
+          </div>
         </div>
         {limitMessage && <p id="studio-limit" className="error" role="alert">{limitMessage}</p>}
         {formError && <p className="error" role="alert">{formError}</p>}
